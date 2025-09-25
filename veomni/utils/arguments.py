@@ -152,13 +152,17 @@ class DataArguments:
         default="streaming",
         metadata={"help": "Type of the dataloader."},
     )
-    datasets_type: Literal["byted", "mapping", "iterable"] = field(
+    datasets_type: Literal["byted", "mapping", "iterable", "energon"] = field(
         default="byted",
         metadata={"help": "Type of the datasets."},
     )
-    data_name: str = field(
+    enable_multisource: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable multisource training."},
+    )
+    source_name: str = field(
         default=None,
-        metadata={"help": "Dataset name for multimodal training."},
+        metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
     )
     data_tag: Literal["default", "mmtag"] = field(
         default="default",

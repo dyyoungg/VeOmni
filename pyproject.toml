@@ -52,6 +52,9 @@ gpu =[
   "liger-kernel>=0.5.5,<=0.5.6",
   "flash-attn==2.6.3",
 ]
+megatron = [
+  "megatron-energon>=7.2.1"
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni.__version__"}
