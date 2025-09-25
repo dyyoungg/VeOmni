@@ -45,7 +45,7 @@ def main(raw_hf_path, merge_hf_path):
 
     num_experts = config.num_experts
     num_hidden_layers = config.num_hidden_layers
-    for i in range(num_hidden_layers):
+    for i in tqdm(range(num_hidden_layers)):
         gate_proj = []
         for j in range(num_experts):
             gate_proj.append(new_state_dict.pop(f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight"))
