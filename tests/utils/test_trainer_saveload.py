@@ -8,7 +8,7 @@ import torch.distributed as dist
 from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer
-from veomni.data import build_dummy_dataset, build_streaming_dataloader
+from veomni.data import build_dummy_dataset, build_streaming_dataloader, build_dataloader
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -142,7 +142,7 @@ def main():
     train_dataset = build_dummy_dataset(task_type="text", size=train_data_size, max_seq_len=args.data.max_seq_len)
 
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-    train_dataloader = build_streaming_dataloader(
+    train_dataloader = build_dataloader(
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
@@ -152,17 +152,17 @@ def main():
         rmpad=args.train.rmpad,
         rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+        # dyn_bsz_runtime=args.train.dyn_bsz_runtime,
         dyn_bsz_margin=args.train.dyn_bsz_margin,
         dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
         collate_fn=None,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        infinity=True,
+        # infinity=True,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         pin_memory=args.data.pin_memory,
         prefetch_factor=args.data.prefetch_factor,
-        drop_resume_buffer=args.data.drop_resume_buffer,
+        # drop_resume_buffer=args.data.drop_resume_buffer,
     )
 
     logger.info_rank0("Prepare model")
@@ -313,8 +313,8 @@ def main():
                 },
             }
 
-            logger.info_rank0("testing DCP async saving")
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=True)
+            logger.info_rank0("testing DCP sync saving")
+            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=False)
 
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
@@ -334,10 +334,29 @@ def main():
     # wait saving to finish
     if Checkpointer.save_model_future is not None:
         logger.info_rank0("Waiting model saving to finish...")
-        Checkpointer.save_model_future.result()
+        try:
+            # Add timeout to prevent hanging
+            import concurrent.futures
+            Checkpointer.save_model_future.result(timeout=300)  # 5 minutes timeout
+            logger.info_rank0("Model saving completed successfully!")
+        except concurrent.futures.TimeoutError:
+            logger.error_rank0("Model saving timed out after 5 minutes!")
+            # Try to cancel the future
+            Checkpointer.save_model_future.cancel()
+        except Exception as e:
+            logger.error_rank0(f"Error waiting for model saving: {e}")
+            
     if Checkpointer.save_optim_future is not None:
         logger.info_rank0("Waiting optimizer saving to finish...")
-        Checkpointer.save_optim_future.result()
+        try:
+            import concurrent.futures
+            Checkpointer.save_optim_future.result(timeout=300)  # 5 minutes timeout
+            logger.info_rank0("Optimizer saving completed successfully!")
+        except concurrent.futures.TimeoutError:
+            logger.error_rank0("Optimizer saving timed out after 5 minutes!")
+            Checkpointer.save_optim_future.cancel()
+        except Exception as e:
+            logger.error_rank0(f"Error waiting for optimizer saving: {e}")
 
     Checkpointer.load(load_path, state)
     dist.barrier()
