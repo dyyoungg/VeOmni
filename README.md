@@ -114,6 +114,24 @@ Read the [VeOmni Best Practice](docs/start/best_practice.md) for more details.
 
 ### 🔧 Installation
 
+#### (Recommended) Use `uv` Managed Virtual Environment
+
+We recommend to use [`uv`](https://docs.astral.sh/uv/) managed virtual environment
+to run VeOmni.
+
+```shell
+# For GPU
+uv sync --extra gpu
+# For Ascend NPU
+uv sync --extra npu
+# You can install other optional deps by adding --extra like --extra dit
+
+# Activate the uv managed virtual environment
+source .venv/bin/activate
+```
+
+#### `pip` Based Install
+
 Install using PyPI:
 
 ```shell

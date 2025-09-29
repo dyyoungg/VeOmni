@@ -30,7 +30,7 @@ train:
   lr_decay_ratio: 1.0
   weight_decay: 0.01
   max_grad_norm: 1.0
-  enable_mixed_precision: false
+  enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
   enable_fsdp_offload: false

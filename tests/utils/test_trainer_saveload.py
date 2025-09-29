@@ -337,31 +337,12 @@ def main():
     else:
         load_path = save_checkpoint_path
     # wait saving to finish
-    if Checkpointer.save_model_future is not None:
+    if Checkpointer.dcp_save_future is not None:
         logger.info_rank0("Waiting model saving to finish...")
-        try:
-            # Add timeout to prevent hanging
-            import concurrent.futures
-            Checkpointer.save_model_future.result(timeout=300)  # 5 minutes timeout
-            logger.info_rank0("Model saving completed successfully!")
-        except concurrent.futures.TimeoutError:
-            logger.error_rank0("Model saving timed out after 5 minutes!")
-            # Try to cancel the future
-            Checkpointer.save_model_future.cancel()
-        except Exception as e:
-            logger.error_rank0(f"Error waiting for model saving: {e}")
-            
+        Checkpointer.save_model_future.result()
     if Checkpointer.save_optim_future is not None:
         logger.info_rank0("Waiting optimizer saving to finish...")
-        try:
-            import concurrent.futures
-            Checkpointer.save_optim_future.result(timeout=300)  # 5 minutes timeout
-            logger.info_rank0("Optimizer saving completed successfully!")
-        except concurrent.futures.TimeoutError:
-            logger.error_rank0("Optimizer saving timed out after 5 minutes!")
-            Checkpointer.save_optim_future.cancel()
-        except Exception as e:
-            logger.error_rank0(f"Error waiting for optimizer saving: {e}")
+        Checkpointer.save_optim_future.result()
 
     Checkpointer.load(load_path, state)
     dist.barrier()

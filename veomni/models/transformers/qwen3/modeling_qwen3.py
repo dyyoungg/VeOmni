@@ -7,7 +7,6 @@ from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, St
 from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layer import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -29,6 +28,7 @@ from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available, is_torch_npu_available
+from ...module_utils import GradientCheckpointingLayer
 
 
 if is_torch_flex_attn_available():
