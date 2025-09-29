@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, List
+from typing import Dict, List, Union, Optional
+import json
+import os
 
 import torch
 from torch.utils.data import Dataset
@@ -196,12 +198,170 @@ class DummyOmniDataset(Dataset):
         ]
 
 
-def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
+class RealTextDataset(Dataset):
+    def __init__(
+        self, 
+        data_path: str, 
+        tokenizer, 
+        max_seq_length: int = 2048,
+        human_token: str = "<|im_start|>user\n",
+        assistant_token: str = "<|im_start|>assistant\n",
+        end_token: str = "<|im_end|>\n"
+    ):
+        """
+        Real dataset that reads JSONL or JSON files with standard messages format.
+        
+        Args:
+            data_path (str): Path to JSONL or JSON file containing conversation data
+            tokenizer: Tokenizer to use for encoding text
+            max_seq_length (int): Maximum sequence length for tokenization
+            human_token (str): Token to use for human messages
+            assistant_token (str): Token to use for assistant messages  
+            end_token (str): Token to use for ending conversations
+        """
+        self.data_path = data_path
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.human_token = human_token
+        self.assistant_token = assistant_token
+        self.end_token = end_token
+        
+        # Load data
+        self.data = self._load_data()
+        logger.info(f"Loaded {len(self.data)} conversations from {data_path}")
+    
+    def _load_data(self) -> List[Dict]:
+        """Load data from JSONL or JSON file."""
+        data = []
+        
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"Data file not found: {self.data_path}")
+        
+        if self.data_path.endswith('.jsonl'):
+            with open(self.data_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            data.append(json.loads(line))
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Skipping invalid JSON line: {e}")
+                            continue
+        elif self.data_path.endswith('.json'):
+            with open(self.data_path, 'r', encoding='utf-8') as f:
+                try:
+                    json_data = json.load(f)
+                    if isinstance(json_data, list):
+                        data = json_data
+                    else:
+                        data = [json_data]
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON file: {e}")
+        else:
+            raise ValueError("File must be either .json or .jsonl format")
+        
+        return data
+    
+    def _format_conversation(self, conversation: List[Dict]) -> tuple[List[int], List[int]]:
+        """Format conversation and return input_ids and labels."""
+        input_ids = []
+        labels = []
+        
+        for turn in conversation:
+            # Support both "from" and "role" fields
+            speaker = turn.get("from") or turn.get("role", "")
+            
+            if speaker == "human" or speaker == "user":
+                # Human part: tokenize and add ignore index to labels
+                human_text = self.human_token + turn.get("value", turn.get("content", "")) + self.end_token + self.assistant_token 
+                human_tokens = self.tokenizer.encode(human_text, add_special_tokens=False)
+                input_ids.extend(human_tokens)
+                labels.extend([-100] * len(human_tokens))  # Ignore human tokens
+                
+            elif speaker == "gpt" or speaker == "assistant":
+                # Assistant part: tokenize and add actual tokens to labels
+                assistant_text = turn.get("value", turn.get("content", "")) + self.end_token
+                assistant_tokens = self.tokenizer.encode(assistant_text, add_special_tokens=False)
+                input_ids.extend(assistant_tokens)
+                labels.extend(assistant_tokens)  # Include assistant tokens in loss
+        
+        return input_ids, labels
+    
+    def __len__(self) -> int:
+        return len(self.data)
+    
+    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        """Get a single conversation item."""
+        item = self.data[index]
+        
+        # Extract conversations
+        conversations = item.get("conversations", [])
+        if not conversations:
+            logger.warning(f"No conversations found in item {index}")
+            # Return empty conversation
+            conversations = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+        
+        # Format conversation and get input_ids and labels
+        input_ids, labels = self._format_conversation(conversations)
+        
+        # Truncate if too long
+        if len(input_ids) > self.max_seq_length:
+            input_ids = input_ids[:self.max_seq_length]
+            labels = labels[:self.max_seq_length]
+        
+        # Convert to tensors
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        
+        return [{
+            "input_ids": input_ids,
+            "attention_mask": attention_mask, 
+            "labels": labels
+        }]
+
+
+def build_dummy_dataset(task_type: str, size: int, max_seq_len: int, data_path="", tokenizer=None) -> "Dataset":
     if task_type == "text":
         return DummyTextDataset(size=size, seq_length=max_seq_len)
     elif task_type == "qwenvl":
         return DummyQwenVLDataset(size=size, seq_length=max_seq_len)
     elif task_type == "omni":
         return DummyOmniDataset(size=size, seq_length=max_seq_len)
+    elif task_type == "real_dummy_text":
+        return build_real_dataset(data_path=data_path, tokenizer=tokenizer, max_seq_length=max_seq_len)
+
     else:
         raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")
+
+
+def build_real_dataset(
+    data_path: str, 
+    tokenizer, 
+    max_seq_length: int = 2048,
+    human_token: str = "<|im_start|>user\n",
+    assistant_token: str = "<|im_start|>assistant\n", 
+    end_token: str = "<|im_end|>\n"
+) -> "Dataset":
+    """
+    Build a real dataset from JSONL or JSON files.
+    
+    Args:
+        data_path (str): Path to JSONL or JSON file containing conversation data
+        tokenizer: Tokenizer to use for encoding text
+        max_seq_length (int): Maximum sequence length for tokenization
+        human_token (str): Token to use for human messages
+        assistant_token (str): Token to use for assistant messages
+        end_token (str): Token to use for ending conversations
+        
+    Returns:
+        RealTextDataset: Dataset instance
+    """
+    return RealTextDataset(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+        human_token=human_token,
+        assistant_token=assistant_token,
+        end_token=end_token
+    )

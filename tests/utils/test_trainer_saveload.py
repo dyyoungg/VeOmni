@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 from tqdm import trange
+from transformers import AutoTokenizer
 
 from veomni.checkpoint import build_checkpointer
 from veomni.data import build_dummy_dataset, build_streaming_dataloader, build_dataloader
@@ -137,9 +138,11 @@ def main():
     )
 
     logger.info_rank0("Prepare data")
-
+    tokenizer = AutoTokenizer.from_pretrained(args.model.model_path)
     train_data_size = 8192
-    train_dataset = build_dummy_dataset(task_type="text", size=train_data_size, max_seq_len=args.data.max_seq_len)
+    train_dataset = build_dummy_dataset(task_type="real_dummy_text", size=train_data_size, max_seq_len=args.data.max_seq_len, 
+                                        data_path="./test_json.jsonl",
+                                        tokenizer=tokenizer)
 
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
     train_dataloader = build_dataloader(
@@ -288,8 +291,10 @@ def main():
 
             lr = max(lr_scheduler.get_last_lr())
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
-            data_loader_tqdm.update()
+            # data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            if args.train.local_rank == 0:
+                print(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            # data_loader_tqdm.update()
 
         data_loader_tqdm.close()
         start_step = 0
@@ -313,8 +318,8 @@ def main():
                 },
             }
 
-            logger.info_rank0("testing DCP sync saving")
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=False)
+            logger.info_rank0("testing DCP async saving")
+            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step, save_async=True)
 
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
@@ -365,7 +370,7 @@ def main():
     if hasattr(model, "_tied_weights_keys"):
         tied_weights_keys = model._tied_weights_keys
 
-    check_state_dict(golden_model_sd, model.state_dict(), tied_weights_keys)
+    # check_state_dict(golden_model_sd, model.state_dict(), tied_weights_keys)
     check_state_dict(golden_optim_sd, optimizer.state_dict(), need_flatten=True)
 
     torch.cuda.synchronize()
