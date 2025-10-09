@@ -383,6 +383,12 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable full determinism."},
     )
+    allow_cuda_launch_blocking: bool = field(
+        default=False,
+        metadata={
+            "help": "Set CUDA_LAUNCH_BLOCK=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something"
+        },
+    )
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
@@ -499,6 +505,12 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    profile_rank0_only: bool = field(
+        default=True,
+        metadata={
+            "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
+        },
+    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
@@ -612,6 +624,28 @@ class TrainingArguments:
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
         self.step2token_path = os.path.join(self.output_dir, "step2token.json")
         self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
+
+        # determine whether to profile this rank
+        if self.enable_profiling:
+            if self.profile_rank0_only:
+                self.profile_this_rank = self.global_rank == 0
+            else:
+                logger.warning_rank0(
+                    "Profiling on ALL ranks is enabled. This would save a lot of files which takes time and space."
+                )
+                self.profile_this_rank = True
+        else:
+            self.profile_this_rank = False
+
+        # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
+        if not self.allow_cuda_launch_blocking:
+            assert not self.enable_full_determinism, (
+                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LUANCH_BLOCKING to 1!"
+            )
+            cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
+            assert cuda_launch_blocking_val != "1", (
+                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
+            )
 
     def compute_train_steps(
         self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None

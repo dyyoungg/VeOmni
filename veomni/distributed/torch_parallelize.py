@@ -278,7 +278,8 @@ def parallelize_model_fsdp2(
             )
             layer_pairs.append((layer_fqn, layer_mod, experts_mod))
         else:
-            # No experts module found
+            # No experts module found in this layer
+            # this is often the case for models like deepseek in which some decoder layers are dense instead of MoE
             layer_pairs.append((layer_fqn, layer_mod, None))
 
     logger.info_rank0(f"layer pairs: {layer_pairs}")
@@ -331,6 +332,7 @@ def parallelize_model_fsdp2(
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
+        # ep enabled and this layer contains the expert module
         if parallel_state.ep_enabled and experts_mod is not None:
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
@@ -364,9 +366,6 @@ def parallelize_model_fsdp2(
         for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:
                 prefetch_modules = next_block._fsdp_modules
-                assert len(prefetch_modules) > 1, (
-                    "Modules to manually prefetch should not be empty when EP is enabled or there are modules to be ignored by mixed precision policy"
-                )
                 # prefetch in order of attn, gate, experts
                 current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 

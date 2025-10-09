@@ -41,6 +41,7 @@ def flash_attention_forward(
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
     implementation: Optional[Literal["fa2", "lego", "fa3"]] = None,
+    skip_ulysses: bool = False,  # Skip ulysses for some ViT cases like internvl3.5
     **kwargs,
 ) -> Tuple[torch.Tensor, None]:
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask", None) is not None:
@@ -64,7 +65,7 @@ def flash_attention_forward(
 
     # Ulysses patch
     ulysses_enabled = get_parallel_state().ulysses_enabled
-    if ulysses_enabled:
+    if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
         # Sanity Check & Repeat Key & Value
         ulysses_size = get_parallel_state().ulysses_size
@@ -149,7 +150,7 @@ def flash_attention_forward(
         )
 
     # Ulysses patch
-    if ulysses_enabled:
+    if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
         if attn_output.ndim == 4 and attn_output.size(0) == 1:
             attn_output = attn_output.squeeze(0)

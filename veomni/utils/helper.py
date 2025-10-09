@@ -594,7 +594,13 @@ class ProfilerWithMem:
 
 
 def create_profiler(
-    start_step: int, end_step: int, trace_dir: str, record_shapes: bool, profile_memory: bool, with_stack: bool
+    start_step: int,
+    end_step: int,
+    trace_dir: str,
+    record_shapes: bool,
+    profile_memory: bool,
+    with_stack: bool,
+    global_rank: int,
 ):
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -616,26 +622,21 @@ def create_profiler(
 
         # torch_npu does not support export gzip trace json directly
         trace_file_extention = "pt.trace.json" if IS_NPU_AVAILABLE else "pt.trace.json.gz"
-        memory_timeline_file_extention = "html"
         gpu_memory_file_extension = "pkl"
 
         if trace_dir.startswith("hdfs://"):
             hdfs_io.makedirs(trace_dir, exist_ok=True)
             os.makedirs(CACHE_DIR, exist_ok=True)
-            trace_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{trace_file_extention}")
-            memory_timeline_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{memory_timeline_file_extention}")
-            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank0_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
         else:
             os.makedirs(trace_dir, exist_ok=True)
-            trace_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{trace_file_extention}")
-            memory_timeline_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{memory_timeline_file_extention}")
-            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank0_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
         p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        p.export_memory_timeline(memory_timeline_file)
-        logger.info(f"Profiling memory timeline saved at {memory_timeline_file}.")
         if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
@@ -654,9 +655,6 @@ def create_profiler(
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")
-
-            copy(memory_timeline_file, trace_dir)
-            logger.info(f"Profiling memory timeline uploaded to {trace_dir}.")
 
         if VEOMNI_UPLOAD_CMD:
             try:
@@ -693,7 +691,7 @@ def create_profiler(
         with_modules=True,
         with_stack=with_stack,
     )
-    if IS_CUDA_AVAILABLE:
+    if IS_CUDA_AVAILABLE and profile_memory:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler

@@ -76,7 +76,7 @@ class ModelState(Stateful):
             )
             model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
 
-        return {"model": model_state_dict}
+        return model_state_dict
 
     @torch.no_grad()
     def load_state_dict(self, state_dict):
@@ -85,7 +85,7 @@ class ModelState(Stateful):
         need to drop EP-dim when loading from DCP checkpoints
         so that EP-FSDP would not be confused
         """
-        model_state_dict = state_dict["model"]
+        model_state_dict = state_dict
         if self.should_ep_aware:
             model_state_dict = self.get_state_dict_without_ep_dim(model_state_dict)
 
@@ -192,14 +192,14 @@ class OptimizerState(Stateful):
         # MultiOptimizer is only used for EP+FSDP2 case for now,
         # and it knows how to produce a merged, flattened dict already
         if getattr(self.optimizer, "_is_multi_optimizer", False):
-            return {"optim": self.optimizer.state_dict()}
+            return self.optimizer.state_dict()
 
         # Single torch optimizer
         sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
-        return {"optim": sd}
+        return sd
 
     def load_state_dict(self, state_dict):
-        optim_state = state_dict["optim"]
+        optim_state = state_dict
 
         # Delegate to MultiOptimizer (it will split/filter correctly)
         if getattr(self.optimizer, "_is_multi_optimizer", False):
