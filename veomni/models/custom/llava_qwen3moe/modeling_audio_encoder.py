@@ -1,0 +1,67 @@
+from typing import Dict
+
+import torch
+import torch.nn as nn
+
+from veomni.models.custom.llava_qwen3moe.modeling_whisper import WhisperEncoder, WhisperConfig
+from veomni.models.custom.llava_qwen3moe.base import BaseEncoderModelMixin, BaseEncoderConfigMixin
+from veomni.models.custom.llava_qwen3moe.projector import build_audio_projector
+
+
+
+class BeeBeeAudioModelConfig(BaseEncoderConfigMixin, WhisperConfig):
+    model_type = "beebee_vl_audio_model"
+
+    def __init__(
+        self,
+        return_hidden_states=False,
+        train_audio_projector=False,
+        audio_downsample_size=10,
+        audio_projector_type="channel_upscale",
+        output_size=6144,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.return_hidden_states = return_hidden_states
+        self.train_audio_projector = train_audio_projector
+        self.audio_downsample_size = audio_downsample_size
+        self.audio_projector_type = audio_projector_type
+        self.output_size = output_size
+        
+
+
+class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
+    config_class = BeeBeeAudioModelConfig
+    _no_split_modules = ["WhisperEncoderLayer"]
+
+    def __init__(self, config: BeeBeeAudioModelConfig):
+        super().__init__(config)
+        self.config = config
+        self.audio_projector = build_audio_projector(projector_type=config.audio_projector_type, 
+                                                    encoder_hidden=config.d_model, 
+                                                    out_hidden=config.output_size, 
+                                                    downsample_ratio=self.config.audio_downsample_size)
+
+    def set_projector_trainable_only(self):
+        self.requires_grad_(False)
+        self.audio_projector.requires_grad_(True)
+       
+    
+    def lm_encode(self, features: torch.Tensor, feature_lengths: torch.Tensor, **kwargs) -> torch.Tensor:
+        hidden_state = super().forward(input_features=features, input_seq_len=feature_lengths).last_hidden_state # [b, max_seq, hidden]
+
+        hidden_state, seq_len = self.audio_projector(hidden_state, feature_lengths)
+        return hidden_state, seq_len
+
+
+    def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
+        features = torch.randn((50, 128), dtype=self.dtype, device=self.device)
+        feature_lens = torch.tensor([[50]], dtype=torch.int64, device=self.device)
+        return {"features": features, "feature_lengths": feature_lens}
+
+    def dummy_forward(self):
+        if getattr(self, "_dummy_data", None) is None:
+            features = torch.randn((50, 128), dtype=self.dtype, device=self.device)
+            feature_lens = torch.tensor([[50]], dtype=torch.int64, device=self.device)
+            self._dummy_data = {"features": features, "feature_lengths": feature_lens}
+        return self.lm_encode(**self._dummy_data)

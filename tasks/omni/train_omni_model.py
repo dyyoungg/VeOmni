@@ -37,7 +37,6 @@ from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
 
-
 logger = helper.create_logger(__name__)
 
 MAX_PIXELS = 768 * 28 * 28

@@ -1640,5 +1640,3 @@ class WhisperModel(WhisperPreTrainedModel):
             encoder_attentions=encoder_outputs.attentions,
         )
 
-
-
