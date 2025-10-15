@@ -379,6 +379,12 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
+    broadcast_model_weights_from_rank0: bool = field(
+        default=True,
+        metadata={
+            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+        },
+    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -588,6 +594,9 @@ class TrainingArguments:
         assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
             "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
         )
+
+        if self.data_parallel_mode == "fsdp2":
+            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
 
         # calculate gradient accumulation steps
         if self.global_batch_size is None:
