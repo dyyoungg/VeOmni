@@ -30,7 +30,7 @@ class AudioUpScaleProjector(nn.Module):
         x = self.afeat_1d_conv(x.transpose(1, 2)).transpose(1, 2) # Process Whisper features with 1D conv: (B x T x D) -> (B x T//2 x D')
         bs, seq_len, audio_hidden_size = x.size()
         # 计算目标长度（向上取整到 compress_ratio 的整数倍）
-        target_seq_len = (seq_len + self.linear_compress_ratio - 1) // self.linear_compress_ratio * self.linear_compress_ratio
+        target_seq_len = math.ceil((seq_len + self.linear_compress_ratio - 1) / self.linear_compress_ratio) * self.linear_compress_ratio
         pad_len = target_seq_len - seq_len
 
         if pad_len > 0:
