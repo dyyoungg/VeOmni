@@ -56,6 +56,7 @@ from ....distributed.sequence_parallel import (
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops.loss import causallm_loss_function
 from ....utils import helper
+from ....utils.device import is_torch_npu_available
 
 
 logger = helper.create_logger(__name__)
@@ -792,6 +793,9 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         deepstack_feature_lists = []
         # Modification: calculate max_seqlen from cu_seqlens here to avoid per layer CPU-GPU sync
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # Modification: move cu_seqlens to cpu when using NPU to avoid per layer CPU-GPU sync when using FA
+        if is_torch_npu_available():
+            cu_seqlens = cu_seqlens.cpu()
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -851,7 +855,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -1187,7 +1191,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     #     return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs
+    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1583,7 +1587,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)
 
-    @check_model_inputs
+    @check_model_inputs()
     @replace_return_docstrings(output_type=Qwen3VLCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -1827,10 +1831,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
         return input_ids, model_kwargs
 
-
-# Modification:
-# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
-ModelClass = Qwen3VLForConditionalGeneration
 
 __all__ = [
     "Qwen3VLVisionModel",

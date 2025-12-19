@@ -19,8 +19,6 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
 from transformers import (
-    AutoConfig,
-    AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
     PreTrainedModel,
@@ -29,7 +27,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
-from .loader import BaseModelLoader, get_loader
+from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
 if TYPE_CHECKING:
@@ -45,11 +43,18 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
-def build_processor(processor_path: str) -> "ProcessorMixin":
+def build_processor(processor_path: str, force_use_huggingface: bool = False) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return AutoProcessor.from_pretrained(processor_path, padding_side="right", trust_remote_code=True)
+    return get_model_processor(processor_path, force_use_huggingface, padding_side="right", trust_remote_code=True)
+
+
+def build_config(config_path: str, force_use_huggingface: bool = False, **config_kwargs) -> "PretrainedConfig":
+    """
+    Builds the model config.
+    """
+    return get_model_config(config_path, force_use_huggingface, trust_remote_code=True, **config_kwargs)
 
 
 def build_foundation_model(
@@ -75,7 +80,7 @@ def build_foundation_model(
     if isinstance(config_path, PretrainedConfig):
         config = config_path
     else:
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **config_kwargs)
+        config = build_config(config_path, force_use_huggingface, **config_kwargs)
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "fused"]:
@@ -95,17 +100,22 @@ def build_foundation_model(
         seed_kernel_attn_implementation = os.getenv("SEED_KERNEL_ATTN_IMPLEMENTATION")
 
         if seed_kernel_attn_implementation == "fa3":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa3")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa3")
         elif seed_kernel_attn_implementation == "fa2":
-            flash_attention_forward = partial(flash_attention_forward, implementation="fa2")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="fa2")
         elif seed_kernel_attn_implementation == "lego":
-            flash_attention_forward = partial(flash_attention_forward, implementation="lego")
+            flash_attention_forward = partial(flash_attention_forward, seed_fa_implementation="lego")
         else:
             assert seed_kernel_attn_implementation is None, (
                 f"seed_kernel_attn_implementation={seed_kernel_attn_implementation} is not supported"
             )
 
-        ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
+        ALL_ATTENTION_FUNCTIONS.register(
+            "flash_attention_2", partial(flash_attention_forward, implementation="flash_attention_2")
+        )
+        ALL_ATTENTION_FUNCTIONS.register(
+            "flash_attention_3", partial(flash_attention_forward, implementation="flash_attention_3")
+        )
 
     init_kwargs = {
         "config": config,

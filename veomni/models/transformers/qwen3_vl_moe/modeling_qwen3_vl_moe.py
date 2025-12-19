@@ -55,6 +55,7 @@ from ....distributed.sequence_parallel import (
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops import causallm_loss_function, fused_moe_forward
 from ....utils import helper
+from ....utils.device import is_torch_npu_available
 
 
 logger = helper.create_logger(__name__)
@@ -889,6 +890,9 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         deepstack_feature_lists = []
         # Modification: calculate max_seqlen from cu_seqlens here to avoid per layer CPU-GPU sync
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+        # Modification: move cu_seqlens to cpu when using NPU to avoid per layer CPU-GPU sync when using FA
+        if is_torch_npu_available():
+            cu_seqlens = cu_seqlens.cpu()
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -1008,7 +1012,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -1400,7 +1404,7 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     #     return special_image_mask, special_video_mask
 
     @auto_docstring
-    @check_model_inputs
+    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1839,7 +1843,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         fake_model = SimpleNamespace(config=self.config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)
 
-    @check_model_inputs
+    @check_model_inputs()
     @replace_return_docstrings(output_type=Qwen3VLMoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -2135,10 +2139,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
 
         return input_ids, model_kwargs
 
-
-# Modification:
-# Register the ModelClass which is used by veOmni to tell which class to match the config.json architecture
-ModelClass = Qwen3VLMoeForConditionalGeneration
 
 __all__ = [
     "Qwen3VLMoeVisionModel",
