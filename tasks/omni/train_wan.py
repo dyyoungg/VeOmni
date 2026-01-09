@@ -148,7 +148,6 @@ def main():
         init_device=args.train.init_device,
         torch_dtype="bfloat16",
         attn_implementation=args.model.attn_implementation,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model.micro_batch_size = args.train.micro_batch_size
 
@@ -215,6 +214,7 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                settings=wandb.Settings(console="off"),
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
