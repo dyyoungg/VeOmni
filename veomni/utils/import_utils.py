@@ -17,6 +17,7 @@
 
 import importlib.metadata
 import importlib.util
+import subprocess
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict
 
@@ -47,6 +48,7 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "librosa": _is_package_available("librosa"),
     "soundfile": _is_package_available("soundfile"),
     "triton": _is_package_available("triton"),
+    "quack": _is_package_available("quack"),
     "veomni_patch": _is_package_available("veomni_patch"),
 }
 
@@ -73,6 +75,18 @@ def is_fused_moe_available() -> bool:
     return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
 
 
+def is_quack_package_available() -> bool:
+    """Check if the quack package is installed."""
+    return _PACKAGE_FLAGS["quack"]
+
+
+def is_quack_gemm_available() -> bool:
+    """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
+    from .device import is_sm90_or_above
+
+    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
+
+
 def is_video_audio_available() -> bool:
     return _PACKAGE_FLAGS["av"] and _PACKAGE_FLAGS["librosa"] and _PACKAGE_FLAGS["soundfile"]
 
@@ -87,5 +101,25 @@ def is_transformers_version_greater_or_equal_to(value: str) -> bool:
     return _get_package_version("transformers") >= version.parse(value)
 
 
-def is_veomni_patch_available() -> bool:
-    return _PACKAGE_FLAGS["veomni_patch"]
+def is_linux_aarch64_platform() -> bool:
+    import platform
+
+    return platform.system() == "Linux" and platform.machine().lower() == "aarch64"
+
+
+_FFMPEG_AVAILABLE = None
+
+
+def is_ffmpeg_available() -> bool:
+    """Check if ffmpeg is available (required for torchcodec and URL downloads).
+
+    Supported FFmpeg versions: 4-8.
+    """
+    global _FFMPEG_AVAILABLE
+    if _FFMPEG_AVAILABLE is None:
+        try:
+            subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True, text=True)
+            _FFMPEG_AVAILABLE = True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            _FFMPEG_AVAILABLE = False
+    return _FFMPEG_AVAILABLE

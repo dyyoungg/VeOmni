@@ -16,17 +16,23 @@ VeOmni is a versatile framework for both single- and multi-modal pre-training an
 :caption: Get Started
 
 get_started/installation/install.md
-get_started/installation/install_ascend.md
+get_started/installation/install_ascend_x86.md
+get_started/installation/install_ascend_arm.md
 ```
 
 ```{toctree}
 :maxdepth: 1
 :caption: Usage
 
-usage/basic_modules.md
+
 usage/arguments.md
-usage/support_new_models.md
+usage/basic_modules.md
+usage/data_packing_and_dyn_bsz.md
+usage/support_new_models/guide_and_checklist.md
+usage/support_new_models/qwen3_vl_example.md
+usage/support_new_models/qwen3_omni_moe_example.md
 usage/checkpoint_conversion.md
+usage/trainer.md
 ```
 
 ```{toctree}
@@ -41,7 +47,10 @@ hardware_support/get_started_npu.md
 :caption: Examples
 
 examples/qwen3.md
+examples/qwen3_5.md
+examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen3_omni_moe.md
 examples/wan2.1.md
 ```
 
@@ -49,9 +58,25 @@ examples/wan2.1.md
 :maxdepth: 1
 :caption: Key Features
 
+key_features/model_loader.md
+key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
-key_features/preprocessor_registry.md
+
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Design
+
+design/kernel_selection.md
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Transformers v5 Updates
+
+transformers_v5/index.md
 ```
 
 ---
