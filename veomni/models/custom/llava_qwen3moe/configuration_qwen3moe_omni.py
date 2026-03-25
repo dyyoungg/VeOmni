@@ -86,9 +86,9 @@ if __name__ == "__main__":
     # Example: compose the omni config from your encoders and Qwen3Moe foundation.
     from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModelConfig
     from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
-    from veomni.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from transformers import Qwen3MoeConfig
 
-    # 1) Instantiate encoder sub-configs directly (recommended)
+    # 1 Instantiate encoder sub-configs directly (recommended)
     image_cfg = BeeBeeVLVisionModelConfig(
         spatial_merge_size=2,
         return_hidden_states=False,
@@ -106,7 +106,7 @@ if __name__ == "__main__":
         output_size=6144,
     )
 
-    # 2) Instantiate foundation LLM config (Qwen3 Moe)
+    # 2 Instantiate foundation LLM config (Qwen3 Moe)
     foundation_cfg = Qwen3MoeConfig(
         vocab_size=151936,
         hidden_size=2048,
@@ -118,7 +118,7 @@ if __name__ == "__main__":
         tie_word_embeddings=False,
     )
 
-    # 3) Build the top-level omni config
+    # 3 Build the top-level omni config
     omni_cfg = Qwen3MoeOmniConfig(
         encoder_config={
             "image_config": image_cfg,

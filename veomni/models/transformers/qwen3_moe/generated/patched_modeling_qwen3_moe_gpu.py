@@ -332,7 +332,7 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(config)
         else:
-            self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+            self.mlp = Qwen3MoeMLP(config)
         self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_size = config.hidden_size
@@ -396,7 +396,7 @@ class Qwen3MoePreTrainedModel(PreTrainedModel):
         super()._init_weights(module)
         std = self.config.initializer_range
         if isinstance(module, Qwen3MoeExperts):
-            init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            init.normal_(module.gate_proj, mean=0.0, std=std)
             init.normal_(module.down_proj, mean=0.0, std=std)
         elif isinstance(module, Qwen3MoeTopKRouter):
             init.normal_(module.weight, mean=0.0, std=std)

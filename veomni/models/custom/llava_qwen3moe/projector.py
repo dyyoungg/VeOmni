@@ -77,6 +77,7 @@ class DynamicAvgPoolProjector(nn.Module):
         outputs = []
         start = 0
         seq_len = []
+        hidden_size = images_feature.shape[-1]
         
         if merge_size is None:
             merge_size = torch.tensor([self.merge_size]*images_thw.shape[0])
@@ -88,17 +89,18 @@ class DynamicAvgPoolProjector(nn.Module):
             length = int(t * h * w)
             img_seq = images_feature[start:start + length]  # [t*h*w, hidden]
             start += length
-
+            print("img seq ", img_seq.shape)
             # reshape to [t, h, w, hidden] -> permute to [hidden, t, h, w]
             img_feat = img_seq.view(t, h, w, -1).permute(3, 0, 1, 2)  # [hidden, t, h, w]
 
             Mh, Nw = get_adaptive_pool_size(h, w, scale=self.mm_downsample_ratio)
             pool = nn.AdaptiveAvgPool2d((Mh, Nw))  # pool on H, W
+            print("conv 2d", Mh, Nw )
 
             pooled = pool(img_feat)  # [hidden, t, Mh, Nw]
             pooled = pooled.permute(1, 2, 3, 0).contiguous()  # [t, Mh, Nw, hidden]
           
-            pooled = pooled.view(-1, self.hidden_size)  # flatten: [t * Mh * Nw, hidden]
+            pooled = pooled.view(-1, hidden_size)  # flatten: [t * Mh * Nw, hidden]
             
             tokens = [pooled.shape[0]//t]*t # calculate each image
             outputs.append(pooled)

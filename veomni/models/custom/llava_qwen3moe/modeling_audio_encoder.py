@@ -48,20 +48,20 @@ class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
        
     
     def lm_encode(self, features: torch.Tensor, feature_lengths: torch.Tensor, **kwargs) -> torch.Tensor:
-        hidden_state = super().forward(input_features=features, input_seq_len=feature_lengths).last_hidden_state # [b, max_seq, hidden]
+        hidden_state = super().forward(input_features=features, input_seq_lens=feature_lengths).last_hidden_state # [b, max_seq, hidden]
 
         hidden_state, seq_len = self.audio_projector(hidden_state, feature_lengths)
         return hidden_state, seq_len
 
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
-        features = torch.randn((50, 128), dtype=self.dtype, device=self.device)
-        feature_lens = torch.tensor([[50]], dtype=torch.int64, device=self.device)
+        features = torch.zeros(2, 128, 3000).to(dtype=self.dtype, device=self.device)
+        feature_lens = torch.tensor([50, 50], dtype=torch.int64, device=self.device)
         return {"features": features, "feature_lengths": feature_lens}
 
     def dummy_forward(self):
         if getattr(self, "_dummy_data", None) is None:
-            features = torch.randn((50, 128), dtype=self.dtype, device=self.device)
-            feature_lens = torch.tensor([[50]], dtype=torch.int64, device=self.device)
+            features = torch.zeros(2, 128, 3000).to(dtype=self.dtype, device=self.device)
+            feature_lens = torch.tensor([50, 50], dtype=torch.int64, device=self.device)
             self._dummy_data = {"features": features, "feature_lengths": feature_lens}
         return self.lm_encode(**self._dummy_data)
