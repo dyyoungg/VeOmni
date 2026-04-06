@@ -529,6 +529,7 @@ def _normalize_key(key: str) -> Optional[str]:
     - "model.lm_head.weight" -> "lm_head.weight" (special case)
     - Other "model.*" keys -> log warning and strip "model." prefix
     """
+  
     if not key.startswith("model."):
         return None
 
@@ -538,13 +539,10 @@ def _normalize_key(key: str) -> Optional[str]:
     elif key == "model.lm_head.weight":
         # Special case: model.lm_head.weight -> lm_head.weight
         return "lm_head.weight"
-    else:
-        # Other keys with single "model." prefix - log and strip prefix
-        logger.warning(
-            f"Found key with single 'model.' prefix that doesn't match expected patterns: '{key}'. "
-            f"Converting to '{key[6:]}' by stripping 'model.' prefix."
-        )
+    elif "model.image_encoder" in key or "model.audio_encoder" in key:
         return key[6:]
+    else:
+        return key # 
 
 
 def _get_sharding_plan(

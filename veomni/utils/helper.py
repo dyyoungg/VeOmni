@@ -27,6 +27,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+import json
 
 import numpy as np
 import psutil
@@ -88,6 +89,9 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         # packed micro batch
         seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
         return seqlens
+    elif "seq_lens" in micro_batch:
+        seqlens = micro_batch["seq_lens"].tolist()
+        return seqlens
     else:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
@@ -101,9 +105,23 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     for key in image_shape_keys:
         if key in micro_batch:
             grid_thw = micro_batch[key]
-            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
-            image_seqlens.extend(seqlens)
+            if grid_thw is not None:
+                seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
+                image_seqlens.extend(seqlens)
     return image_seqlens
+
+def _compute_audio_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    audio_shape_keys = ["audio_features_lens"]
+    audio_seqlens = []
+    for key in audio_shape_keys:
+        if key in micro_batch:
+            audio_feature_lens = micro_batch[key]
+            if audio_feature_lens is not None:
+                seqlens = audio_feature_lens.tolist()
+                audio_seqlens.extend(seqlens)
+    return audio_seqlens
+
+
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -152,6 +170,7 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.audio_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -188,18 +207,20 @@ class EnvironMeter:
             for sample in micro_batch:
                 self.batch_seqlens.extend(_compute_seqlens(sample))
                 self.images_seqlens.extend(_compute_image_seqlens(sample))
+                self.audio_seqlens.extend(_compute_audio_seqlens(micro_batch))
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
         else:
             self.batch_seqlens.extend(_compute_seqlens(micro_batch))
             self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+            self.audio_seqlens.extend(_compute_audio_seqlens(micro_batch))
             if self.enable_multisource:
                 self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
-    def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.images_seqlens) > 0:
+    def step(self, delta_time: float, global_step: int, worker_metrics_queue=None) -> Dict[str, Any]:
+        if len(self.images_seqlens) > 0 or len(self.audio_seqlens) > 0:
             flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
+                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens, audio_seqlens=self.audio_seqlens
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
@@ -228,37 +249,81 @@ class EnvironMeter:
 
         # cpu memory
         cpu_memory_info = psutil.virtual_memory()
+        gen0, gen1, gen2 = gc.get_count()
 
         metrics = {
-            "flops_achieved(T)": flops_achieved,
-            "flops_promised(T)": flops_promised,
-            "mfu": mfu,
+            "system_metric/flops_achieved(T)": flops_achieved,
+            "system_metric/flops/flops_promised(T)": flops_promised,
+            "system_metric/mfu": mfu,
             "training/avg_effective_len": avg_effective_len,
             "training/avg_sample_seq_len": avg_sample_seq_len,
-            "tokens_per_second(M)": tokens_per_second / 1e6,
-            "consume_tokens(M)": self.consume_tokens / 1e6,
-            "consume_tokens(B)": self.consume_tokens / 1e9,
-            "consumed_chunk_num": self.consume_chunks,
-            "max_memory_allocated(GB)": allocated_memory / (1024**3),
-            "max_memory_reserved(GB)": reserved_memory / (1024**3),
-            "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-            "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-            "cpu_memory_usage(%)": cpu_memory_info.percent,
-            "num_alloc_retries": num_alloc_retries,
+            "gc/gen0_count": gen0,
+            "gc/gen1_count": gen1,
+            "gc/gen2_count": gen2,
+            "training/tokens_per_second(M)": tokens_per_second / 1e6,
+            "training/consume_tokens(M)": self.consume_tokens / 1e6,
+            "training/consume_tokens(B)": self.consume_tokens / 1e9,
+            "training/consumed_chunk_num": self.consume_chunks,
+            "memory/max_memory_allocated(GB)": allocated_memory / (1024**3),
+            "memory/max_memory_reserved(GB)": reserved_memory / (1024**3),
+            "memory/cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
+            "memory/cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
+            "memory/cpu_memory_usage(%)": cpu_memory_info.percent,
+            "memory/num_alloc_retries": num_alloc_retries,
         }
-
+        worker_metrics = self.get_worker_metrics(worker_metrics_queue)
+        metrics.update(worker_metrics)
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
 
         if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
             empty_cache()
+            import ctypes
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                logger.info("empty cache failed")
+                pass
 
         if self.gc_steps > 0 and global_step % self.gc_steps == 0:
             gc.collect()
 
+    
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.audio_seqlens = []  
+
+        return metrics
+    
+
+    def get_worker_metrics(self, worker_metrics_queue) -> Dict[str, Any]:
+        metrics = {}
+        if worker_metrics_queue is None:
+            return metrics
+        # drain queue
+        worker_rss = {}
+        while True:
+            try:
+                m = worker_metrics_queue.get_nowait()
+                worker_rss[m["pid"]] = m["rss_mb"]
+            except Exception:
+                break
+
+        if not worker_rss:
+            return metrics
+
+        rss_values = list(worker_rss.values())
+        local_avg_rss = sum(rss_values) / len(rss_values)
+
+        # 只有 rank0 写入，wandb 本来也只有 rank0 在 log
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return metrics
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        metrics[f"worker/rss_mb/rank{rank}_avg"] = local_avg_rss
+        for i, (pid, rss) in enumerate(worker_rss.items()):
+            metrics[f"worker/rss_mb/rank{rank}_worker{i}"] = rss
 
         return metrics
 
@@ -432,7 +497,9 @@ def enable_third_party_logging() -> None:
     """
     Enables explicit logger of the third-party libraries.
     """
-    transformers.logging.set_verbosity_info()
+    transformers.utils.logging.set_verbosity_error()
+    # transformers.logging.set_verbosity_info()
+   
     transformers.logging.enable_default_handler()
     transformers.logging.enable_explicit_format()
 
@@ -713,3 +780,31 @@ def create_profiler(
 
 if os.getenv("DISABLE_WARNINGS", "0").lower() in ["true", "1"]:
     disable_warning()
+
+
+def read_data(data_path):
+    data_list = []
+    if os.path.isdir(data_path):
+        jsonl_files = sorted([os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith('.jsonl')])
+        json_files = sorted([os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith('.json')])
+        all_files = jsonl_files + json_files
+        for file_path in all_files:
+            if file_path.endswith('.jsonl'):
+                with open(file_path, 'r') as f:
+                    for line in f.readlines():
+                        data = json.loads(line)
+                        data_list.append(data)
+            elif file_path.endswith('.json'):
+                with open(file_path, 'r') as f:
+                    data_list.extend(json.load(f))
+    elif data_path.endswith('.jsonl'):
+        with open(data_path, 'r') as f:
+            for line in f.readlines():
+                data = json.loads(line)
+                data_list.append(data)
+    elif data_path.endswith('.json'):
+        with open(data_path, 'r') as f:
+            data_list = json.load(f)
+    else:
+        raise NotImplementedError("data format is not supported")
+    return data_list

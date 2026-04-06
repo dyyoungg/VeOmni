@@ -90,7 +90,8 @@ def apply_veomni_fused_moe_patch(
         _fused_moe_forward = quack_gemm_fused_moe_forward
     elif moe_implementation == "fused" and is_fused_moe_available() and get_env("USE_GROUP_GEMM") == "1":
         from .group_gemm import group_gemm_fused_moe_forward
-
+        
         _fused_moe_forward = group_gemm_fused_moe_forward
+        logger.info(f"Apply moe implementation {moe_implementation} successful !!")
     else:
         _fused_moe_forward = None

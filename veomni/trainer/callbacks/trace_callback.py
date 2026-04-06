@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import time
+import os
 from typing import TYPE_CHECKING, Any, Dict, List
-
+from collections import deque
 from tqdm import trange
+import tracemalloc
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
@@ -44,7 +46,7 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
 
-        config = self.trainer.model_config
+        config = self.trainer.model_config.foundation_config if getattr(self.trainer.model_config, "foundation_config") else self.trainer.model_config
         if hasattr(config, "num_experts"):
             from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
 
@@ -82,6 +84,23 @@ class MoERouterMonitorCallback(Callback):
             image = self.monitor.create_wandb_image(load_matrix)
             vio = MoERouterMonitor.compute_vio(load_matrix)
             max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
+            tb_writer = getattr(self.trainer, "tb_writer", None)
+            if tb_writer is not None:
+            
+                for i in range(num_layers):
+                    tb_writer.add_scalar(f"moe/max_vio/layer_{i}", max_vio[i].item(), state.global_step)
+                    tb_writer.add_scalar(f"moe/min_vio/layer_{i}", min_vio[i].item(), state.global_step)
+                    tb_writer.add_scalar(f"moe/avg_vio/layer_{i}", avg_vio[i].item(), state.global_step)
+          
+                tb_writer.add_scalar("moe/max_vio/max", max_vio.max().item(), state.global_step)
+                tb_writer.add_scalar("moe/max_vio/avg", max_vio.mean().item(), state.global_step)
+                tb_writer.add_scalar("moe/avg_vio/max", avg_vio.max().item(), state.global_step)
+                tb_writer.add_scalar("moe/avg_vio/avg", avg_vio.mean().item(), state.global_step)
+        
+                heatmap = load_matrix.unsqueeze(0)  # (1, num_layers, num_experts)
+                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+                tb_writer.add_image("moe/expert_load_heatmap", heatmap, state.global_step)
+
             metrics = {"moe/expert_load_heatmap": image}
             for i in range(num_layers):
                 metrics[f"moe/max_vio/layer_{i}"] = max_vio[i].item()
@@ -94,6 +113,7 @@ class MoERouterMonitorCallback(Callback):
             metrics["moe/avg_vio/max"] = avg_vio.max().item()
             metrics["moe/avg_vio/avg"] = avg_vio.mean().item()
             wandb.log(metrics, step=state.global_step)
+
             logger.info_rank0(
                 f"Step {state.global_step}: uploaded MoE load balance heatmap "
                 f"({num_layers} layers, {load_matrix.shape[1]} experts, "
@@ -119,6 +139,10 @@ class WandbTraceCallback(Callback):
             from dataclasses import asdict
 
             import wandb
+            try:
+                wandb.login(key=os.getenv("WANDB_API_KEY", None))
+            except:
+                print("未找到 WANDB_API_KEY 环境变量")
 
             wandb.init(
                 project=args.train.wandb.project,
@@ -135,6 +159,96 @@ class WandbTraceCallback(Callback):
             import wandb
 
             wandb.log(self.trainer.step_env_metrics, step=state.global_step)
+
+    def on_eval_end(self, state: TrainerState, eval_metrics: Dict[str, Any] = None, **kwargs) -> None:
+        """Log evaluation results to wandb.
+ 
+        Called directly by EvaluateCallback._log_eval_results() immediately after
+        evaluation completes, so metrics are always logged at the exact eval step.
+ 
+        Args:
+            state:        current TrainerState.
+            eval_metrics: dict of metric_name → value, including 'step' and 'epoch'.
+        """
+        if eval_metrics is None:
+            return
+ 
+        args: "VeOmniArguments" = self.trainer.args
+        if args.train.global_rank != 0 or not args.train.wandb.enable:
+            return
+ 
+        import wandb
+ 
+        # Prefix with "eval/" so training and eval metrics are separated in wandb.
+        eval_step = eval_metrics.get("step", state.global_step)
+        wandb_payload = {
+            f"eval/{k}": v
+            for k, v in eval_metrics.items()
+            if k not in ("step", "epoch")
+        }
+        # Also log epoch for easy filtering.
+        wandb_payload["eval/epoch"] = eval_metrics.get("epoch", state.epoch)
+ 
+        wandb.log(wandb_payload, step=eval_step)
+        logger.info_rank0(
+            f"[WandbTrace] Logged {len(wandb_payload)} eval metrics at step={eval_step}."
+        )
+
+
+class TensorboardTraceCallback(Callback):
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+        self.tb_writer = None
+        if args.train.global_rank == 0:
+            from torch.utils.tensorboard import SummaryWriter
+
+            tb_log_dir = os.path.join(args.train.checkpoint.output_dir, "runs")
+            os.makedirs(tb_log_dir, exist_ok=True)
+            
+            self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
+            self.trainer.tb_writer = self.tb_writer
+            print(f"TensorBoard 已经初始化，日志将保存至: {tb_log_dir}")
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+
+        if args.train.global_rank == 0 and self.tb_writer is not None:
+            for k, v in self.trainer.step_env_metrics.items():
+           
+                if isinstance(v, (int, float)):
+                    self.tb_writer.add_scalar(k, v, global_step=state.global_step)
+
+    def on_eval_end(self, state: TrainerState, eval_metrics: Dict[str, Any] = None, **kwargs) -> None:
+        """Log evaluation results to TensorBoard."""
+        if eval_metrics is None:
+            return
+
+        args: "VeOmniArguments" = self.trainer.args
+        if args.train.global_rank != 0 or getattr(self, "tb_writer", None) is None:
+            return
+
+        eval_step = eval_metrics.get("step", state.global_step)
+        
+        # 记录所有非 step/epoch 的 eval 指标
+        logged_count = 0
+        for k, v in eval_metrics.items():
+            if k not in ("step", "epoch") and isinstance(v, (int, float)):
+                self.tb_writer.add_scalar(f"eval/{k}", v, global_step=eval_step)
+                logged_count += 1
+        
+        self.tb_writer.flush()
+        
+        # 如果你的环境中已经配置了 logger，可以解除这行注释
+        logger.info_rank0(
+            f"[TensorboardTrace] Logged {logged_count} eval metrics at step={eval_step}."
+        )
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """训练结束时关闭 TensorBoard Writer"""
+        if getattr(self, "tb_writer", None) is not None:
+            self.tb_writer.close()
+            self.tb_writer = None
+
 
 
 class ProfileTraceCallback(Callback):
@@ -176,6 +290,10 @@ class EnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
         )
+       
+        self._loss_window = deque(maxlen=100)
+        self._tracemalloc_started = False
+        self._tracemalloc_snapshot = None
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
@@ -186,10 +304,12 @@ class EnvironMeterCallback(Callback):
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         delta_time = time.time() - self.start_time
-        step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step)
+        wq = getattr(self.trainer.train_dataloader, "worker_metrics_queue", None)
+        step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step,  worker_metrics_queue=wq)
 
         step_train_metrics = {
             "total_loss": loss,
+           
         }
         step_train_metrics.update(loss_dict)
         step_train_metrics["grad_norm"] = grad_norm
@@ -199,7 +319,14 @@ class EnvironMeterCallback(Callback):
             f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
             for k, v in step_train_metrics.items()
         }
+        step_train_metrics["training/iter_time"] = delta_time
+        current_loss = step_train_metrics["training/total_loss"]
+        self._loss_window.append(current_loss)
+        train_loss = sum(self._loss_window) / len(self._loss_window)
+        step_train_metrics["training/total_loss"] = train_loss
 
+        # step_train_metrics["training/raw_loss"] = current_loss
+     
         lr = max(self.trainer.lr_scheduler.get_last_lr())
         step_train_metrics["training/lr"] = lr
 
@@ -207,6 +334,53 @@ class EnvironMeterCallback(Callback):
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
+
+        if self.trainer.args.train.global_rank != 0:
+            return
+        
+        logging_steps = getattr(self.trainer.args.train, "logging_steps", 10)
+
+        if state.global_step % logging_steps == 0:
+            global_loss =  step_train_metrics["training/total_loss"]
+            train_info = (
+                f"[step {state.global_step}] "
+                f"loss: {global_loss:.4f}  "
+                f"grad_norm: {grad_norm:.3f}  "
+                f"lr: {lr:.6e}  "
+                f"time: {delta_time:.2f}s"
+            )
+            logger.info(train_info)
+
+            # 吞吐 & 显存
+            env_info = (
+                f"  mfu: {step_env_metrics.get('mfu', 0):.4f}  "
+                f"tokens/s: {step_env_metrics.get('tokens_per_second(M)', 0):.4f}M  "
+                f"consumed: {step_env_metrics.get('consume_tokens(B)', 0):.4f}B  "
+                f"avg_seqlen: {step_env_metrics.get('training/avg_sample_seq_len', 0):.1f}  "
+                f"mem_alloc: {step_env_metrics.get('max_memory_allocated(GB)', 0):.2f}GB  "
+                f"mem_reserved: {step_env_metrics.get('max_memory_reserved(GB)', 0):.2f}GB  "
+                f"alloc_retries: {step_env_metrics.get('num_alloc_retries', 0)}  "
+                f"cpu_memory_usage(%): {step_env_metrics.get('cpu_memory_usage(%)', 0):.2f} "
+            )
+            logger.info(env_info)
+        
+        if state.global_step == 50:
+            # 第一次：开始追踪，记录基准快照
+            tracemalloc.start(10)  # 10层调用栈
+            self._tracemalloc_snapshot = tracemalloc.take_snapshot()
+            logger.info("[MemTrace] baseline snapshot taken.")
+        
+        elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
+            # 之后每 200 步和基准对比
+            new_snapshot = tracemalloc.take_snapshot()
+            top_stats = new_snapshot.compare_to(
+                self._tracemalloc_snapshot, 'lineno'
+            )
+            logger.info(f"[MemTrace] step={state.global_step} top memory growth:")
+            for stat in top_stats[:10]:  
+                logger.info(f"  {stat}")
+           
+            self._tracemalloc_snapshot = new_snapshot
 
 
 class TqdmCallback(Callback):
@@ -219,6 +393,7 @@ class TqdmCallback(Callback):
             initial=self.trainer.start_step,
             disable=args.train.local_rank != 0,
         )
+        
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
         self.data_loader_tqdm.close()
@@ -227,3 +402,58 @@ class TqdmCallback(Callback):
         postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix)
         self.data_loader_tqdm.update()
+
+
+class VideoTqdmCallback(Callback):
+    def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+        self.epoch_total = self.trainer.init_data_size
+        self._last_video_trained_num = self.trainer.start_step  # 恢复训练时的偏移
+        self.data_loader_tqdm = trange(
+            self.epoch_total,
+            desc=f"data size {self.epoch_total}",
+            total=self.epoch_total,
+            initial=self.trainer.start_step,
+            disable=args.train.local_rank != 0,
+        )
+
+    def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
+        self.data_loader_tqdm.close()
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        def fmt(k, v):
+            if "loss" in k:
+                return f"{k.split('/', 1)[-1]}: {v:.4f}"   # loss 保留4位
+            elif "grad_norm" in k:
+                return f"{k.split('/', 1)[-1]}: {v:.3f}"   # grad_norm 保留3位
+            elif "lr" in k:
+                return f"{k.split('/', 1)[-1]}: {v:.3e}"   # lr 用科学计数法
+            elif "iter_time" in k:
+                return f"{k.split('/', 1)[-1]}: {v:.2f}"
+            else:
+                return f"{k.split('/', 1)[-1]}: {v:.4f}"
+            
+        trained_videos = state.video_trained_num
+        global_step = f"step:{state.global_step}"
+        epoch_progress = f"{trained_videos / self.epoch_total:.3f}" if self.epoch_total > 0 else "0.000"
+
+        metrics_str = ", ".join(fmt(k, v) for k, v in self.trainer.step_train_metrics.items())
+        eval_metrics: dict = getattr(self.trainer, "eval_metrics", None)
+        eval_suffix = ""
+        if eval_metrics:
+            eval_step = eval_metrics.get("step", "?")
+            core = {k: v for k, v in eval_metrics.items() if k not in ("step", "epoch")}
+            # Show at most the 4 most important metrics to keep the bar readable.
+            priority_keys = ["acc", "prob", "all_acc"] + [
+                k for k in core if k not in ("acc", "prob", "all_acc")
+            ]
+            shown = {k: core[k] for k in priority_keys[:4] if k in core}
+            eval_summary = " ".join(f"{k}:{v:.3f}" for k, v in shown.items())
+            eval_suffix = f" | eval@{eval_step}[{eval_summary}]"
+ 
+        postfix = f"{epoch_progress} | {global_step} | {metrics_str} | {eval_suffix}"
+        self.data_loader_tqdm.set_postfix_str(postfix)
+        delta = state.video_trained_num - self._last_video_trained_num
+        self.data_loader_tqdm.update(max(delta, 1))
+        self._last_video_trained_num = state.video_trained_num
+        self.trainer.eval_metrics = None

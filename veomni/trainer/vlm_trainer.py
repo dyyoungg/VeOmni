@@ -17,11 +17,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
+from transformers import AutoConfig
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_foundation_model, build_processor
+from ..models.custom.llava_qwen3moe.auto import build_qwen3moe_omni_from_pretrained
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -40,14 +42,27 @@ class VLMTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether or not to freeze the vit parameters."},
     )
+    freeze_vit_projector: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the vit projector parameters."},
+    )
     freeze_audio_tower: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the audio tower parameters."},
+    )
+    freeze_audio_projector: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the audio tower parameters."},
+    )
+    freeze_llm: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the llm parameters."},
     )
     vit_lr: float = field(
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
+
 
 
 @dataclass
@@ -118,16 +133,26 @@ class VLMTrainer:
     def _build_model(self):
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
-        self.base.model = build_foundation_model(
-            config_path=args.model.config_path,
-            weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-            attn_implementation=args.model.ops_implementation.attn_implementation,
-            moe_implementation=args.model.ops_implementation.moe_implementation,
-            init_device=args.train.init_device,
-            encoder_data_balance=args.model.encoder_data_balance,
-            encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
-        )
+        cfg = AutoConfig.from_pretrained(args.model.config_path, trust_remote_code=True)
+        if cfg.model_type == "llavaqwen3moe_omni":
+            self.base.model = build_qwen3moe_omni_from_pretrained(
+                args.model.model_path,
+                init_device=args.train.init_device,
+                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+                attn_implementation=args.model.ops_implementation.attn_implementation,
+                moe_implementation=args.model.ops_implementation.moe_implementation,
+            )
+        else:
+            self.base.model = build_foundation_model(
+                config_path=args.model.config_path,
+                weights_path=args.model.model_path,
+                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+                attn_implementation=args.model.ops_implementation.attn_implementation,
+                moe_implementation=args.model.ops_implementation.moe_implementation,
+                init_device=args.train.init_device,
+                encoder_data_balance=args.model.encoder_data_balance,
+                encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+            )
         self.base.model_config = self.base.model.config
 
     def _freeze_model_module(self):
@@ -140,17 +165,33 @@ class VLMTrainer:
             if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
                 self.base.model.thinker.visual.requires_grad_(False)
                 self.base.model.thinker.visual.merger.requires_grad_(True)
+            
+            elif model_config.model_type in ("llavaqwen3moe_omni"):
+                self.base.model.image_encoder.requires_grad_(False)
+
             else:
                 self.base.model.visual.requires_grad_(False)
 
-        if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.model.thinker.audio_tower.requires_grad_(False)
-            # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
-            audio_proj = (
-                getattr(self.base.model.thinker.audio_tower, "proj1", None) or self.base.model.thinker.audio_tower.proj
-            )
-            audio_proj.requires_grad_(True)
+        if args.train.freeze_vit_projector:
+            if model_config.model_type in ("llavaqwen3moe_omni"):
+                self.base.model.image_encoder.mm_projector.requires_grad_(False)
 
+        if args.train.freeze_audio_tower:
+            if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+                self.base.model.thinker.audio_tower.requires_grad_(False)
+                # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
+                audio_proj = (
+                    getattr(self.base.model.thinker.audio_tower, "proj1", None) or self.base.model.thinker.audio_tower.proj
+                )
+                audio_proj.requires_grad_(True)
+            elif model_config.model_type in ("llavaqwen3moe_omni"):
+                self.base.model.audio_encoder.requires_grad_(False)
+        
+        if args.train.freeze_audio_projector:
+            if model_config.model_type in ("llavaqwen3moe_omni"):
+                self.base.model.audio_encoder.audio_projector.requires_grad_(False)
+
+    
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
@@ -179,7 +220,7 @@ class VLMTrainer:
         )
 
     def _build_collate_fn(self):
-        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe", "llavaqwen3moe_omni"):
             data_collate_info = {
                 "audio_feature_lengths": (0, False, None, None),
                 "input_features": (0, True, 0, 1),

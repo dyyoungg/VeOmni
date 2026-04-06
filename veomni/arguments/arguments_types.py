@@ -321,6 +321,10 @@ class CheckpointConfig:
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
 
+    save_total_limit: int = field(
+        default=2,
+        metadata={"help": "Number of model ckpt save."},
+    )
 
 @dataclass
 class TrainingArguments:
@@ -339,6 +343,10 @@ class TrainingArguments:
     micro_batch_size: int = field(
         default=1,
         metadata={"help": "Micro batch size. The number of samples per iteration on each device."},
+    )
+    per_device_train_batch_size: int = field(
+        default=1,
+        metadata={"help": "batch size per device."},
     )
     global_batch_size: Optional[int] = field(
         default=None,
@@ -385,7 +393,7 @@ class TrainingArguments:
         metadata={"help": "Enable batch invariant mode."},
     )
     empty_cache_steps: int = field(
-        default=500,
+        default=200,
         metadata={"help": "Number of steps between two empty cache operations."},
     )
     gc_steps: int = field(
@@ -573,7 +581,7 @@ class OpsImplementationConfig:
         metadata={"help": "Attention implementation to use."},
     )
     moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
-        default=None,
+        default="fused",
         metadata={
             "help": "MoE implementation to use. "
             "'eager' for reference loop, 'fused' for Triton group-gemm, "
@@ -603,7 +611,7 @@ class ModelArguments:
         metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
     )
     model_path: Optional[str] = field(
-        default=None,
+        default="",
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
     tokenizer_path: Optional[str] = field(
@@ -739,10 +747,11 @@ class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
 
     train_path: str = field(
+        default="",
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
     eval_path: Optional[str] = field(
-        default=None,
+        default="",
         metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
     )
     train_size: int = field(

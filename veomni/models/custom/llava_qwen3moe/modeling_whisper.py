@@ -62,6 +62,16 @@ from transformers.utils import (
 from transformers.models.whisper.configuration_whisper import WhisperConfig
 from transformers.models.whisper.tokenization_whisper import TASK_IDS, TO_LANGUAGE_CODE
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_heads_scatter_seq, 
+    gather_seq_scatter_heads, 
+    pad_tensor, 
+    unpad_tensor, 
+    slice_input_tensor,
+    gather_outputs
+    )
+
 
 logger = logging.get_logger(__name__)
 
@@ -383,6 +393,15 @@ class WhisperAttention(nn.Module):
             query_states = query_states.view(-1, self.num_heads, self.head_dim)
             key_states = key_states.view(-1, self.num_heads, self.head_dim)
             value_states = value_states.view(-1, self.num_heads, self.head_dim)
+            if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+                qkv = torch.stack([query_states, key_states, value_states], dim=0)
+                unpadded_dim_size = cu_seqlens_q[-1]
+                qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group)
+                sp_padding_size = qkv.size(1) - unpadded_dim_size
+                if sp_padding_size > 0:
+                    qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
+
+                query_states, key_states, value_states = qkv.unbind(0)
             if is_fa3_ready:
                 attn_output, attn_probs_ret = fa3_varlen_func(
                     q=query_states,
@@ -417,7 +436,11 @@ class WhisperAttention(nn.Module):
                     attn_output, attn_probs = attn_output
                 else:
                     attn_probs = None
-            attn_output = attn_output.view(-1, self.embed_dim)
+
+            if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+                attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
+                attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
+            attn_output = attn_output.reshape(-1, self.embed_dim).contiguous()
 
         ret = self.out_proj(attn_output)
 
@@ -788,6 +811,7 @@ class WhisperPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     main_input_name = "input_features"
     supports_gradient_checkpointing = True
+    _supports_flash_attn=True
     _no_split_modules = ["WhisperEncoderLayer", "WhisperDecoderLayer"]
 
     def _init_weights(self, module):
@@ -1034,11 +1058,11 @@ class WhisperEncoder(WhisperPreTrainedModel):
         )
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
-
+        batch_seq = inputs_embeds.shape[-1]
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
         embed_pos = self.embed_positions.weight
 
-        hidden_states = inputs_embeds + embed_pos
+        hidden_states = inputs_embeds + embed_pos[:batch_seq]
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training
         )
@@ -1070,6 +1094,10 @@ class WhisperEncoder(WhisperPreTrainedModel):
                 max_seqlen_kv = max(max_seqlen_kv, input_seq_lens[i])
 
             hidden_states = torch.cat(hidden_states_collect, dim=0)
+
+            if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+                unpadded_dim_len = cu_seqlens_q[-1]
+                hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group, padding=True)
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
@@ -1124,6 +1152,12 @@ class WhisperEncoder(WhisperPreTrainedModel):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
+        if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
+            sp_padding_size = hidden_states.size(0) - unpadded_dim_len
+            if sp_padding_size > 0:
+                hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
+        
         if input_seq_lens is not None:
             # recover the hidden_states, split by seq_lens and then pad&cat
             hidden_states = torch.split(

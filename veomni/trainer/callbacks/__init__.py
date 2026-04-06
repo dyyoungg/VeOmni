@@ -26,7 +26,9 @@ from .trace_callback import (
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
+    VideoTqdmCallback,
     WandbTraceCallback,
+    TensorboardTraceCallback
 )
 
 
@@ -41,4 +43,6 @@ __all__ = [
     "EnvironMeterCallback",
     "MoERouterMonitorCallback",
     "TqdmCallback",
+    "VideoTqdmCallback",
+    "TensorboardTraceCallback"
 ]

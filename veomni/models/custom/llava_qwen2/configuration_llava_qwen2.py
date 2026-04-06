@@ -22,7 +22,7 @@ def _init_config(config_dict: Optional[Dict[str, Any] | PretrainedConfig]) -> Op
 
 
 class Qwen3MoeOmniEncoderConfig(PretrainedConfig):
-    model_type = "qwen3moe_omni_encoder"
+    model_type = "llavaqwen2_encoder"
     sub_configs = {
         "image_config": AutoConfig,
         "audio_config": AutoConfig,
@@ -45,7 +45,7 @@ class Qwen3MoeOmniEncoderConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class Qwen3MoeOmniConfig(PretrainedConfig):
+class LlavaQwen2Config(PretrainedConfig):
     """Top-level config tying together encoders and the foundation LLM.
 
     This omni variant intentionally omits any decoder component. It only contains:
@@ -54,7 +54,7 @@ class Qwen3MoeOmniConfig(PretrainedConfig):
     - foundation LLM (text backbone)
     """
 
-    model_type = "llavaqwen3moe_omni"
+    model_type = "llavaqwen2_omni"
     sub_configs = {
         "encoder_config": AutoConfig,
         "foundation_config": AutoConfig,
@@ -74,21 +74,21 @@ class Qwen3MoeOmniConfig(PretrainedConfig):
 
         # Default architecture name communicates expected top-level class
         super().__init__(
-            architectures=kwargs.pop("architectures", "LlavaQwen3MoeForCausalLM"),
+            architectures=kwargs.pop("architectures", "LlavaQwen2ForCausalLM"),
             **kwargs,
         )
 
     def get_text_config(self) -> PretrainedConfig:
         return self.foundation_config
 
-AutoConfig.register("llavaqwen3moe_omni", Qwen3MoeOmniConfig)
+AutoConfig.register("llavaqwen2_omni", LlavaQwen2Config)
 
 
 if __name__ == "__main__":
     # Example: compose the omni config from your encoders and Qwen3Moe foundation.
     from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModelConfig
     from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
-    from transformers import Qwen3MoeConfig
+    from transformers import Qwen2Config
 
     # 1 Instantiate encoder sub-configs directly (recommended)
     image_cfg = BeeBeeVLVisionModelConfig(
@@ -104,12 +104,12 @@ if __name__ == "__main__":
         return_hidden_states=False,
         train_audio_projector=True,
         audio_downsample_size=10,
-        audio_projector_type="channel_upscale",
+        audio_projector_type="conv_channel_upscale",
         output_size=6144,
     )
 
     # 2 Instantiate foundation LLM config (Qwen3 Moe)
-    foundation_cfg = Qwen3MoeConfig(
+    foundation_cfg = Qwen2Config(
         vocab_size=151936,
         hidden_size=2048,
         intermediate_size=6144,
@@ -121,7 +121,7 @@ if __name__ == "__main__":
     )
 
     # 3 Build the top-level omni config
-    omni_cfg = Qwen3MoeOmniConfig(
+    omni_cfg = LlavaQwen2Config(
         encoder_config={
             "image_config": image_cfg,
             "audio_config": audio_cfg,

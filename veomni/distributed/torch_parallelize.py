@@ -305,7 +305,7 @@ def parallelize_model_fsdp2(
     target_modules: List[Tuple[str, nn.Module]] = [
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
     ]
-    logger.info_rank0(f"target classes to shard: {target_classes}")
+    # logger.info_rank0(f"target classes to shard: {target_classes}")
 
     # Step 1: Apply extra_parallel parallelism
     # e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
@@ -363,7 +363,7 @@ def parallelize_model_fsdp2(
         layer_pair.append(extra_parallel_mod)
         layer_pairs[layer_fqn] = tuple(layer_pair)
 
-    logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
+    # logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
@@ -480,7 +480,7 @@ def parallelize_model_fsdp2(
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
             layer_mod._fsdp_modules.append(layer_mod)
-        logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+        # logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
     # shard root model
     fully_shard(model, **fsdp_kwargs)

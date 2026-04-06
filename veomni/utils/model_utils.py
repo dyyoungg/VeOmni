@@ -15,6 +15,8 @@
 
 import numpy as np
 import torch.nn as nn
+import transformers
+from veomni.arguments import ModelArguments
 
 from . import logging
 
@@ -64,3 +66,26 @@ def pretty_print_trainable_parameters(model: nn.Module):
         train_param_info += "\n" + print_pattern
     train_param_info += "\n**** trainable parameters ****"
     logger.info_rank0(train_param_info)
+
+
+def smart_model_embedding_resize(
+    num_new_tokens:int,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+    model_args: ModelArguments,
+):
+    model.resize_token_embeddings(len(tokenizer))
+    if num_new_tokens > 0:
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
+
+        input_embeddings[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+

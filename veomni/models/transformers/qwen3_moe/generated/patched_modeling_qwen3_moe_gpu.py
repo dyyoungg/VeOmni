@@ -263,7 +263,7 @@ class Qwen3MoeExperts(torch.nn.Module):
                 final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
         elif self._moe_implementation == "fused":
             final_hidden_states = fused_moe_forward(
-                module=self,
+                # module=self,
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
@@ -286,6 +286,8 @@ class Qwen3MoeTopKRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        from veomni.utils.moe_monitor import router_forward_hook
+        self.register_forward_hook(router_forward_hook)
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -398,6 +400,8 @@ class Qwen3MoePreTrainedModel(PreTrainedModel):
         if isinstance(module, Qwen3MoeExperts):
             init.normal_(module.gate_proj, mean=0.0, std=std)
             init.normal_(module.down_proj, mean=0.0, std=std)
+            init.normal_(module.up_proj, mean=0.0, std=std)
+
         elif isinstance(module, Qwen3MoeTopKRouter):
             init.normal_(module.weight, mean=0.0, std=std)
 

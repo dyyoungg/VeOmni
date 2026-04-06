@@ -85,6 +85,9 @@ class VeomniFlopsCounter:
             "seed_oss": self._estimate_seed_flops,
             "qwen3_5": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
+            "llavaqwen3moe_omni": self._estimate_llavaqwen3moeOmni_flops,
+            "llavaqwen2_omni": self._estimate_llavaqwen2_omni_flops
+
         }
 
         self.config = config
@@ -174,7 +177,7 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
+    def _estimate_qwen3_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
         moe_intermediate_size = self.config.moe_intermediate_size
@@ -319,6 +322,8 @@ class VeomniFlopsCounter:
         flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
+    
+ 
 
     def _estimate_qwen3_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
         # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
@@ -361,6 +366,180 @@ class VeomniFlopsCounter:
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
+    
+    def _estimate_audio_flops(self, audio_seqlens, audio_config):
+        """
+        Estimate flops for Whisper encoder.
+        audio_seqlens: list of mel feature lengths for each audio sample
+        """
+        # Whisper encoder 结构参数
+        hidden_size = getattr(audio_config, "d_model", 1280)
+        num_hidden_layers = getattr(audio_config, "encoder_layers", 32)
+        num_attention_heads = getattr(audio_config, "encoder_attention_heads", 20)
+        ffn_dim = getattr(audio_config, "encoder_ffn_dim", hidden_size * 4)
+
+        head_dim = hidden_size // num_attention_heads
+
+        # conv1d stem: 2层卷积将 mel 特征降采样
+        # conv1(kernel=3) + conv2(kernel=3, stride=2)
+        # flops = 2 * kernel_size * in_channels * out_channels * seq_len
+        conv_flops = 0
+        for audio_len in audio_seqlens:
+            # conv1: mel_bins(80) -> hidden_size, kernel=3
+            conv1_flops = 2 * 3 * 80 * hidden_size * audio_len
+            # conv2: hidden_size -> hidden_size, kernel=3, stride=2, seq缩短一半
+            conv2_flops = 2 * 3 * hidden_size * hidden_size * (audio_len // 2)
+            conv_flops += conv1_flops + conv2_flops
+
+        tokens_sum = sum(s // 2 for s in audio_seqlens)  # conv stride=2 后的实际长度
+
+        # attention linear: Q K V O
+        q_size = hidden_size
+        k_size = hidden_size
+        v_size = hidden_size
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + hidden_size)
+        attn_linear_flops = 6 * attn_linear_N * num_hidden_layers * tokens_sum
+
+        # FFN: fc1 + fc2 (Whisper 用 GELU，两个线性层)
+        ffn_N = hidden_size * ffn_dim * 2
+        ffn_flops = 6 * ffn_N * num_hidden_layers * tokens_sum
+
+        # attention qkv flops（序列长度平方）
+        seqlen_square_sum = sum((s // 2) * (s // 2) for s in audio_seqlens)
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        audio_flops = conv_flops + attn_linear_flops + ffn_flops + attn_qkv_flops
+
+        return audio_flops
+    
+    def _estimate_llavaqwen2_omni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
+        llm_config = getattr(self.config, "foundation_config", self.config)
+        hidden_size = llm_config.hidden_size
+        vocab_size = llm_config.vocab_size
+        num_hidden_layers = llm_config.num_hidden_layers
+        num_key_value_heads = llm_config.num_key_value_heads
+        num_attention_heads = llm_config.num_attention_heads
+        intermediate_size = llm_config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # non-attn per layer parm
+        mlp_N = hidden_size * intermediate_size * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # non-attn all_layer parm
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        # non-attn all_layer & all_token fwd & bwd flops
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        # attn all_layer & all_token fwd & bwd flops
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        # vit flops
+        images_seqlens = kwargs.get("images_seqlens", None)
+        if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            image_config = getattr(self.config.encoder_config, "image_config", None)
+            if image_config is not None:
+                vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+            else:
+                vit_flops = 0
+        else:
+            vit_flops = 0
+
+        # audio encoder flops（如果有）
+        audio_seqlens = kwargs.get("audio_seqlens", None)
+        if audio_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            audio_config = getattr(self.config.encoder_config, "audio_config", None)
+            if audio_config is not None:
+                audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
+            else:
+                audio_flops = 0
+        else:
+            audio_flops = 0
+
+        flops_all = dense_N_flops + attn_qkv_flops + vit_flops + audio_flops
+        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
+        return flops_achieved
+    
+    def _estimate_llavaqwen3moeOmni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
+        llm_config = getattr(self.config, "foundation_config", self.config)
+
+        hidden_size = llm_config.hidden_size
+        vocab_size = llm_config.vocab_size
+        num_hidden_layers = llm_config.num_hidden_layers
+        num_key_value_heads = llm_config.num_key_value_heads
+        num_attention_heads = llm_config.num_attention_heads
+        intermediate_size = llm_config.intermediate_size
+        # MoE 相关
+        num_experts = getattr(llm_config, "num_experts", 1)
+        num_experts_per_tok = getattr(llm_config, "num_experts_per_tok", 1)
+        # Qwen3MoE 有 shared expert
+        shared_expert_intermediate_size = getattr(llm_config, "shared_expert_intermediate_size", 0)
+        # 是否每层都是 MoE，还是部分层是 dense
+        num_experts_per_layer = getattr(llm_config, "decoder_sparse_step", 1)  # 每隔几层是 MoE
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # attention linear 参数量（每层）
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+
+        # MoE FFN：只有被激活的 expert 参与计算
+        # 每个 token 激活 num_experts_per_tok 个 expert
+        moe_ffn_N_per_token = hidden_size * intermediate_size * 3 * num_experts_per_tok
+        # shared expert 每个 token 都要过
+        shared_ffn_N = hidden_size * shared_expert_intermediate_size * 3 if shared_expert_intermediate_size > 0 else 0
+
+        # embedding + lm_head
+        emb_and_lm_head_N = vocab_size * hidden_size * 2
+
+        # 非 attention 的总 flops（fwd + bwd = 6x）
+        # attn linear
+        attn_linear_flops = 6 * attn_linear_N * num_hidden_layers * tokens_sum
+        # moe ffn（按激活参数量算，不是总参数量）
+        moe_ffn_flops = 6 * (moe_ffn_N_per_token + shared_ffn_N) * num_hidden_layers * tokens_sum
+        # embedding & lm_head
+        emb_flops = 6 * emb_and_lm_head_N * tokens_sum
+
+        dense_flops = attn_linear_flops + moe_ffn_flops + emb_flops
+
+        # attention qkv flops（与序列长度平方相关）
+        seqlen_square_sum = sum(s * s for s in batch_seqlens)
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        # image encoder flops
+        images_seqlens = kwargs.get("images_seqlens", None)
+        if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            image_config = getattr(self.config.encoder_config, "image_config", None)
+            if image_config is not None:
+                vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+            else:
+                vit_flops = 0
+        else:
+            vit_flops = 0
+
+        # audio encoder flops（如果有）
+        audio_seqlens = kwargs.get("audio_seqlens", None)
+        if audio_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            audio_config = getattr(self.config.encoder_config, "audio_config", None)
+            if audio_config is not None:
+                audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
+            else:
+                audio_flops = 0
+        else:
+            audio_flops = 0
+
+        flops_all = dense_flops + attn_qkv_flops + vit_flops + audio_flops
+        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
         return flops_achieved
 
     def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):

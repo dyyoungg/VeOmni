@@ -7,23 +7,19 @@ import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import can_return_tuple
+from transformers import Qwen2ForCausalLM
 
-from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen3MoeOmniConfig
+from veomni.models.custom.llava_qwen2.configuration_llava_qwen2 import LlavaQwen2Config
 from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModel
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeVLAudioModel
-from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
-    Qwen3MoeForCausalLM,
-    load_balancing_loss_func,
-)
-from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
 
 
-class Qwen3MoeOmniPreTrainedModel(PreTrainedModel):
-    config_class = Qwen3MoeOmniConfig
+class LlavaQwen2PreTrainedModel(PreTrainedModel):
+    config_class = LlavaQwen2Config
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
     _supports_cache_class = True
@@ -61,15 +57,9 @@ class Qwen3MoeOmniPreTrainedModel(PreTrainedModel):
 
 
 
-class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
-    """
-    Qwen3 MoE causal LM augmented with image/audio encoders.
+class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
 
-    It expects a `Qwen3MoeOmniConfig` at construction time. The underlying LLM is
-    initialized from `foundation_config`. The image/audio encoders are created
-    from `encoder_config`'s sub-configs.
-    """
-    def __init__(self, config: Qwen3MoeOmniConfig):
+    def __init__(self, config: LlavaQwen2Config):
         # Initialize base CausalLM with foundation (text) config
         # Keep the full omni config so `save_pretrained()` can persist encoder configs too.
         super().__init__(config.foundation_config)
@@ -84,7 +74,7 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         else:
             torch_dtype = torch.float32
 
-        foundation_llm = Qwen3MoeForCausalLM._from_config(
+        foundation_llm = Qwen2ForCausalLM._from_config(
             self.foundation_config,
             attn_implementation=self.foundation_config._attn_implementation,
             dtype=torch_dtype,
@@ -92,9 +82,6 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         self.model = foundation_llm.model
         self.vocab_size = foundation_llm.vocab_size
         self.lm_head = foundation_llm.lm_head
-        self.router_aux_loss_coef = foundation_llm.router_aux_loss_coef
-        self.num_experts = foundation_llm.num_experts
-        self.num_experts_per_tok = foundation_llm.num_experts_per_tok
         del foundation_llm
         # Keep a reference to the omni config
         self.omni_config = config
@@ -152,14 +139,6 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def get_parallel_plan(self):
-        # The foundation parallel plan patterns start with `model.*`.
-        # In this wrapper, the foundation LLM is exposed as `self.model`,
-        # so we should not prefix it.
-        from veomni.models.transformers.qwen3_moe.parallel_plan import get_parallel_plan as _get_parallel_plan
-
-        return _get_parallel_plan()
-
     def get_position_id_func(self):
         """
         Fallback position-id function for training data preprocessing.
@@ -196,18 +175,24 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         # outputs
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs,
     ):
         if input_ids is None:
             raise ValueError("forward() requires `input_ids` because image/video/audio masks are computed from input_ids.")
-
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.foundation_config.output_router_logits
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
         parallel_state = get_parallel_state()
         sp_enabled = parallel_state is not None and parallel_state.sp_enabled and self.training
         sp_group = parallel_state.sp_group if sp_enabled else None
@@ -328,8 +313,9 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_router_logits=output_router_logits,
             cache_position=cache_position,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             **kwargs,
         )
 
@@ -362,27 +348,13 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
                 # loss = fixed_cross_entropy(shift_logits, shift_labels, **loss_kwargs)
                 loss = loss_fct(shift_logits, shift_labels)
         
-        # print("loss", loss, "output_router_logits", type(outputs.router_logits), outputs.router_logits)
-
-        aux_loss = None
-        if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None and loss is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
-
-        return MoeCausalLMOutputWithPast(
+      
+        return CausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
         )
     
 

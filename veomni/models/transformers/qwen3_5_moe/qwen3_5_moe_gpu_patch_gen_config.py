@@ -184,6 +184,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         # Modification: read _moe_implementation to switch between eager and fused MoE paths.
         self._moe_implementation = getattr(config, "_moe_implementation", "eager")
+        print("MOE implementation", self._moe_implementation)
 
     def forward(
         self,

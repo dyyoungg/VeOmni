@@ -6,7 +6,7 @@ import torch.nn as nn
 from veomni.models.custom.llava_qwen3moe.modeling_whisper import WhisperEncoder, WhisperConfig
 from veomni.models.custom.llava_qwen3moe.base import BaseEncoderModelMixin, BaseEncoderConfigMixin
 from veomni.models.custom.llava_qwen3moe.projector import build_audio_projector
-
+from transformers import AutoConfig
 
 
 class BeeBeeAudioModelConfig(BaseEncoderConfigMixin, WhisperConfig):
@@ -17,7 +17,7 @@ class BeeBeeAudioModelConfig(BaseEncoderConfigMixin, WhisperConfig):
         return_hidden_states=False,
         train_audio_projector=False,
         audio_downsample_size=10,
-        audio_projector_type="channel_upscale",
+        audio_projector_type="conv_channel_upscale",
         output_size=6144,
         **kwargs,
     ):
@@ -31,6 +31,14 @@ class BeeBeeAudioModelConfig(BaseEncoderConfigMixin, WhisperConfig):
 
 
 class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
+    # Some Whisper checkpoints are saved from a full seq2seq model, where weights are prefixed with
+    # `model.encoder.*`. Our encoder-only model expects `conv1/*`, `layers/*`, etc. directly.
+    # `load_model_weights()` will consult this mapping (if present) to rewrite checkpoint keys.
+    _checkpoint_conversion_mapping = {
+        r"^model\.encoder\.": "",
+        r"^encoder\.": "",
+    }
+
     config_class = BeeBeeAudioModelConfig
     _no_split_modules = ["WhisperEncoderLayer"]
 
@@ -65,3 +73,5 @@ class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
             feature_lens = torch.tensor([50, 50], dtype=torch.int64, device=self.device)
             self._dummy_data = {"features": features, "feature_lengths": feature_lens}
         return self.lm_encode(**self._dummy_data)
+    
+AutoConfig.register("beebee_vl_audio_model", BeeBeeAudioModelConfig)

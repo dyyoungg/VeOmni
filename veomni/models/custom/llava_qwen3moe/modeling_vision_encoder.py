@@ -14,6 +14,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVi
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLRMSNorm, apply_rotary_pos_emb_vision, Qwen2_5_VLMLP
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
+from transformers import AutoConfig
 
 
 def pad_tensor(x: Tensor, dim: int, padding_size: int, padding_value: int = 0) -> Tensor:
@@ -35,6 +36,7 @@ class BeeBeeVLVisionModelConfig(BaseEncoderConfigMixin, Qwen2_5_VLVisionConfig):
         self,
         return_hidden_states=False,
         train_vision_projector=False,
+        freeze_vision_merger: bool = False,
         image_downsample_size=8,
         image_projector_type="dynamic_avgpool",
         output_size=6144,
@@ -43,6 +45,8 @@ class BeeBeeVLVisionModelConfig(BaseEncoderConfigMixin, Qwen2_5_VLVisionConfig):
         super().__init__(**kwargs)
         self.return_hidden_states = return_hidden_states
         self.train_vision_projector = train_vision_projector
+        # Used by `set_projector_trainable_only()` to decide whether to train the patch merger.
+        self.freeze_vision_merger = freeze_vision_merger
         self.image_downsample_size = image_downsample_size
         self.image_projector_type = image_projector_type
         self.output_size = output_size
@@ -274,3 +278,6 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
                 grid_thw = torch.tensor([[sp_world_size, 32, 48]]).to(dtype=torch.int64, device=self.device)
             self._dummy_data = {"features": pixel_values, "grid_thw": grid_thw}
         return self.lm_encode(**self._dummy_data)
+    
+
+AutoConfig.register("beebee_vl_vision_model", BeeBeeVLVisionModelConfig)

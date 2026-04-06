@@ -293,7 +293,6 @@ def load_model_weights(
             # IMPORTANT: Call this function to adapt to transformers 4.52 breaking change
             # on model structure. See the comment for details.
             name = _convert_weight_key(name, model)
-
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
             elif name in parameter_names_to_load:
@@ -304,7 +303,6 @@ def load_model_weights(
 
         del state_dict_iterator
         empty_cache()
-
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
 
@@ -374,7 +372,7 @@ def rank0_load_and_broadcast_weights(
                 try:
                     key, tensor = next(iterator)  # type: ignore[arg-type]
                     key = _convert_weight_key(key, model)
-                    logger.info_rank0(f"loading {key=}")
+                    # logger.info_rank0(f"loading {key=}")
                     if torch.count_nonzero(tensor) == 0:
                         logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
                     metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
@@ -395,7 +393,7 @@ def rank0_load_and_broadcast_weights(
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
-            logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
+            # logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
@@ -403,9 +401,9 @@ def rank0_load_and_broadcast_weights(
 
             start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
-            logger.info_rank0(
-                f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
-            )
+            # logger.info_rank0(
+            #     f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+            # )
 
             if name in buffer_dict:
                 buffer_dict[name] = tensor.detach().clone()
@@ -447,11 +445,13 @@ def post_process_after_weight_loading(
 
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
     # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
-    if getattr(model.config, "tie_word_embeddings", True):
+    
+    if getattr(model.config, "tie_word_embeddings", False):
         try:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            if output_embeddings is not None and input_embeddings is not None:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
         except Exception as e:
             logger.info_rank0(f"Failed to tie embeddings: {e}")
             raise RuntimeError("Failed to tie input/output embeddings") from e
