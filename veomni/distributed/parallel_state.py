@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
+import datetime
 
 import torch
 from torch import distributed as dist
@@ -27,7 +28,6 @@ from torch import distributed as dist
 from ..utils import logging
 from ..utils.device import get_device_type
 from ..utils.import_utils import is_torch_version_greater_than
-
 
 if is_torch_version_greater_than("2.4"):
     from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -76,6 +76,64 @@ def init_para_mesh_matrix(para_size: int, para_fsdp_size: int, para_outside: boo
             )
     return mesh
 
+def _build_sp_cpu_gloo_group(sp_gpu_group: "ProcessGroup") -> Optional["ProcessGroup"]:
+    """
+    Create a CPU Gloo process group that mirrors an existing GPU SP group.
+ 
+    Called once per SP group during init_parallel_state.  Every rank in the
+    job must call this function (it drives a dist.all_gather + dist.new_group
+    barrier internally), so it must be invoked collectively.
+ 
+    Strategy
+    --------
+    1. Each rank finds the global ranks that share its GPU sp group.
+    2. All ranks broadcast their group membership via all_gather so that every
+       rank knows every group's composition.
+    3. Unique groups are deduped, and dist.new_group(..., backend="gloo") is
+       called collectively for each of them.
+    4. The Gloo group corresponding to the calling rank's SP group is returned.
+ 
+    Returns None when dist is not initialized or the SP group has only one rank.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+ 
+    sp_size = dist.get_world_size(group=sp_gpu_group)
+    if sp_size <= 1:
+        return None
+ 
+    world_size = dist.get_world_size()
+    my_rank = dist.get_rank()
+ 
+    # ── Step 1: collect this rank's SP-group membership ──────────────────────
+    my_sp_ranks = sorted(
+        [dist.get_global_rank(sp_gpu_group, r) for r in range(sp_size)]
+    )
+    my_ranks_tensor = torch.tensor(my_sp_ranks, dtype=torch.long)
+ 
+    # ── Step 2: all_gather so every rank knows all groups ────────────────────
+    all_ranks_tensors = [torch.zeros(sp_size, dtype=torch.long) for _ in range(world_size)]
+    dist.all_gather(all_ranks_tensors, my_ranks_tensor)
+ 
+    # ── Step 3: deduplicate group lists ──────────────────────────────────────
+    seen: set = set()
+    unique_groups = []
+    for t in all_ranks_tensors:
+        key = tuple(sorted(t.tolist()))
+        if key not in seen:
+            seen.add(key)
+            unique_groups.append(list(key))
+ 
+    # ── Step 4: collectively create one Gloo group per SP group ──────────────
+    my_cpu_group: Optional["ProcessGroup"] = None
+    for group_ranks in unique_groups:
+        cpu_group = dist.new_group(ranks=group_ranks, backend="gloo")
+        if my_rank in group_ranks:
+            my_cpu_group = cpu_group
+ 
+    return my_cpu_group
+
+
 
 @dataclass(frozen=True)
 class ParallelState:
@@ -94,6 +152,11 @@ class ParallelState:
     extra_parallel_sizes: Dict[str, int] = field(default_factory=lambda: {"ep": 1})
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
+    # ── CPU Gloo group mirroring the SP (ulysses) group ──────────────────────
+    # Used by the dataloader to verify data consistency across SP ranks without
+    # touching GPU resources.  Excluded from equality / hash comparisons because
+    # ProcessGroup objects are not reliably comparable.
+   
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
@@ -117,12 +180,27 @@ class ParallelState:
                 set_data_parallel_group,
                 set_ulysses_sequence_parallel_group,
                 set_unified_sequence_parallel_group,
+                set_ulysses_sequence_parallel_cpu_group
             )
 
             if self.device_mesh is not None:
                 set_data_parallel_group(self.device_mesh.get_group("dp"))
                 if self.ulysses_size > 1:
-                    set_ulysses_sequence_parallel_group(self.device_mesh.get_group("ulysses"))
+                    ulysses_group = self.device_mesh.get_group("ulysses")
+                    set_ulysses_sequence_parallel_group(ulysses_group)
+
+                    ulysses_ranks = dist.get_process_group_ranks(ulysses_group)
+                    ulysses_cpu_group = dist.new_group(
+                        ulysses_ranks, 
+                        backend="gloo", 
+                        timeout=datetime.timedelta(seconds=60)
+                    )
+                    
+                    try:
+                        set_ulysses_sequence_parallel_cpu_group(group=ulysses_cpu_group, group_key="default")
+                        logger.info("success initialize data cpu sync group!!")
+                    except ImportError:
+                        logger.error("Failed to initialize data cpu sync group!!")
                 if self.cp_size > 1:
                     set_context_parallel_group(self.device_mesh.get_group("cp"))
                 # set unified sequence parallel group

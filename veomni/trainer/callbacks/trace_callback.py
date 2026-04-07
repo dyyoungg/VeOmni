@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any, Dict, List
 from collections import deque
 from tqdm import trange
 import tracemalloc
+import contextlib
+import torch
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
@@ -98,7 +100,7 @@ class MoERouterMonitorCallback(Callback):
                 tb_writer.add_scalar("moe/avg_vio/avg", avg_vio.mean().item(), state.global_step)
         
                 heatmap = load_matrix.unsqueeze(0)  # (1, num_layers, num_experts)
-                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            
                 tb_writer.add_image("moe/expert_load_heatmap", heatmap, state.global_step)
 
             metrics = {"moe/expert_load_heatmap": image}
@@ -319,7 +321,7 @@ class EnvironMeterCallback(Callback):
             f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
             for k, v in step_train_metrics.items()
         }
-        step_train_metrics["training/iter_time"] = delta_time
+        step_train_metrics["time_profiling/iter_time"] = delta_time
         current_loss = step_train_metrics["training/total_loss"]
         self._loss_window.append(current_loss)
         train_loss = sum(self._loss_window) / len(self._loss_window)
@@ -457,3 +459,51 @@ class VideoTqdmCallback(Callback):
         self.data_loader_tqdm.update(max(delta, 1))
         self._last_video_trained_num = state.video_trained_num
         self.trainer.eval_metrics = None
+
+class StepTimer:
+    def __init__(self):
+        self.events = {}
+
+    @contextlib.contextmanager
+    def measure(self, name):
+      
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        yield
+      
+        end.record()
+        if name not in self.events:
+            self.events[name] = []
+        self.events[name].append((start, end))
+
+    def get_and_reset(self) -> Dict[str, float]:
+       
+        torch.cuda.synchronize()
+        timings = {}
+        for name, evts in self.events.items():
+            total_ms = sum(s.elapsed_time(e) for s, e in evts)
+            timings[name] = total_ms / 1000.0  # 转换为秒
+        self.events.clear()
+        return timings
+
+class ComponentTimingCallback(Callback):
+    def __init__(self, trainer):
+        super().__init__(trainer)
+        self.step_timer = StepTimer()
+        self.logging_steps = getattr(trainer.args.train, "logging_steps", 10)
+
+    def on_step_begin(self, state: TrainerState, **kwargs) -> None:
+       
+        if state.global_step % self.logging_steps == 0:
+            self.trainer._current_step_timer = self.step_timer
+        else:
+            self.trainer._current_step_timer = None
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        if getattr(self.trainer, "_current_step_timer", None) is not None:
+            timings = self.trainer._current_step_timer.get_and_reset()
+            for k, v in timings.items():
+                metric_name = f"time_profiling/time_{k}"
+                self.trainer.step_env_metrics[metric_name] = v
+                self.trainer.step_train_metrics[metric_name] = v

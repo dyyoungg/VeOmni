@@ -48,6 +48,10 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import get_data_parallel_rank
 from veomni.data.multimodal.image_utils import get_adaptive_pool_size, jpeg_degrade, smart_resize
 from veomni.utils.constants import get_image_video_audio_placeholder
+from veomni.utils.logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -1305,3 +1309,22 @@ class OmniSampleProcessor:
             token_counts=token_counts,
         )
     
+class LongVideoProcessor(OmniSampleProcessor):
+    def __init__(self, tokenizer, model_args, data_args, training_args, *, ceph_client, bos_client, rank, build_inputs_token_fn, preprocess_workers = 4):
+        super().__init__(tokenizer, 
+                         model_args, 
+                         data_args, 
+                         training_args, 
+                         ceph_client=ceph_client, 
+                         bos_client=bos_client, 
+                         rank=rank, 
+                         build_inputs_token_fn=build_inputs_token_fn, 
+                         preprocess_workers=preprocess_workers)
+        
+        
+    
+    def process(self, sample_data: Dict, sample_idx: int) -> Optional[OmniSample]:
+
+        yield sample_data
+
+

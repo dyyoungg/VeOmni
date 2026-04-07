@@ -15,6 +15,7 @@
 
 from contextlib import nullcontext
 from typing import Any, Optional
+import datetime
 
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -285,7 +286,7 @@ def init_sequence_parallel(
                 end_rank = start_rank + ulysses_size
                 ulysses_ranks = range(start_rank, end_rank)
                 ulysses_group = dist.new_group(ulysses_ranks)
-                ulysses_cpu_group = dist.new_group(ulysses_ranks, backend="gloo")
+                ulysses_cpu_group = dist.new_group(ulysses_ranks, backend="gloo", timeout=datetime.timedelta(seconds=60))
                 if rank in ulysses_ranks:
                     set_ulysses_sequence_parallel_group(group=ulysses_group, group_key=ulysses_group_key)
                     set_ulysses_sequence_parallel_cpu_group(group=ulysses_cpu_group, group_key=ulysses_group_key)

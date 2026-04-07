@@ -29,6 +29,7 @@ from imageio.core import Request
 
 
 from veomni.utils.helper import read_data
+from veomni.utils.constants import _CHAT_TEMPLATES
 
 
 TIMEOUT = 30
@@ -41,20 +42,6 @@ class TimeoutException(Exception):
 
 def timeout_handler(signum, frame):
     raise TimeoutException()
-
-
-_CHAT_TEMPLATES = {
-    "qwen2": dict(
-        system="<|im_start|>system\n{}<|im_end|>",
-        system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
-        user="\n<|im_start|>user\n{}<|im_end|>",
-        assistant="\n<|im_start|>assistant\n{}<|im_end|>",
-        assistant_prefix="\n<|im_start|>assistant\n",
-        query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-    ),
-}
-
-_CHAT_TEMPLATES["qwen3"] = _CHAT_TEMPLATES["qwen2"]
 
 
 class BaseDataLoader:

@@ -42,6 +42,7 @@ from veomni.utils.constants import (
     DEFAULT_AUDIO_END_TOKEN,
     DEFAULT_VISION_START_TOKEN,
     DEFAULT_VISION_END_TOKEN,
+    _CHAT_TEMPLATES
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
 from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample
@@ -69,18 +70,6 @@ except Exception:
 AOSS_FILE = "/mnt/afs/yangdeyu/aoss_ydy_game.conf"
 logger = helper.create_logger(__name__)
 
-_CHAT_TEMPLATES = {
-    "qwen2": dict(
-        system="<|im_start|>system\n{}<|im_end|>",
-        system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
-        user="\n<|im_start|>user\n{}<|im_end|>",
-        assistant="\n<|im_start|>assistant\n{}<|im_end|>",
-        assistant_prefix="\n<|im_start|>assistant\n",
-        query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-    ),
-}
-
-_CHAT_TEMPLATES["qwen3"] = _CHAT_TEMPLATES["qwen2"]
 
 def set_env_cpu_limit(cpu_num: int = 1) -> None:
     for key in (
@@ -1005,7 +994,7 @@ def get_eval_dataloader(tokenizer, data_args, training_args, model_args):
     eval_dataloader.categories = getattr(eval_dataset, 'categories', None)
     return eval_dataloader
 
-def get_train_dataloader(tokenizer, data_args, training_args, model_args):
+def get_train_dataloader(data_args, training_args, model_args, tokenizer):
 
     train_dataloader = OmniDataloader(
             tokenizer=tokenizer,

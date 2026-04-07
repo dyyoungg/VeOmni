@@ -90,3 +90,16 @@ def get_image_video_audio_placeholder(tokenizer):
   
     return image_token_id, video_token_id, audio_token_id
 
+
+_CHAT_TEMPLATES = {
+    "qwen2": dict(
+        system="<|im_start|>system\n{}<|im_end|>",
+        system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
+        user="\n<|im_start|>user\n{}<|im_end|>",
+        assistant="\n<|im_start|>assistant\n{}<|im_end|>",
+        assistant_prefix="\n<|im_start|>assistant\n",
+        query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+    ),
+}
+
+_CHAT_TEMPLATES["qwen3"] = _CHAT_TEMPLATES["qwen2"]

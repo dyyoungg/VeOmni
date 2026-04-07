@@ -18,6 +18,7 @@ from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+import contextlib
 
 import torch
 import torch.distributed as dist
@@ -37,6 +38,7 @@ from veomni.arguments import (
     save_args,
 )
 from veomni.data.llavaomni_dataloader import get_eval_dataloader, get_train_dataloader
+from veomni.data.ulysess_dataloader import make_ulysses_train_dataloader
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import init_parallel_state
@@ -55,7 +57,8 @@ from veomni.trainer.callbacks import (
     VideoTqdmCallback,
     TrainerState,
     WandbTraceCallback,
-    TensorboardTraceCallback
+    TensorboardTraceCallback,
+    ComponentTimingCallback
 )
 from veomni.utils import helper, logging
 from veomni.utils.device import (
@@ -65,11 +68,12 @@ from veomni.utils.device import (
     synchronize,
 )
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
-from veomni.utils.model_utils import pretty_print_trainable_parameters, smart_model_embedding_resize
+from veomni.utils.model_utils import pretty_print_trainable_parameters
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.comm import get_data_parallel_world_size
 from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
 from veomni.utils.constants import get_image_video_audio_placeholder, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN
+
 
 logger = helper.create_logger(__name__)
 MAX_PIXELS = 768 * 28 * 28
@@ -325,8 +329,11 @@ class VLMTrainer:
 
         tokenizer = self.tokenizer
         training_args, model_args, data_args = args.train, args.model, args.data
+        if get_parallel_state() is not None and get_parallel_state().ulysses_enabled:
+            self.train_dataloader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
+        else:
+            self.train_dataloader = get_train_dataloader(data_args, training_args, model_args, tokenizer)
 
-        self.train_dataloader = get_train_dataloader(tokenizer, data_args, training_args, model_args)
         self.eva_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
     
     def _build_model_assets(self):
@@ -374,8 +381,8 @@ class VLMTrainer:
                     llm_params.append(param)
 
         param_groups = [
-            {"params": vit_params, "lr": args.train.optimizer.lr},
-            {"params": audio_params, "lr": args.train.optimizer.lr},
+            {"params": vit_params, "lr": args.train.vit_lr},
+            {"params": audio_params, "lr": args.train.vit_lr},
             {"params": llm_params, "lr": args.train.optimizer.lr},
         ]
 
@@ -431,6 +438,7 @@ class VLMTrainer:
     def _init_callbacks(self):
         """Initialize callbacks."""
         self.environ_meter_callback = EnvironMeterCallback(self)
+        self.timing_callback = ComponentTimingCallback(self)
         self.tqdm_callback = VideoTqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.tensorboard_callback = TensorboardTraceCallback(self)
@@ -486,6 +494,7 @@ class VLMTrainer:
 
     def on_step_begin(self, micro_batches=None):
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.timing_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.tensorboard_callback.on_step_begin(self.state, micro_batches=micro_batches)
@@ -496,6 +505,7 @@ class VLMTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.timing_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.tensorboard_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
@@ -533,9 +543,11 @@ class VLMTrainer:
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
-
+        step_timer = None
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            step_timer = getattr(self, "_current_step_timer", None)
+            with step_timer.measure("forward") if step_timer else contextlib.nullcontext():
+                outputs: ModelOutput = self.model(**micro_batch, use_cache=False, step_timer=step_timer)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
@@ -543,7 +555,8 @@ class VLMTrainer:
 
         # Backward pass
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+            with step_timer.measure("backward") if step_timer else contextlib.nullcontext():
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict

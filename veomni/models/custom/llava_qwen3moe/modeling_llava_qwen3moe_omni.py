@@ -1,6 +1,7 @@
 from typing import Optional
 import json
 import torch.distributed as dist
+import contextlib
 
 from transformers import AutoConfig, AutoModel, GenerationMixin, PreTrainedModel
 import torch
@@ -201,6 +202,8 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs,
     ):
+        step_timer = kwargs.pop("step_timer", None)
+        
         if input_ids is None:
             raise ValueError("forward() requires `input_ids` because image/video/audio masks are computed from input_ids.")
 
@@ -281,8 +284,8 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
 
             cat_pixels = torch.cat(cat_pixels, dim=0)
             cat_thw = torch.cat(cat_thw, dim=0)
-            
-            vision_features, _ = self.image_encoder.lm_encode(features=cat_pixels, grid_thw=cat_thw)
+            with step_timer.measure("vit") if step_timer else contextlib.nullcontext():
+                vision_features, _ = self.image_encoder.lm_encode(features=cat_pixels, grid_thw=cat_thw)
             vision_features = vision_features.to(inputs_embeds.device, inputs_embeds.dtype)
             # print("vision feature", vision_features.shape)
             image_features = vision_features[:effective_n_image_tokens]
@@ -301,10 +304,10 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
 
         # Audio
         if n_audio_tokens > 0 and audio_features is not None:
-           
-            audio_features, _ = self.audio_encoder.lm_encode(
-                features=audio_features, feature_lengths=audio_features_lens
-            )
+            with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():
+                audio_features, _ = self.audio_encoder.lm_encode(
+                    features=audio_features, feature_lengths=audio_features_lens
+                )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             
             audio_features = audio_features[:n_audio_tokens]
@@ -320,18 +323,18 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         if sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(inputs_embeds, head_dim=2, seq_dim=1, group=sp_group)
            
-
-        outputs = self.model(
-            input_ids=None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_router_logits=output_router_logits,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        with step_timer.measure("llm") if step_timer else contextlib.nullcontext():
+            outputs = self.model(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_router_logits=output_router_logits,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep

@@ -28,7 +28,8 @@ from .trace_callback import (
     TqdmCallback,
     VideoTqdmCallback,
     WandbTraceCallback,
-    TensorboardTraceCallback
+    TensorboardTraceCallback,
+    ComponentTimingCallback,
 )
 
 
@@ -44,5 +45,6 @@ __all__ = [
     "MoERouterMonitorCallback",
     "TqdmCallback",
     "VideoTqdmCallback",
-    "TensorboardTraceCallback"
+    "TensorboardTraceCallback",
+    "ComponentTimingCallback"
 ]
