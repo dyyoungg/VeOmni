@@ -52,14 +52,14 @@ class AudioConvUpScaleProjector(nn.Module):
             if remainder > 0:
                 pad_len = sp_world_size - remainder
                 x = pad_tensor(x, dim=1, padding_size=pad_len) 
-            x = slice_input_tensor(x, dim=1, group=get_parallel_state().sp_group, padding=False)
+            x = slice_input_tensor(x, dim=1, group=get_parallel_state().ulysses_group, padding=False)
 
         x = self.linear1(x)
         x = self.gelu(x)
         x = self.linear2(x)
 
         if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
-            x  = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group)
+            x  = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             if remainder > 0:
                 x = unpad_tensor(x, dim=1, padding_size=pad_len)
 
@@ -128,26 +128,26 @@ class DynamicAvgPoolProjector(nn.Module):
             outputs.append(pooled)
             seq_len.extend(tokens)
         
-        outputs = torch.cat(outputs, dim=0)  # [m, hidden_size]
+        hidden_states = torch.cat(outputs, dim=0)  # [m, hidden_size]
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            # hidden_states = gather_outputs(hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
-            sp_world_size = get_parallel_state().sp_size
+            
+            sp_world_size = get_parallel_state().ulysses_size
             remainder = hidden_states.shape[0] % sp_world_size
             if remainder > 0:
                 pad_len = sp_world_size - remainder
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=pad_len) 
 
             hidden_states = gather_heads_scatter_seq(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             ) # [m//sp, hidden*sp]
-        projected = self.mlp(outputs)  # [m, out_hidden]
+        hidden_states = self.mlp(hidden_states)  # [m, out_hidden]
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            hidden_states = gather_seq_scatter_heads(hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group)
+            hidden_states = gather_seq_scatter_heads(hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group)
             if remainder > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=pad_len)
-            # hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+          
 
-        return projected, seq_len
+        return hidden_states, seq_len
 
         
 

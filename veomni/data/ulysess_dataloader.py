@@ -117,7 +117,7 @@ class UlysessOmniProcessor:
                 bos_client=self.bos_client,
                 rank=self.rank,
                 build_inputs_token_fn=self.build_inputs_token,
-                preprocess_workers=getattr(self.data_args, "preprocess_workers", 2),
+                preprocess_workers=1,
             )
             self.processor.init_image_processor()
 
@@ -236,9 +236,9 @@ class UlyssesStreamingDataset(IterableDataset):
                 model_args=self.model_args,
             )
             self._processor.init_image_processor()
-            logger.info(
-                f"[DP Rank {self.dp_rank} PID {os.getpid()}] UlyssesOmniProcessor initialized."
-            )
+            # logger.info(
+            #     f"[DP Rank {self.dp_rank} PID {os.getpid()}] UlyssesOmniProcessor initialized."
+            # )
  
     # ── Iteration helpers ─────────────────────────────────────────────────────
  
@@ -270,15 +270,10 @@ class UlyssesStreamingDataset(IterableDataset):
         worker_info = get_worker_info()
         num_workers = worker_info.num_workers if worker_info else 1
         worker_id   = worker_info.id          if worker_info else 0
- 
-        # Compute which (global_idx % total_shards) this worker handles
-        if not self.offline_split:
-            total_shards    = self.dp_world_size * num_workers
-            current_shard   = self.dp_rank * num_workers + worker_id
-        else:
-            total_shards    = num_workers
-            current_shard   = worker_id
- 
+
+        total_shards    = num_workers
+        current_shard   = worker_id
+
         # Resume support: skip already-consumed samples
         data = data[self.skip_samples_count :]
         global_idx    = self.skip_samples_count
@@ -305,7 +300,7 @@ class UlyssesStreamingDataset(IterableDataset):
                         yield (global_idx, 0, True, None)
  
                     local_counter += 1
-                    if i % 5 == 0:
+                    if i % 10 == 0:
                         time.sleep(0.001)  # yield GIL briefly
  
                 except Exception as e:
@@ -337,7 +332,7 @@ class ReorderingDataLoader:
     MAX_BUFFER_SIZE the head is forcibly emitted to avoid unbounded memory use.
     """
  
-    MAX_BUFFER_SIZE = 40
+    MAX_BUFFER_SIZE = 500
  
     def __init__(self, dataloader):
         self.dataloader = dataloader
@@ -363,7 +358,7 @@ class ReorderingDataLoader:
             try:
                 item = next(iterator)
                 duration = time.time() - start_t
-                if duration > 30:
+                if duration > 60:
                     logger.warning(f"[Rank {self.rank}] WARNING: PyTorch DataLoader took {duration:.2f}s to yield an item!")
                 return item
             except StopIteration:
@@ -935,7 +930,7 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         raw_dataset,
         batch_size=None,           # disable auto-batching; items are already dicts
         num_workers=getattr(training_args, "dataloader_num_workers", 2),
-        prefetch_factor=getattr(training_args, "dataloader_prefetch_factor", 2),
+        prefetch_factor=getattr(training_args, "dataloader_prefetch_factor", 1),
         persistent_workers=True,
     )
  
@@ -1019,7 +1014,7 @@ def test_ulysess():
     train_loader = make_ulysses_train_dataloader(model_args, data_args, training_args, tokenizer)
 
     for i, data in enumerate(train_loader):
-        sp_group =  get_parallel_state().sp_group
+        sp_group =  get_parallel_state().ulysses_group
         sp_rank = get_parallel_state().sp_rank
         input_ids = data["input_ids"].to(device) 
       

@@ -198,7 +198,7 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
         )
         parallel_state = get_parallel_state()
         sp_enabled = parallel_state is not None and parallel_state.sp_enabled and self.training
-        sp_group = parallel_state.sp_group if sp_enabled else None
+        sp_group = parallel_state.ulysses_group if sp_enabled else None
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -260,13 +260,18 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
 
             cat_pixels = []
             cat_thw = []
-            if effective_n_image_tokens > 0:
+            if pixel_values is not None and image_grid_thw is not None:
                 cat_pixels.append(pixel_values)
                 cat_thw.append(image_grid_thw)
-            if effective_n_video_tokens > 0:
+            else:
+                raise ValueError("pixel values is None or image_grid_thw is None!")
+            
+            if pixel_values_videos is not None and video_grid_thw is not None:
                 cat_pixels.append(pixel_values_videos)
                 cat_thw.append(video_grid_thw)
-
+            else:
+                raise ValueError("pixel values video is None or video_grid_thw is None!")
+           
             cat_pixels = torch.cat(cat_pixels, dim=0)
             cat_thw = torch.cat(cat_thw, dim=0)
             with step_timer.measure("vit") if step_timer else contextlib.nullcontext():

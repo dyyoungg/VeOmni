@@ -188,19 +188,44 @@ class ParallelState:
                 if self.ulysses_size > 1:
                     ulysses_group = self.device_mesh.get_group("ulysses")
                     set_ulysses_sequence_parallel_group(ulysses_group)
+                    set_ulysses_sequence_parallel_cpu_group(group=None, group_key="default")
 
-                    ulysses_ranks = dist.get_process_group_ranks(ulysses_group)
-                    ulysses_cpu_group = dist.new_group(
-                        ulysses_ranks, 
-                        backend="gloo", 
-                        timeout=datetime.timedelta(seconds=60)
-                    )
+                    my_global_rank = dist.get_rank()
+                    my_ranks = sorted(dist.get_process_group_ranks(ulysses_group))
+                    print(f"rank: {my_global_rank}, local ulysses rank: {my_ranks}")
+                    my_ranks_tensor = torch.tensor(my_ranks, dtype=torch.long, device="cuda")
                     
+                    # 2. 全局 all_gather，让所有 rank 知道全网所有的分组情况
+                    world_size = dist.get_world_size()
+                    all_ranks_tensors = [torch.zeros_like(my_ranks_tensor) for _ in range(world_size)]
+                    dist.all_gather(all_ranks_tensors, my_ranks_tensor)
+                    
+                    # 3. 去重，构建一个所有 rank 都绝对一致的 unique_groups 列表
+                    seen = set()
+                    unique_groups = []
+                    for t in all_ranks_tensors:
+                        group_tuple = tuple(t.tolist())
+                        if group_tuple not in seen:
+                            seen.add(group_tuple)
+                            unique_groups.append(list(group_tuple))
+                    
+                    my_cpu_group = None
+                    for g_ranks in unique_groups:
+                        gloo_group = dist.new_group(
+                            ranks=g_ranks, 
+                            backend="gloo", 
+                            timeout=datetime.timedelta(seconds=180)
+                        )
+                       
+                        if my_global_rank in g_ranks:
+                            my_cpu_group = gloo_group
                     try:
-                        set_ulysses_sequence_parallel_cpu_group(group=ulysses_cpu_group, group_key="default")
-                        logger.info("success initialize data cpu sync group!!")
+                        set_ulysses_sequence_parallel_cpu_group(group=my_cpu_group, group_key="default")
+                        logger.info(f"rank {my_global_rank} success initialize data cpu sync group!!")
                     except ImportError:
                         logger.error("Failed to initialize data cpu sync group!!")
+
+                   
                 if self.cp_size > 1:
                     set_context_parallel_group(self.device_mesh.get_group("cp"))
                 # set unified sequence parallel group

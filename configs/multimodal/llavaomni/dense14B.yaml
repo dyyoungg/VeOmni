@@ -80,7 +80,7 @@ train:
   # checkpoint
   checkpoint:
     output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/llava_14B
-    save_steps: 10
+    save_steps: 100000000000
     save_total_limit: 2
     manager: dcp
     save_hf_weights: false

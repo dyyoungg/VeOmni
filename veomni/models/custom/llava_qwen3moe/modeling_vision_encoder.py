@@ -181,7 +181,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
             # dp_rank = get_parallel_state().dp_rank
             # print(f"RANK:{rank}, DP rank: {dp_rank}, image shape: {hidden_states.shape[0]}")
             hidden_states = gather_seq_scatter_heads(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
             
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
@@ -202,7 +202,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
             if sp_padding_size > 0:
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
             hidden_states = gather_heads_scatter_seq(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
             
         for layer_num, blk in enumerate(self.blocks):
@@ -228,7 +228,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
             sp_padding_size = hidden_states.size(0) - unpadded_dim_size
             hidden_states = gather_seq_scatter_heads(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
             
             if sp_padding_size > 0:

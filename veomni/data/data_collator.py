@@ -486,46 +486,60 @@ class UlysessOmniDataSharderCollator:
  
     Output keys (FSDP2 flash-attention packing convention)
     -------------------------------------------------------
-        input_ids          : [1, T//sp]
-        labels             : [1, T//sp]
-        pixel_values       : [P//sp, D]   (image + video merged, SP-sliced)
-        image_grid_thw     : [M+K, 3]     (image + video merged, NOT sliced)
-        audio_features     : [A, F]       (NOT sliced – audio SP not supported)
-        audio_features_lens: [Na]
-        seq_lens           : [N]          – per-sample lengths (full, pre-slice)
-        cu_seq_lens_q      : [N+1]        – cumulative, for flash-attn (pre-slice)
-        cu_seq_lens_k      : [N+1]        – same as cu_seq_lens_q for self-attn
-        max_length_q       : int          – max per-sample length
-        max_length_k       : int          – same as max_length_q
-        attention_mask     : [1, T//sp]   – (optional)
+        input_ids          : [1, T_pad//sp]
+        labels             : [1, T_pad//sp]
+        pixel_values       : [P_pad//sp, D]  (image + video merged, SP-sliced)
+        image_grid_thw     : [M+K, 3]        (image + video merged, NOT sliced)
+        audio_features     : [A, F]          (NOT sliced)
+        audio_features_lens: [Na]            (NOT sliced)
+        seq_lens           : [N]             – per-sample lengths (full, pre-slice)
+        cu_seq_lens_q      : [N+1] or [N+2]  – cumulative seqlens for flash-attn;
+                                               N+2 when SP padding adds a dummy segment
+        cu_seq_lens_k      : same as cu_seq_lens_q
+        max_length_q       : int             – max real per-sample length (pre-slice)
+        max_length_k       : int             – same as max_length_q
+        attention_mask     : [1, T_pad//sp]  – (optional)
+ 
+    Notes on cu_seq_lens
+    --------------------
+    flash-attn varlen kernels require cu_seqlens[-1] == actual tensor length fed
+    to the kernel (i.e. T_pad, the SP-padded length, NOT the original T).
+ 
+    When SP padding is needed (T_pad > T), we append one extra dummy segment
+    [T, T_pad] to cu_seqlens instead of stretching the last real segment, so
+    the dummy padding tokens are causally isolated and never attend to real ones.
+    Their labels are IGNORE_INDEX so they contribute nothing to the loss.
     """
  
     pad_token_id: int = 0
     ignore_index: int = IGNORE_INDEX
  
+    # dim along which each key is SP-padded then SP-sliced
     sp_slice_features: Dict[str, int] = field(
         default_factory=lambda: {
-            "input_ids": -1,        # [1, T]      → slice last dim
-            "labels": -1,           # [1, T]      → slice last dim
-            "attention_mask": -1,   # [1, T]      → slice last dim
-            "pixel_values": 0,      # [P, D]      → slice first dim
+            "input_ids":      -1,   # [1, T]   → last dim
+            "labels":         -1,   # [1, T]   → last dim
+            "attention_mask": -1,   # [1, T]   → last dim
+            "pixel_values":    0,   # [P, D]   → first dim
         }
     )
  
     padding_features: Dict[str, Any] = field(
         default_factory=lambda: {
-            "input_ids": 0,           # overridden by pad_token_id in __post_init__
-            "labels": IGNORE_INDEX,
+            "input_ids":      0,            # overridden by pad_token_id in __post_init__
+            "labels":         IGNORE_INDEX,
             "attention_mask": 0,
-            "pixel_values": 0,
+            "pixel_values":   0,
             "audio_features": 0.0,
         }
     )
  
-    # Some modalities require the pad length to be a multiple of (sp_size * scale)
+    # pixel_values patches come in groups of 4 (temporal window), so their
+    # padded length must be divisible by sp_size * 4.
+    # Token sequences have no extra grouping constraint (scale = 1).
     padding_scale: Dict[str, int] = field(
         default_factory=lambda: {
-            "pixel_values": 4,   # ViT patch groups of 4 (temporal window)
+            "pixel_values": 4,
         }
     )
  
@@ -538,165 +552,170 @@ class UlysessOmniDataSharderCollator:
             self.sp_size = 1
             self.sp_rank = 0
  
-        # Sync pad_token_id into padding_features
         self.padding_features["input_ids"] = self.pad_token_id
  
     # ── SP helpers ────────────────────────────────────────────────────────────
+ 
+    def _padded_length(self, original: int, dim_key: str) -> int:
+        """Return the SP-aligned length for a given feature key."""
+        if self.sp_size <= 1:
+            return original
+        scale       = self.padding_scale.get(dim_key, 1)
+        target_unit = self.sp_size * scale
+        return (original + target_unit - 1) // target_unit * target_unit
  
     def _sp_padding(
         self,
         tensor: torch.Tensor,
         dim: int,
         pad_value: float,
-        pad_scale: int = 1,
+        dim_key: str,
     ) -> torch.Tensor:
-        """Pad `tensor` along `dim` so that size is divisible by sp_size * pad_scale."""
+        """Pad `tensor` along `dim` to the SP-aligned length."""
         if self.sp_size <= 1:
             return tensor
  
-        seq_len = tensor.size(dim)
-        target_unit = self.sp_size * pad_scale
-        target_len = (seq_len + target_unit - 1) // target_unit * target_unit
-        pad_size = target_len - seq_len
+        original   = tensor.size(dim)
+        target_len = self._padded_length(original, dim_key)
+        pad_size   = target_len - original
  
         if pad_size <= 0:
             return tensor
  
-        pad_shape = list(tensor.shape)
+        pad_shape      = list(tensor.shape)
         pad_shape[dim] = pad_size
-        pad_tensor = torch.full(
+        pad_tensor     = torch.full(
             pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device
         )
         return torch.cat([tensor, pad_tensor], dim=dim)
  
     def _sp_slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
-        """Extract this rank's chunk of `tensor` along `dim`."""
+        """Extract this rank's contiguous chunk along `dim`."""
         if self.sp_size <= 1:
             return tensor
  
-        total_len = tensor.size(dim)
-        chunk_size = total_len // self.sp_size
-        start_idx = self.sp_rank * chunk_size
-        return tensor.narrow(dim, start_idx, chunk_size).contiguous()
-
+        total      = tensor.size(dim)
+        chunk_size = total // self.sp_size
+        start      = self.sp_rank * chunk_size
+        return tensor.narrow(dim, start, chunk_size).contiguous()
+ 
+    # ── Main collation ────────────────────────────────────────────────────────
+ 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            features: list with exactly one packed sample dict (packing mode, bs=1).
-        Returns:
-            Batch dict ready for the model forward pass.
-        """
         assert len(features) == 1, (
-            "OmniDataSharderCollator only supports batch_size=1 (packing mode). "
-            f"Got {len(features)}."
+            f"UlysessOmniDataSharderCollator only supports batch_size=1 "
+            f"(packing mode), got {len(features)}."
         )
-        raw = features[0]
+        raw   = features[0]
         batch: Dict[str, Any] = {}
  
         def _to_tensor(val, dtype=None):
             if isinstance(val, torch.Tensor):
                 return val if dtype is None else val.to(dtype)
             if isinstance(val, list):
-                if len(val) > 0 and isinstance(val[0], torch.Tensor):
+                if val and isinstance(val[0], torch.Tensor):
                     return torch.cat(val, dim=0)
                 return torch.tensor(val, dtype=dtype)
-            raise ValueError(f"Unsupported data type: {type(val)}")
+            raise ValueError(f"Unsupported type: {type(val)}")
  
-        # ── Text tokens ──────────────────────────────────────────────────────
+        # ── 1. Text tokens ────────────────────────────────────────────────────
         if "input_ids" in raw:
-            inp = _to_tensor(raw["input_ids"], dtype=torch.long)
-            batch["input_ids"] = inp.unsqueeze(0)                # [1, T]
+            batch["input_ids"] = _to_tensor(raw["input_ids"], torch.long).unsqueeze(0)   # [1, T]
  
         if "labels" in raw:
-            lbl = _to_tensor(raw["labels"], dtype=torch.long)
-            batch["labels"] = lbl.unsqueeze(0)                   # [1, T]
+            batch["labels"] = _to_tensor(raw["labels"], torch.long).unsqueeze(0)         # [1, T]
  
         if "attention_mask" in raw:
-            mask = _to_tensor(raw["attention_mask"])
-            batch["attention_mask"] = mask.unsqueeze(0)          # [1, T]
+            batch["attention_mask"] = _to_tensor(raw["attention_mask"]).unsqueeze(0)     # [1, T]
  
-        # ── Per-sample sequence lengths → seq_lens ───────────────────────────
-        # sample_lens holds per-sample lengths in the packed sequence.
+        # ── 2. Per-sample lengths ─────────────────────────────────────────────
         if "sample_lens" in raw:
-            seq_lens = _to_tensor(raw["sample_lens"], dtype=torch.int32)
-            batch["seq_lens"] = seq_lens
+            batch["seq_lens"] = _to_tensor(raw["sample_lens"], torch.int32)              # [N]
  
-        # ── Flash-attention packing metadata (computed BEFORE SP slice) ──────
-        # cu_seq_lens and max_length describe the full packed sequence structure
-        # and must be consistent across all SP ranks so the SP flash-attention
-        # kernel can reason about cross-rank boundaries.
-        if "seq_lens" in batch:
-            seq_lens = batch["seq_lens"]                          # [N]
-            cu_seqlens = F.pad(
-                seq_lens.cumsum(dim=0).to(torch.int32), (1, 0), value=0
-            )                                                     # [N+1]
-            max_seqlen = int(seq_lens.max().item())
- 
-            batch["cu_seq_lens_q"] = cu_seqlens
-            batch["cu_seq_lens_k"] = cu_seqlens
-            batch["max_length_q"]  = max_seqlen   # plain int, not tensor
-            batch["max_length_k"]  = max_seqlen
- 
-        # ── Label shift + boundary masking ───────────────────────────────────
-        # Standard next-token prediction: shift labels left by 1, then zero out
-        # the last token of each packed sample to prevent cross-sample leakage.
+        # ── 3. Label shift + inter-sample boundary masking ────────────────────
+      
         if "labels" in batch and "seq_lens" in batch:
-            labels = batch["labels"]                              # [1, T]
-            # shift
+            labels = batch["labels"]                    # [1, T]
+ 
             labels = labels[..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", self.ignore_index)
  
-            # mask the last token of every sample (except the very last one,
-            # which is already masked by the shift padding above)
-            cu = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
-            boundaries = cu[1:-1]                                 # inter-sample boundaries
+            # mask the last token of every sample except the final one
+            # (the final sample's last position is already IGNORE from the shift pad)
+            cu         = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
+            boundaries = cu[1:-1]                       # inter-sample boundaries, [N-1]
             if boundaries.numel() > 0:
                 labels[0, boundaries - 1] = self.ignore_index
  
             batch["labels"] = labels
  
-        # ── Vision modalities: merge image + video pixel_values ──────────────
+        # ── 4. Flash-attention metadata (BEFORE SP padding/slice) ─────────────
+        #
+        # The flash-attn varlen kernel requires:
+        #     cu_seqlens[-1] == length of the tensor actually passed in
+        #
+        # After SP padding the tensor length becomes T_padded, so cu_seqlens
+        # must reflect that.  We append a dummy segment [T_original, T_padded]
+        # rather than stretching the last real segment, so padding tokens are
+        # causally isolated.  Their labels are IGNORE_INDEX → no loss contribution.
+        #
+        # All SP ranks derive T_padded from the same deterministic formula, so
+        # cu_seqlens is identical across the SP group (required for correctness).
+        #
+        if "seq_lens" in batch:
+            seq_lens   = batch["seq_lens"]                              # [N], int32
+            T_original = int(seq_lens.sum().item())
+            # tokens have no extra scale (scale=1); use _padded_length for consistency
+            T_padded   = self._padded_length(T_original, "input_ids")
+            max_seqlen = int(seq_lens.max().item())
+ 
+            cu_seqlens = F.pad(
+                seq_lens.cumsum(dim=0).to(torch.int32), (1, 0), value=0
+            )                                                           # [N+1]
+ 
+            if T_padded > T_original:
+                cu_seqlens = F.pad(cu_seqlens, (0, 1), value=T_padded) # [N+2]
+ 
+            batch["cu_seq_lens_q"] = cu_seqlens
+            batch["cu_seq_lens_k"] = cu_seqlens
+            batch["max_length_q"]  = max_seqlen     # plain int, not tensor
+            batch["max_length_k"]  = max_seqlen
+ 
+        # ── 5. Vision modalities ──────────────────────────────────────────────
         merged_pv: List[torch.Tensor] = []
         for key in ("pixel_values", "pixel_values_video"):
             if key in raw and raw[key] is not None:
                 merged_pv.append(_to_tensor(raw[key]))
         if merged_pv:
-            batch["pixel_values"] = torch.cat(merged_pv, dim=0)  # [P_img+P_vid, D]
+            batch["pixel_values"] = torch.cat(merged_pv, dim=0)        # [P_img+P_vid, D]
  
-        # image_grid_thw: merge image and video grids
         merged_thw: List[torch.Tensor] = []
         for key in ("image_grid_thw", "video_grid_thw"):
             if key in raw and raw[key] is not None:
                 merged_thw.append(_to_tensor(raw[key]))
         if merged_thw:
-            batch["image_grid_thw"] = torch.cat(merged_thw, dim=0)  # [M+K, 3]
+            batch["image_grid_thw"] = torch.cat(merged_thw, dim=0)     # [M+K, 3]
  
-        # ── Audio modalities (not SP-sliced) ─────────────────────────────────
         for key in ("audio_features", "audio_features_lens"):
             if key in raw and raw[key] is not None:
                 batch[key] = _to_tensor(raw[key])
  
-        # ── SP padding then SP slice ──────────────────────────────────────────
-        # Keys that need SP treatment are listed in sp_slice_features.
-        # We pad them first (so total length is divisible by sp_size), then
-        # each rank takes its own chunk.
+        # ── 7. SP padding → SP slice ──────────────────────────────────────────
         #
-        # NOTE: cu_seq_lens_q/k, max_length_q/k, seq_lens, image_grid_thw, and
-        # audio_* are intentionally excluded — they describe the full sequence
-        # and must be identical on every SP rank.
- 
-        for key in list(self.sp_slice_features.keys()):
+        # Excluded from SP treatment (must be identical on every rank):
+        #   cu_seq_lens_q/k, max_length_q/k, seq_lens, image_grid_thw, audio_*
+        #
+        for key, dim in self.sp_slice_features.items():
             if key not in batch:
                 continue
-            dim = self.sp_slice_features[key]
             pad_val = self.padding_features.get(key, 0)
-            scale = self.padding_scale.get(key, 1)
-            batch[key] = self._sp_padding(batch[key], dim=dim, pad_value=pad_val, pad_scale=scale)
+            batch[key] = self._sp_padding(
+                batch[key], dim=dim, pad_value=pad_val, dim_key=key
+            )
  
-        for key in list(self.sp_slice_features.keys()):
+        for key, dim in self.sp_slice_features.items():
             if key not in batch:
                 continue
-            dim = self.sp_slice_features[key]
             batch[key] = self._sp_slice(batch[key], dim=dim)
  
         return batch

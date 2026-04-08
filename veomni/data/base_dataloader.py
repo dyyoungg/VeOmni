@@ -66,7 +66,7 @@ class BaseDataLoader:
 
         self.dataloader_num_workers = training_args.dataloader_num_workers
         self.debug = False
-        self.is_launch = False
+        self.is_launched = False
         self.remote_data_index = torch.multiprocessing.Value("i", 0)
 
         self.data_list: List = []
@@ -114,8 +114,10 @@ class BaseDataLoader:
     def launch(self) -> None:
         """Set up worker processes and I/O queues.  Designed to support
         resume-from-checkpoint in the trainer."""
+        if self.is_launched:
+            return
         self.end_signal = False
-        self.is_launch = False
+        self.is_launched = False
 
         # inter-process queues
         self.data_queue = torch.multiprocessing.Queue()
@@ -158,7 +160,7 @@ class BaseDataLoader:
             for d in self.data_list:
                 self.data_queue.put(d)
 
-        self.is_launch = True
+        self.is_launched = True
 
     def start_worker(self) -> None:
         if self.dataloader_num_workers == 0:
@@ -210,7 +212,7 @@ class BaseDataLoader:
             pass
 
     def close(self) -> None:
-        if not self.is_launch:
+        if not self.is_launched:
             return
 
         self.end_signal = True
@@ -257,10 +259,10 @@ class BaseDataLoader:
                 print(f"[close] remote_server_process stop failed: {e}")
             self.remote_server_process = None
 
-        self.is_launch = False
+        self.is_launched = False
 
     def check_all_workers_done(self) -> bool:
-        if not self.is_launch:
+        if not self.is_launched:
             return False
         return all(e.is_set() for e in self.worker_status_event)
 

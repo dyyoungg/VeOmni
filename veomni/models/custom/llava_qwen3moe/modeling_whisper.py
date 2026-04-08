@@ -396,7 +396,7 @@ class WhisperAttention(nn.Module):
             if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
                 qkv = torch.stack([query_states, key_states, value_states], dim=0)
                 unpadded_dim_size = cu_seqlens_q[-1]
-                qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group)
+                qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
                 sp_padding_size = qkv.size(1) - unpadded_dim_size
                 if sp_padding_size > 0:
                     qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
@@ -1097,7 +1097,7 @@ class WhisperEncoder(WhisperPreTrainedModel):
 
             if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
                 unpadded_dim_len = cu_seqlens_q[-1]
-                hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group, padding=True)
+                hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().ulysses_group, padding=True)
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
@@ -1153,7 +1153,7 @@ class WhisperEncoder(WhisperPreTrainedModel):
                 all_attentions = all_attentions + (layer_outputs[1],)
 
         if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().ulysses_group)
             sp_padding_size = hidden_states.size(0) - unpadded_dim_len
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)

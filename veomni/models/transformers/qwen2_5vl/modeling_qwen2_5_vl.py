@@ -570,7 +570,6 @@ class Qwen2_5_VLForConditionalGeneration(_Qwen2_5_VLForConditionalGeneration):
     # --- Patch.1 ---
 
     @can_return_tuple
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,

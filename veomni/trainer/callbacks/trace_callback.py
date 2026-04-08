@@ -355,19 +355,19 @@ class EnvironMeterCallback(Callback):
 
             # 吞吐 & 显存
             env_info = (
-                f"  mfu: {step_env_metrics.get('mfu', 0):.4f}  "
-                f"tokens/s: {step_env_metrics.get('tokens_per_second(M)', 0):.4f}M  "
-                f"consumed: {step_env_metrics.get('consume_tokens(B)', 0):.4f}B  "
+                f"  mfu: {step_env_metrics.get('system_metric/mfu', 0):.4f}  "
+                f"flops_achieved(T): {step_env_metrics.get('system_metric/flops_achieved(T)', 0):.4f}  "
+                f"tokens/s: {step_env_metrics.get('training/tokens_per_second(M)', 0):.4f}M  "
+                f"consumed: {step_env_metrics.get('training/consume_tokens(B)', 0):.4f}B  "
                 f"avg_seqlen: {step_env_metrics.get('training/avg_sample_seq_len', 0):.1f}  "
-                f"mem_alloc: {step_env_metrics.get('max_memory_allocated(GB)', 0):.2f}GB  "
-                f"mem_reserved: {step_env_metrics.get('max_memory_reserved(GB)', 0):.2f}GB  "
-                f"alloc_retries: {step_env_metrics.get('num_alloc_retries', 0)}  "
-                f"cpu_memory_usage(%): {step_env_metrics.get('cpu_memory_usage(%)', 0):.2f} "
+                f"mem_alloc: {step_env_metrics.get('memory/max_memory_allocated(GB)', 0):.2f}GB  "
+                f"mem_reserved: {step_env_metrics.get('memory/max_memory_reserved(GB)', 0):.2f}GB  "
+                f"alloc_retries: {step_env_metrics.get('memory/num_alloc_retries', 0)}  "
+                f"cpu_memory_usage(%): {step_env_metrics.get('memory/cpu_memory_usage(%)', 0):.2f} "
             )
             logger.info(env_info)
         
         if state.global_step == 50:
-            # 第一次：开始追踪，记录基准快照
             tracemalloc.start(10)  # 10层调用栈
             self._tracemalloc_snapshot = tracemalloc.take_snapshot()
             logger.info("[MemTrace] baseline snapshot taken.")

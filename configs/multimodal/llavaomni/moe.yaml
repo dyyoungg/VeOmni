@@ -51,8 +51,8 @@ train:
   enable_mixed_precision: false
   enable_batch_invariant_mode: false
   eval_steps: 0
-  gc_steps: 100
-  empty_cache_steps: 100
+  gc_steps: 200
+  empty_cache_steps: 200
   logging_steps: 20
 
   gradient_checkpointing:
@@ -78,7 +78,7 @@ train:
   # checkpoint
   checkpoint:
     output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/moe_test
-    save_steps: 20
+    save_steps: 20000000
     save_total_limit: 3
     manager: dcp
     save_hf_weights: false
@@ -89,7 +89,7 @@ train:
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_moe
+    name: llavaomni_moe_down4
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2

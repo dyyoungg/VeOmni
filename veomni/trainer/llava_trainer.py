@@ -207,7 +207,7 @@ class VLMTrainer:
         if not dist.is_initialized():
             dist.init_process_group(backend=get_dist_comm_backend())
 
-        logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+        # logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
         init_parallel_state(
@@ -333,7 +333,7 @@ class VLMTrainer:
             self.train_dataloader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
         else:
             self.train_dataloader = get_train_dataloader(data_args, training_args, model_args, tokenizer)
-
+        self.train_dataloader.launch()
         self.eva_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
     
     def _build_model_assets(self):
@@ -725,7 +725,8 @@ class VLMTrainer:
         )
         
         for epoch in range(args.train.num_train_epochs):
-            self.train_dataloader.launch()
+            if not self.train_dataloader.is_launched:
+                self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)
             self.current_epoch = epoch
             if hasattr(self.train_dataloader, "set_epoch"):
