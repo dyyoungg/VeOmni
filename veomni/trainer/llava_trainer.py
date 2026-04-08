@@ -678,12 +678,12 @@ class VLMTrainer:
             self.train_steps * args.train.optimizer.lr_warmup_ratio
         )
         if warmup_steps > 0 and self.video_trained_num < warmup_steps:
-            self.lr_scheduler.step(self.video_trained_num)
+            self.lr_scheduler.step(epoch=self.video_trained_num)
 
         else:
             decay_ratio = getattr(args.train.optimizer, "lr_decay_ratio", 1.0)
             if self.video_trained_num / max(self.init_data_size, 1) <= decay_ratio:
-                self.lr_scheduler.step(max(self.video_trained_num, warmup_steps))
+                self.lr_scheduler.step(epoch=max(self.video_trained_num, warmup_steps))
 
         self.state.global_step += 1
         self.current_step += 1

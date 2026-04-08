@@ -263,14 +263,12 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
             if pixel_values is not None and image_grid_thw is not None:
                 cat_pixels.append(pixel_values)
                 cat_thw.append(image_grid_thw)
-            else:
-                raise ValueError("pixel values is None or image_grid_thw is None!")
+        
             
             if pixel_values_videos is not None and video_grid_thw is not None:
                 cat_pixels.append(pixel_values_videos)
                 cat_thw.append(video_grid_thw)
-            else:
-                raise ValueError("pixel values video is None or video_grid_thw is None!")
+           
            
             cat_pixels = torch.cat(cat_pixels, dim=0)
             cat_thw = torch.cat(cat_thw, dim=0)

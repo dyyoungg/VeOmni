@@ -63,6 +63,7 @@ train:
   # FSDP / 并行
   accelerator:
     ulysses_size: 1
+    ep_size: 2
     enable_async: false
     fsdp_config:
       fsdp_mode: fsdp2
@@ -89,7 +90,7 @@ train:
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_moe_down4
+    name: llavaomni_moe_ep4_down4
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2

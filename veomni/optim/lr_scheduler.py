@@ -35,9 +35,9 @@ class MultiLRScheduler(dict):
 
     _is_multi_lr_scheduler: bool = True
 
-    def step(self) -> None:
+    def step(self, *args, **kwargs) -> None:
         for sched in self.values():
-            sched.step()
+            sched.step(*args, **kwargs)
 
     def state_dict(self) -> Dict[str, any]:
         return {name: sched.state_dict() for name, sched in self.items()}

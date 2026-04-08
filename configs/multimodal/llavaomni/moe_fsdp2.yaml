@@ -1,19 +1,15 @@
 # configs/llava_train.yaml
 model:
-  model_path: /mnt/afs/share/llava_qwen2_14B-veomni-down4
-  config_path: /mnt/afs/share/llava_qwen2_14B-veomni-down4
+  model_path: /mnt/afs/share/llava_qwen30B_A3B-veomni-down4
+  config_path: /mnt/afs/share/llava_qwen30B_A3B-veomni-down4
   model_arc: qwen2
   vision_tower: /mnt/afs/share/qwen25_vl_encoder
   mm_downsample_ratio: 4
-  image_projector_type: dynamic_avgpool
-  audio_projector_type: conv_channel_upscale
-  use_audio_start_end_token: true
-  audio_downsample_ratio: 10
-
+  image_projector_type: avgpool
 
 data:
   train_path: /mnt/afs/yangdeyu/GameMLLM/llava_dev/LLaVA_hub/data/stage2/train_0.jsonl
-  eval_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/test_json.json
+  eval_path: /mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_audio_text_ocr_eval.json
   mm_configs:
     image_max_pixels: 602112   # 768*28*28
   sample_fps: 4
@@ -28,7 +24,7 @@ train:
   world_size: 8
 
   # 模型参数
-  model_max_length: 8192
+  model_max_length: 4096
   pack_seq: true
   init_device: meta
 
@@ -51,12 +47,14 @@ train:
 
   vit_lr: 2.0e-4
   min_lr_rate: 0.1
+  moe_load_balance_monitor_interval: 10
   enable_mixed_precision: false
   enable_batch_invariant_mode: false
   eval_steps: 0
-  gc_steps: 100
-  empty_cache_steps: 100
+  gc_steps: 200
+  empty_cache_steps: 200
   logging_steps: 20
+
   gradient_checkpointing:
     enable: true
     debug: false
@@ -64,7 +62,8 @@ train:
 
   # FSDP / 并行
   accelerator:
-    ulysses_size: 2
+    ulysses_size: 1
+    ep_size: 1
     enable_async: false
     fsdp_config:
       fsdp_mode: fsdp2
@@ -79,22 +78,21 @@ train:
 
   # checkpoint
   checkpoint:
-    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/llava_14B
-    save_steps: 100000000000
-    save_total_limit: 2
+    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/moe_test
+    save_steps: 20000000
+    save_total_limit: 3
     manager: dcp
     save_hf_weights: false
     save_async: true
-    hf_save_steps: 20
  
 
 
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_14B_down4_ulysess
+    name: llavaomni_moe_down4
   # dataloader
-  dataloader_num_workers: 2
+  dataloader_num_workers: 4
   dataloader_prefetch_factor: 2
   remote_dataloader: false
   broadcast_model_weights_from_rank0: true
