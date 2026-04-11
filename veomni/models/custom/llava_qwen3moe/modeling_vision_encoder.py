@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+import torch.distributed as dist
 from flash_attn import flash_attn_varlen_func
 
 from veomni.models.transformers.qwen2_5vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel
@@ -175,7 +176,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         unpadded_dim_size = cu_seqlens[-1]
-
+        
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
             # rank = get_parallel_state().global_rank
             # dp_rank = get_parallel_state().dp_rank
@@ -226,7 +227,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         reverse_indices = torch.argsort(window_index)
 
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            sp_padding_size = hidden_states.size(0) - unpadded_dim_size
+            sp_padding_size = hidden_states.size(0) * get_parallel_state().ulysses_size - seq_len // 4
             hidden_states = gather_seq_scatter_heads(
                 hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
@@ -234,8 +235,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
             if sp_padding_size > 0:
                 hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
             
-
-        hidden_states = hidden_states[reverse_indices, :]
+        hidden_states = hidden_states[reverse_indices, :] # [seq, hidden//sp]
         return hidden_states
 
 class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):

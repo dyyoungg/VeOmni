@@ -197,17 +197,18 @@ class VLMTrainer:
     def _setup(self):
         # log args
         # logger.info_rank0(json.dumps(asdict(self.args), indent=2))
-
         # init distributed environment
         device_str = f"{get_device_type()}:{self.args.train.local_rank}"
+ 
         get_torch_device().set_device(device_str)
         self.device = torch.device(device_str)
 
         # Initialize distributed process group
         if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend())
-
-        # logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+            dist.init_process_group(backend=get_dist_comm_backend(),
+                                    device_id=torch.device(device_str))
+       
+        logger.info(f"Process rank: {self.args.train.global_rank}, {device_str}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
         init_parallel_state(
@@ -333,7 +334,8 @@ class VLMTrainer:
             self.train_dataloader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
         else:
             self.train_dataloader = get_train_dataloader(data_args, training_args, model_args, tokenizer)
-        self.train_dataloader.launch()
+        dist.barrier()
+        
         self.eva_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
     
     def _build_model_assets(self):
@@ -414,7 +416,11 @@ class VLMTrainer:
         self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
         self.train_steps = self.init_data_size * args.train.num_train_epochs
         print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
-       
+        parallel_state = get_parallel_state()
+        # 检查 fsdp_mesh 的 world size
+        fsdp_mesh_size = parallel_state.fsdp_mesh.size()  # 或 .numel()
+        sp_size = parallel_state.sp_size
+        dp_size = parallel_state.dp_size
     
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
@@ -544,6 +550,7 @@ class VLMTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
         step_timer = None
+        dist.barrier()
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             step_timer = getattr(self, "_current_step_timer", None)
             with step_timer.measure("forward") if step_timer else contextlib.nullcontext():
@@ -706,7 +713,7 @@ class VLMTrainer:
         args: VeOmniArguments = self.args
     
         self.on_train_begin()
-
+        self.train_dataloader.launch()
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps
         self.state.video_trained_num = 0

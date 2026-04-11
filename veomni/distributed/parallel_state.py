@@ -195,12 +195,10 @@ class ParallelState:
                     print(f"rank: {my_global_rank}, local ulysses rank: {my_ranks}")
                     my_ranks_tensor = torch.tensor(my_ranks, dtype=torch.long, device="cuda")
                     
-                    # 2. 全局 all_gather，让所有 rank 知道全网所有的分组情况
                     world_size = dist.get_world_size()
                     all_ranks_tensors = [torch.zeros_like(my_ranks_tensor) for _ in range(world_size)]
                     dist.all_gather(all_ranks_tensors, my_ranks_tensor)
                     
-                    # 3. 去重，构建一个所有 rank 都绝对一致的 unique_groups 列表
                     seen = set()
                     unique_groups = []
                     for t in all_ranks_tensors:
@@ -208,18 +206,20 @@ class ParallelState:
                         if group_tuple not in seen:
                             seen.add(group_tuple)
                             unique_groups.append(list(group_tuple))
-                    
+                    _KEEPALIVE_GLOO_GROUPS = []
                     my_cpu_group = None
                     for g_ranks in unique_groups:
                         gloo_group = dist.new_group(
                             ranks=g_ranks, 
                             backend="gloo", 
-                            timeout=datetime.timedelta(seconds=180)
+                            timeout=datetime.timedelta(seconds=120)
                         )
-                       
+                        _KEEPALIVE_GLOO_GROUPS.append(gloo_group)
                         if my_global_rank in g_ranks:
                             my_cpu_group = gloo_group
                     try:
+                        global _PERSISTENT_GROUPS 
+                        _PERSISTENT_GROUPS = _KEEPALIVE_GLOO_GROUPS
                         set_ulysses_sequence_parallel_cpu_group(group=my_cpu_group, group_key="default")
                         logger.info(f"rank {my_global_rank} success initialize data cpu sync group!!")
                     except ImportError:

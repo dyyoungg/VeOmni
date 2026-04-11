@@ -208,7 +208,7 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
 
         # SP: gather inputs_embeds to full sequence and gather input_ids to compute masks.
         if sp_enabled:
-            inputs_embeds = gather_seq_scatter_heads(inputs_embeds, seq_dim=1, head_dim=2, group=sp_group)
+            inputs_embeds = gather_seq_scatter_heads(inputs_embeds, seq_dim=1, head_dim=2, group=sp_group) # [full_seq, h//sp]
             sp_size = parallel_state.sp_size
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=sp_group)
@@ -244,7 +244,7 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
         n_audio_tokens = special_audio_mask.sum().item()
         n_video_tokens = special_video_mask.sum().item()
 
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device) # [full_seq, h//d]
         special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
 

@@ -9,6 +9,7 @@ import heapq
 import queue
 import threading
 import datetime
+import pickle
 
 
 import math
@@ -170,11 +171,17 @@ class UlyssesStreamingDataset(IterableDataset):
         self.offline_split = getattr(data_args, "offline_dataset_split", False)
  
         self.dp_rank, self.dp_world_size = self._detect_distribution_mode()
- 
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
         # ── Load data manifest ────────────────────────────────────────────────
         self.data_list: List[Dict] = self._load_data_list(data_args.train_path)
-        logger.info(f"[DP Rank {self.dp_rank}] Loaded {len(self.data_list)} samples.")
- 
+       
+        try:
+            ps = get_parallel_state()
+            self._sp_rank = ps.ulysses_rank if (ps is not None and ps.sp_size > 1) else 0
+        except Exception:
+            self._sp_rank = 0
+            logger.info("get sp rank failed. set sp_rank=0 by default.")
+        logger.info(f"[DP Rank {self.dp_rank} SP Rank {self._sp_rank}] Loaded {len(self.data_list)} samples.")
         # Processor is lazily initialized inside each DataLoader worker
         self._processor: Optional[UlysessOmniProcessor] = None
  
@@ -214,7 +221,7 @@ class UlyssesStreamingDataset(IterableDataset):
  
     def set_epoch(self, epoch: int):
         self.epoch = epoch
-        logger.info(f"[DP Rank {self.dp_rank}] Epoch set to {epoch}.")
+        # logger.info(f"[DP Rank {self.dp_rank}] Epoch set to {epoch}.")
  
     def set_consumed_samples(self, n: int):
         self.skip_samples_count = n
@@ -261,9 +268,42 @@ class UlyssesStreamingDataset(IterableDataset):
             prev = item
         yield prev, True
  
-    # ── __iter__ ─────────────────────────────────────────────────────────────
+    def _process_with_timeout(
+        self, sample_data: Dict, sample_idx: int, timeout: float = 60.0) -> Optional[Any]:
+        """
+        在独立线程里处理样本，超时则放弃返回 None。
+        Python 无法强杀线程，daemon=True 保证进程退出时自动回收。
+        """
+        result_holder    = [None]
+        exception_holder = [None]
+        done_event       = threading.Event()
+
+        def _run():
+            try:
+                result_holder[0] = self._processor(sample_data, sample_idx)
+            except Exception as e:
+                exception_holder[0] = e
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        finished = done_event.wait(timeout=timeout)
+
+        if not finished:
+            logger.warning(
+                f"[DP Rank {self.dp_rank}] Sample {sample_idx} timed out "
+                f"after {timeout}s, skipping. (thread still running in bg)"
+            )
+            return None  # 直接跳过，不等了
+
+        if exception_holder[0] is not None:
+            raise exception_holder[0]
+
+        return result_holder[0]
  
     def __iter__(self):
+       
         self._init_processor()
  
         data = self._get_shuffled_data()
@@ -282,36 +322,34 @@ class UlyssesStreamingDataset(IterableDataset):
  
         for i, sample_data in enumerate(data):
             try:
-                if global_idx % total_shards != current_shard:
-                    global_idx += 1
-                    continue
+                if global_idx % total_shards == current_shard:
  
-                try:
-                    result = self._processor(sample_data, sample_idx=local_counter)
-                    if result is not None:
-                        if isinstance(result, (list, types.GeneratorType)):
-                            sub_idx = 0
-                            for item, is_last in self._iterate_with_lookahead(result):
-                                yield (global_idx, sub_idx, is_last, item)
-                                sub_idx += 1
+                    try:
+                        result = self._processor(sample_data, sample_idx=local_counter)
+                        if result is not None:
+                            if isinstance(result, (list, types.GeneratorType)):
+                                sub_idx = 0
+                                for item, is_last in self._iterate_with_lookahead(result):
+                                    yield (global_idx, sub_idx, is_last, item)
+                                    sub_idx += 1
+                            else:
+                                yield (global_idx, 0, True, result)
                         else:
-                            yield (global_idx, 0, True, result)
-                    else:
+                            yield (global_idx, 0, True, None)
+                        # print(f"rank {self.rank}, sample idx: {global_idx}")
+                        local_counter += 1
+                        if i % 10 == 0:
+                            time.sleep(0.001)  # yield GIL briefly
+    
+                    except Exception as e:
+                        traceback.print_exc()
+                        logger.warning(
+                            f"[DP Rank {self.dp_rank} Worker {worker_id}] "
+                            f"Processing failed at idx {i}: {e}"
+                        )
                         yield (global_idx, 0, True, None)
- 
-                    local_counter += 1
-                    if i % 10 == 0:
-                        time.sleep(0.001)  # yield GIL briefly
- 
-                except Exception as e:
-                    traceback.print_exc()
-                    logger.warning(
-                        f"[DP Rank {self.dp_rank} Worker {worker_id}] "
-                        f"Processing failed at idx {i}: {e}"
-                    )
-                    yield (global_idx, 0, True, None)
-                    local_counter += 1
- 
+                        local_counter += 1
+    
                 global_idx += 1
  
             except Exception as e:
@@ -633,7 +671,7 @@ class PrefetchingPackedLoader:
         if self.samples_consumed > 0:
             self._propagate(self.dataset, "set_consumed_samples", self.samples_consumed)
  
-        logger.info(f"[Rank {self.rank}] Launching PrefetchingPackedLoader (epoch {self.epoch})…")
+        # logger.info(f"[Rank {self.rank}] Launching PrefetchingPackedLoader (epoch {self.epoch})…")
         self.queue = queue.Queue(maxsize=self.prefetch_batches)
         self.stop_event.clear()
         self.producer_thread = threading.Thread(target=self._producer, daemon=True)
@@ -732,7 +770,10 @@ class PrefetchingPackedLoader:
         gathered   = [torch.zeros_like(local_t) for _ in range(world_size)]
  
         try:
-            dist.all_gather(gathered, local_t, group=cpu_group)
+            if not self.stop_event.is_set():
+                dist.all_gather(gathered, local_t, group=cpu_group)
+            else:
+                return
         except Exception as e:
             logger.error(f"[Rank {self.rank}] CPU Gloo all_gather failed: {e}")
             return
@@ -761,7 +802,7 @@ class PrefetchingPackedLoader:
             )
  
     def _create_cpu_synced_iterator(
-        self, raw_iterator: Iterator, chunk_size: int = 4
+        self, raw_iterator: Iterator, chunk_size: int = 1
     ) -> Iterator[Dict]:
         """
         Wrap raw_iterator with SP-consistency gating.
@@ -773,14 +814,17 @@ class PrefetchingPackedLoader:
         always sees the exact same sequence of packed samples.
         """
         cpu_group = None
+        sp_size   = 1
         try:
             ps = get_parallel_state()
             if ps is not None and ps.sp_size > 1:
                 cpu_group = get_ulysses_sequence_parallel_cpu_group()
+                sp_rank   = ps.ulysses_rank
+                sp_size   = ps.ulysses_size
         except Exception as e:
             logger.warning(f"[Rank {self.rank}] Could not retrieve sp_data_group: {e}")
  
-        if cpu_group is None:
+        if cpu_group is None or sp_size <= 1:
             logger.error(
                 f"[Rank {self.rank}] CRITICAL WARNING: SP CPU Gloo group is None! "
                 "Data divergence across SP ranks will NOT be caught!"
@@ -789,7 +833,7 @@ class PrefetchingPackedLoader:
                 if item is not None:
                     yield item
             return
- 
+     
         buffer: List = []
         for item in raw_iterator:
             buffer.append(item)
@@ -855,11 +899,20 @@ class PrefetchingPackedLoader:
                 batch = self.collate_fn(batch_buf)
             else:
                 batch = batch_buf
-            self.queue.put(batch)
-            time.sleep(0.001)
+            while not self.stop_event.is_set():
+                try:
+                    self.queue.put(batch, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
         except Exception as e:
             logger.error(f"[Rank {self.rank}] Collation error: {e}\n{traceback.format_exc()}")
-            self.queue.put(e)
+            while not self.stop_event.is_set():
+                try:
+                    self.queue.put(e, timeout=0.1)
+                    break
+                except queue.Full:
+                    pass
  
     # ── Consumer (main thread) ────────────────────────────────────────────────
  

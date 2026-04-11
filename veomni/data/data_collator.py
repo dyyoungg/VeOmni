@@ -642,10 +642,10 @@ class UlysessOmniDataSharderCollator:
  
             # mask the last token of every sample except the final one
             # (the final sample's last position is already IGNORE from the shift pad)
-            cu         = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
-            boundaries = cu[1:-1]                       # inter-sample boundaries, [N-1]
-            if boundaries.numel() > 0:
-                labels[0, boundaries - 1] = self.ignore_index
+            # cu         = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
+            # boundaries = cu[1:-1]                       # inter-sample boundaries, [N-1]
+            # if boundaries.numel() > 0:
+            #     labels[0, boundaries - 1] = self.ignore_index
  
             batch["labels"] = labels
  

@@ -11,6 +11,7 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
     pad_tensor
     )
+from veomni.distributed.sequence_parallel.ulysses import _Gather, _Slice
     
 @lru_cache(maxsize=100)
 def get_adaptive_pool_size(M, N, scale=20):
@@ -128,25 +129,30 @@ class DynamicAvgPoolProjector(nn.Module):
             outputs.append(pooled)
             seq_len.extend(tokens)
         
-        hidden_states = torch.cat(outputs, dim=0)  # [m, hidden_size]
+        hidden_states = torch.cat(outputs, dim=0)  # [m, hidden_size//sp]
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            
+            sp_group = get_parallel_state().ulysses_group
             sp_world_size = get_parallel_state().ulysses_size
             remainder = hidden_states.shape[0] % sp_world_size
             if remainder > 0:
                 pad_len = sp_world_size - remainder
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=pad_len) 
-
+      
             hidden_states = gather_heads_scatter_seq(
-                hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
-            ) # [m//sp, hidden*sp]
+                hidden_states, seq_dim=0, head_dim=1, group=sp_group
+            ) # [m//sp, h*sp]
+      
+            # hidden_states = _Gather.apply(sp_group, hidden_states, 0, False)
+
         hidden_states = self.mlp(hidden_states)  # [m, out_hidden]
         if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            hidden_states = gather_seq_scatter_heads(hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group)
-            if remainder > 0:
-                hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=pad_len)
-          
 
+            hidden_states = gather_seq_scatter_heads(hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group)
+            # hidden_states = _Slice.apply(get_parallel_state().ulysses_group, hidden_states, 1, True)
+            if remainder > 0:
+                hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=pad_len) ## [seq, h//sp]
+           
+          
         return hidden_states, seq_len
 
         

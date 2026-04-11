@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from transformers.loss.loss_utils import LOSS_MAPPING
 
 from ...distributed.parallel_state import get_parallel_state
@@ -101,6 +102,7 @@ def ForCausalLMLoss(
     if sp_enabled:
         num_valid_tokens = (labels != ignore_index).sum()
         loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+    # print(dist.get_rank(), loss.item())
     return loss, logits
 
 

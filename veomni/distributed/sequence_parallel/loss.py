@@ -43,7 +43,8 @@ class ReduceLoss(torch.autograd.Function):
         ctx: torch.autograd.Function, grad_output: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         local_num_tokens, global_num_tokens = ctx.saved_tensors
-        grad_output = get_unified_sequence_parallel_world_size() * local_num_tokens * grad_output / global_num_tokens
+        sp_world_size = get_unified_sequence_parallel_world_size()
+        grad_output = sp_world_size * local_num_tokens * grad_output / global_num_tokens
         return grad_output, None
 
 

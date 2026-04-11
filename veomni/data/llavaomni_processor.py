@@ -691,8 +691,8 @@ class OmniSampleProcessor:
         if method == "imageio" or format == "gif":
             img_index = 0
             for idx, image in enumerate(video):
-                # if idx % 10 == 0:
-                #     time.sleep(0.001)
+                if idx % 20 == 0:
+                    time.sleep(0.001)
                 if idx == frame_seq[img_index]:
                     raw_img_list.append(Image.fromarray(image).convert("RGB"))
                     img_index += 1
