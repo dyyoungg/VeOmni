@@ -754,9 +754,10 @@ class VLMTrainer:
                     break
                 
                 if should_stop:
-                    logger.info(f"epoch:{epoch} Data exhausted on one or more ranks, stopping.")
+                    logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping.")
                     break
             self.start_step = 0
+            dist.barrier()
             self.train_dataloader.close()
             self.on_epoch_end()
 

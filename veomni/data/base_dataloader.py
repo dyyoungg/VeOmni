@@ -29,12 +29,13 @@ from imageio.core import Request
 
 
 from veomni.utils.helper import read_data
+from veomni.utils.logging import get_logger
 from veomni.utils.constants import _CHAT_TEMPLATES
 
 
 TIMEOUT = 30
 REMOTE_SERVER_PORT = 10017
-
+logger = get_logger(__name__)
 
 class TimeoutException(Exception):
     pass
@@ -217,38 +218,38 @@ class BaseDataLoader:
 
         self.end_signal = True
         self.workers_done_event.set()
-
-        if self.fetch_data_thread is not None:
-            self.fetch_data_thread.join()
-            self.fetch_data_thread = None
+        if self.result_queue is not None:
+            self.result_queue.cancel_join_thread()
+        if self.data_queue is not None:
+            self.data_queue.cancel_join_thread()
 
         self._drain_queue(self.batch_data_queue, use_nowait=False)
-
         if self.result_queue is not None:
             self._drain_queue(self.result_queue)
-
         if self.data_queue is not None:
             self._drain_queue(self.data_queue)
+        
+        if self.fetch_data_thread is not None:
+            self.fetch_data_thread.join(timeout=2)
+            self.fetch_data_thread = None
 
         for p in self.worker_processes:
             try:
                 p.join(timeout=5)
                 if p.is_alive():
-                    print(f"Worker {p.pid} did not exit, terminating...")
+                    logger.warning(f"rank {self.rank} Worker {p.pid} did not exit, terminating...")
                     p.terminate()
                     p.join()
             except Exception as e:
-                print(f"[close] join worker failed: {e}")
+                logger.warning(f"[close] join worker failed: {e}")
         self.worker_processes = []
 
         if self.result_queue is not None:
             self.result_queue.close()
-            self.result_queue.join_thread()
             self.result_queue = None
 
         if self.data_queue is not None:
             self.data_queue.close()
-            self.data_queue.join_thread()
             self.data_queue = None
 
         if self.rank == 0 and self.remote_server_process is not None:
@@ -258,7 +259,7 @@ class BaseDataLoader:
             except Exception as e:
                 print(f"[close] remote_server_process stop failed: {e}")
             self.remote_server_process = None
-
+        logger.info(f"rank {self.rank} closed dataloader successful!")
         self.is_launched = False
 
     def check_all_workers_done(self) -> bool:
