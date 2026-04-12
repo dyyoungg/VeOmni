@@ -17,6 +17,7 @@ data:
   mm_configs:
     image_max_pixels: 602112   # 768*28*28
   sample_fps: 4
+  finetune_sample_frames: 64
   preprocess_workers: 2
 
 train:
@@ -72,7 +73,7 @@ train:
       reshard_after_forward: true
       reshard_after_backward: true
       offload: false
-      forward_prefetch: false
+      forward_prefetch: true
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.8
@@ -92,7 +93,7 @@ train:
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_14B_down4_ulysess
+    name: llavaomni_14B_down4_ulysess_fixlabel
   # dataloader
   dataloader_num_workers: 2
   dataloader_prefetch_factor: 2

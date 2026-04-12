@@ -17,6 +17,7 @@ data:
   mm_configs:
     image_max_pixels: 602112   # 768*28*28
   sample_fps: 4
+  finetune_sample_frames: 64
   preprocess_workers: 2
 
 train:
@@ -28,7 +29,7 @@ train:
   world_size: 8
 
   # 模型参数
-  model_max_length: 4096
+  model_max_length: 8192
   pack_seq: true
   init_device: meta
 
@@ -92,7 +93,7 @@ train:
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_14B_down4_test
+    name: llavaomni_14B_down4_4gpu
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2

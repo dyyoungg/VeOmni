@@ -13,6 +13,7 @@ data:
   mm_configs:
     image_max_pixels: 602112   # 768*28*28
   sample_fps: 4
+  finetune_sample_frames: 64
   preprocess_workers: 2
 
 train:
