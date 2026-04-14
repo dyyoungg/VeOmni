@@ -3,7 +3,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from veomni.models.custom.llava_qwen3moe.modeling_whisper import WhisperEncoder, WhisperConfig
+from veomni.models.custom.audio_encoder.modeling_whisper import WhisperEncoder, WhisperConfig
 from veomni.models.custom.llava_qwen3moe.base import BaseEncoderModelMixin, BaseEncoderConfigMixin
 from veomni.models.custom.llava_qwen3moe.projector import build_audio_projector
 from transformers import AutoConfig
