@@ -12,7 +12,8 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers.utils import can_return_tuple
 
 from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen3MoeOmniConfig
-from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModel
+from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModel
+from veomni.models.custom.vision_encoder.modeling_qwen35_vision_encoder import BeeBeeVLQwen35MoeVisionModel
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeVLAudioModel
 from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
     Qwen3MoeForCausalLM,
@@ -107,7 +108,12 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         
         if encoder_cfg is not None:
             if getattr(encoder_cfg, "image_config", None) is not None:
-                self.image_encoder = BeeBeeVLVisionModel._from_config(config=encoder_cfg.image_config, 
+                if "qwen35moe" in encoder_cfg.image_config.model_type:
+                    self.image_encoder = BeeBeeVLQwen35MoeVisionModel._from_config(config=encoder_cfg.image_config, 
+                                                           attn_implementation=encoder_cfg.image_config._attn_implementation, 
+                                                           dtype=torch_dtype)
+                else:
+                    self.image_encoder = BeeBeeVLVisionModel._from_config(config=encoder_cfg.image_config, 
                                                            attn_implementation=encoder_cfg.image_config._attn_implementation, 
                                                            dtype=torch_dtype)
 
@@ -417,7 +423,7 @@ if __name__ == "__main__":
         return int(actual_audio_feature_len)
 
     # Minimal demo: build from config and print model structure
-    from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModelConfig
+    from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModelConfig
     from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
     from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen3MoeOmniConfig
 

@@ -21,14 +21,6 @@ from torch.utils.data import IterableDataset, get_worker_info, DataLoader
 import torch.distributed as dist
 
 from veomni.utils.constants import (
-    IGNORE_INDEX,
-    AUDIO_TOKEN_INDEX,
-    IMAGE_TOKEN_INDEX,
-    VIDEO_TOKEN_INDEX,
-    SYSTEM_PROMPTS,
-    DEFAULT_VISION_START_TOKEN,
-    DEFAULT_VISION_END_TOKEN,
-    IMAGE_PACTH_SIZE,
     get_image_video_audio_placeholder,
     _CHAT_TEMPLATES,
 

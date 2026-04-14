@@ -29,19 +29,10 @@ except ImportError:
 from veomni.data.base_dataloader import BaseDataLoader
 from veomni.utils.constants import (
     IGNORE_INDEX,
-    IMAGE_TOKEN_INDEX,
-    IMAGE_PACTH_SIZE,
     AUDIO_TOKEN_INDEX,
-    VIDEO_TOKEN_INDEX,
     DEFAULT_AUDIO_TOKEN,
-    IMAGE_FACTOR,
-    MIN_PIXELS,
-    MAX_PIXELS,
-    SYSTEM_PROMPTS,
     DEFAULT_AUDIO_START_TOKEN,
     DEFAULT_AUDIO_END_TOKEN,
-    DEFAULT_VISION_START_TOKEN,
-    DEFAULT_VISION_END_TOKEN,
     _CHAT_TEMPLATES
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
@@ -123,7 +114,6 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
         labels, batch_first=True, padding_value=IGNORE_INDEX # 请确保 IGNORE_INDEX 在外部已定义
     )[:, :tokenizer.model_max_length]
 
-    # 2. 初始化多模态数据和 Mask 收集器
     multimodal_keys = [
         "pixel_values", "image_grid_thw", 
         "pixel_values_video", "video_grid_thw", 

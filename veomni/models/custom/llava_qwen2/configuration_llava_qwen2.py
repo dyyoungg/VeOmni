@@ -86,7 +86,7 @@ AutoConfig.register("llavaqwen2_omni", LlavaQwen2Config)
 
 if __name__ == "__main__":
     # Example: compose the omni config from your encoders and Qwen3Moe foundation.
-    from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModelConfig
+    from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModelConfig
     from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
     from transformers import Qwen2Config
 

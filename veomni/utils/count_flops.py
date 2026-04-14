@@ -447,7 +447,10 @@ class VeomniFlopsCounter:
         if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             image_config = getattr(self.config.encoder_config, "image_config", None)
             if image_config is not None:
-                vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+                if "qwen35moe" in image_config.model_type:
+                    vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, image_config)
+                else:
+                    vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
             else:
                 vit_flops = 0
         else:
@@ -521,7 +524,10 @@ class VeomniFlopsCounter:
         if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             image_config = getattr(self.config.encoder_config, "image_config", None)
             if image_config is not None:
-                vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+                if "qwen35moe" in image_config.model_type:
+                    vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, image_config)
+                else:
+                    vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
             else:
                 vit_flops = 0
         else:

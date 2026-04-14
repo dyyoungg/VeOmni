@@ -30,7 +30,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from transformers import StoppingCriteria
-from veomni.utils.constants import IMAGE_TOKEN_INDEX, AUDIO_TOKEN_INDEX, IMAGE_FACTOR, MIN_PIXELS, MAX_PIXELS, MAX_RATIO, IMAGE_MEAN, IMAGE_MIN_SIDE
+from veomni.utils.constants import (
+    IMAGE_TOKEN_INDEX, 
+    AUDIO_TOKEN_INDEX, 
+    IMAGE_FACTOR, 
+    MIN_PIXELS_SEQ, 
+    MAX_PIXELS_SEQ, 
+    MAX_RATIO, 
+    IMAGE_MEAN, 
+    IMAGE_MIN_SIDE
+    )
 from concurrent.futures import ThreadPoolExecutor
 from transformers import Qwen2_5_VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessorKwargs
@@ -62,8 +71,8 @@ def smart_resize(
     height: int, 
     width: int, 
     factor: int = IMAGE_FACTOR, 
-    min_pixels: int = MIN_PIXELS, 
-    max_pixels: int = MAX_PIXELS,
+    min_pixels: int = MIN_PIXELS_SEQ * IMAGE_FACTOR**2, 
+    max_pixels: int = MAX_PIXELS_SEQ * IMAGE_FACTOR**2,
     min_side: int = IMAGE_MIN_SIDE
 ) -> tuple[int, int]:
     """
@@ -346,7 +355,7 @@ def pad_image(image, h, w):
     padded_image = padded_image.resize((w, h), Resampling.BILINEAR)
     return padded_image
 
-def _process_one_image(image_input, min_side, size_factor, force_fixed_size=None):
+def _process_one_image(image_input, min_side, size_factor, mm_downsample_ratio, force_fixed_size=None):
     """
     Args:
         force_fixed_size: Optional[Tuple[int, int]], e.g., (336, 336). 
@@ -391,13 +400,13 @@ def _process_one_image(image_input, min_side, size_factor, force_fixed_size=None
             resized_width, resized_height = target_w, target_h
             
         else:
-         
+            
             resized_height, resized_width = smart_resize(
                 height,
                 width,
-                factor=size_factor * 4,  
-                min_pixels=MIN_PIXELS, 
-                max_pixels=MAX_PIXELS,
+                factor=size_factor * math.ceil(math.sqrt(mm_downsample_ratio)),  
+                min_pixels=MIN_PIXELS_SEQ * size_factor**2, 
+                max_pixels=MAX_PIXELS_SEQ * size_factor**2,
                 min_side=min_side,
             )
             image = image.resize((resized_width, resized_height), resample=Image.BICUBIC)
@@ -407,7 +416,8 @@ def _process_one_image(image_input, min_side, size_factor, force_fixed_size=None
         print(f"[Error processing image] {e}")
         return None
 
-def qwen25vl_image_preprocess(images: Union[List[Image.Image],Image.Image], 
+def qwen25vl_image_preprocess(images: Union[List[Image.Image],Image.Image],
+                              mm_downsample_ratio: int, 
                               min_side:int=IMAGE_MIN_SIDE, 
                               size_factor: int = IMAGE_FACTOR,
                               force_fixed_size: Optional[Tuple[int, int]] = None, # 新增参数
@@ -417,22 +427,21 @@ def qwen25vl_image_preprocess(images: Union[List[Image.Image],Image.Image],
     if isinstance(images, Image.Image):
         images = [images]
     if len(images) == 1:
-        res = _process_one_image(images[0], min_side, size_factor, force_fixed_size)
+        res = _process_one_image(images[0], min_side, size_factor, mm_downsample_ratio,  force_fixed_size)
         return [res] if res else []
     
     if executor is not None:
-        futures = [executor.submit(_process_one_image, img, min_side, size_factor, force_fixed_size) 
+        futures = [executor.submit(_process_one_image, img, min_side, size_factor, mm_downsample_ratio, force_fixed_size) 
            for img in images]
         results = [f.result() for f in futures]  # 先全部取出
         processed_images = [r for r in results if r is not None]  # 再过滤
     else:
         with ThreadPoolExecutor(max_workers=4) as temp_executor:
-            futures = [temp_executor.submit(_process_one_image, img, min_side, size_factor, force_fixed_size) 
+            futures = [temp_executor.submit(_process_one_image, img, min_side, size_factor, mm_downsample_ratio, force_fixed_size) 
                 for img in images]
             results = [f.result() for f in futures]
             processed_images = [r for r in results if r is not None]
 
-    
     
     return processed_images
 

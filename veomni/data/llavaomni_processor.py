@@ -22,6 +22,7 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 from whisper.audio import pad_or_trim, log_mel_spectrogram
 from snowflake import SnowflakeGenerator
+from transformers import AutoConfig
 
 from veomni.utils.constants import (
     IGNORE_INDEX,
@@ -30,9 +31,8 @@ from veomni.utils.constants import (
     AUDIO_TOKEN_INDEX,
     VIDEO_TOKEN_INDEX,
     DEFAULT_AUDIO_TOKEN,
-    IMAGE_FACTOR,
-    MIN_PIXELS,
-    MAX_PIXELS,
+    MIN_PIXELS_SEQ,
+    MAX_PIXELS_SEQ,
     SYSTEM_PROMPTS,
     DEFAULT_AUDIO_START_TOKEN,
     DEFAULT_AUDIO_END_TOKEN,
@@ -140,6 +140,8 @@ class OmniSampleProcessor:
         self._threadpool: Optional[ThreadPoolExecutor] = None
         self.image_merge_size = 2
         self.video_merge_size = 2
+        self.image_patch_size = IMAGE_PACTH_SIZE
+        self.image_factor = IMAGE_PACTH_SIZE * 2
         self._rng = random.Random()
  
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
@@ -151,20 +153,18 @@ class OmniSampleProcessor:
 
     def init_image_processor(self) -> None:
         """在 worker 进程启动后调用一次，加载 image_processor 并建线程池。"""
-        for location in (
-            self.model_args.model_path,
-            self.model_args.vision_tower,
-        ):
-            try:
-                self.image_processor = Qwen25VLProcessor.from_pretrained(location)
-                break
-            except Exception:
-                # print(traceback.print_exc())
-                pass
-        else:
-            raise RuntimeError("Failed to load image processor.")
- 
+       
+        try:
+            self.image_processor = Qwen25VLProcessor.from_pretrained(self.model_args.vision_tower)
+            self.image_config = AutoConfig.from_pretrained(self.model_args.vision_tower)
+        except Exception as e:
+            # print(traceback.print_exc())
+            raise ValueError(f"error loading processor: {e}")
+        self.image_patch_size = getattr(self.image_config, "patch_size")
+        self.image_factor = self.image_patch_size * 2
+        print("image patch size:", self.image_patch_size)
         self._threadpool = ThreadPoolExecutor(max_workers=self.preprocess_workers)
+        
  
     # ------------------------------------------------------------------
     # I/O：视频
@@ -329,10 +329,13 @@ class OmniSampleProcessor:
         fix_size = (
             self.model_args.mm_image_size if self.training_args.fix_image_size else None
         )
+        min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
         return qwen25vl_image_preprocess(
             image,
-            size_factor=IMAGE_PACTH_SIZE * image_merge_size,
+            mm_downsample_ratio=getattr(self.model_args, "mm_downsample_ratio", 4),
+            size_factor=self.image_factor,
             executor=self._threadpool,
+            min_side=min_side,
             force_fixed_size=fix_size,
         )
 
@@ -379,20 +382,22 @@ class OmniSampleProcessor:
         if self.training_args.fix_image_size:
             rw, rh = self.model_args.mm_image_size
         else:
+            min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
             rh, rw = smart_resize(
                 height=height,
                 width=width,
-                factor=IMAGE_PACTH_SIZE * merge_size,
-                min_pixels=MIN_PIXELS,
-                max_pixels=MAX_PIXELS,
+                factor=self.image_patch_size * merge_size,
+                min_pixels=MIN_PIXELS_SEQ * self.image_factor **2,
+                max_pixels=MAX_PIXELS_SEQ * self.image_factor **2,
+                min_side=min_side
             )
         resolution = (rw, rh)
         proj = self.model_args.image_projector_type
 
         if "avgpool" in proj or "dual_conv" in proj:
             scale = self.model_args.mm_downsample_ratio
-            M = resolution[0] / IMAGE_PACTH_SIZE / merge_size
-            N = resolution[1] / IMAGE_PACTH_SIZE / merge_size
+            M = resolution[0] / self.image_patch_size / merge_size
+            N = resolution[1] / self.image_patch_size / merge_size
             m, n = get_adaptive_pool_size(M, N, float(scale))
             if isinstance(self.image_processor, Qwen25VLProcessor):
                 each = math.ceil(m * n / 2) + 2
@@ -400,52 +405,13 @@ class OmniSampleProcessor:
                 raise NotImplementedError
         elif "mlp" in proj:
             if isinstance(self.image_processor, Qwen25VLProcessor):
-                each = int(math.prod(resolution) / (IMAGE_FACTOR ** 2) / 2) + 2
+                each = int(math.prod(resolution) / (self.image_factor ** 2) / 2) + 2
             else:
                 raise NotImplementedError
         else:
             raise NotImplementedError(f"Unknown projector type: {proj!r}")
 
         return each, resolution
-    
-    def get_video_frames(
-        self,
-        video_file,
-        max_image_tokens: int,
-        start_time: Optional[float] = None,
-        end_time: Optional[float] = None,
-        method: str = "decord",
-        format: str = "",
-        merge_size: Optional[int] = None,
-    ) -> Tuple[List, int, int, Tuple[int, int]]:
-        if merge_size is None:
-            merge_size = self.video_merge_size
- 
-        if self.training_args.dataloader_debug:
-            fake = [Image.new("RGB", (644, 364), (200, 200, 200))] * 30
-            processed = []
-            for img in fake:
-                processed.extend(self.preprocess_image(img, image_merge_size=merge_size))
-            return processed, 20, 560, (644, 364)
- 
-        results = self._extract_imagelist_from_videobytes(
-            video_file, max_image_tokens, start_time, end_time,
-            method=method, format=format, merge_size=merge_size,
-        )
-        if results is None:
-            return [], 0, 0, (0, 0)
- 
-        raw_imgs, frame_count, each_token, resolution = results
-        processed = []
-        for img in raw_imgs:
-            processed.extend(self.preprocess_image(img, image_merge_size=merge_size))
-            img.close()
-
-        del raw_imgs
- 
-        if len(processed) % 2 == 1 and processed:
-            processed.pop()
-        return processed, frame_count, len(processed) * each_token, resolution
     
     @staticmethod
     def _count_gif_frames(gif: Image.Image) -> int:
@@ -643,10 +609,8 @@ class OmniSampleProcessor:
             self._cleanup_shm(video_file)
             return None
         
-        h, w = smart_resize(height=resolution[1], width=resolution[0], factor=IMAGE_FACTOR * 4)
-
         each_token, resized_res = self.calculate_video_each_frame_token(
-            height=h, width=w, merge_size=merge_size
+            height=resolution[1], width=resolution[0], merge_size=merge_size
         )
         max_frames = int(max_image_tokens / each_token)
         desired = (

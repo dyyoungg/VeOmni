@@ -10,7 +10,8 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen3MoeOmniConfig
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
 from veomni.models.custom.llava_qwen3moe.modeling_llava_qwen3moe_omni import LlavaQwen3MoeForCausalLM
-from veomni.models.custom.llava_qwen3moe.modeling_vision_encoder import BeeBeeVLVisionModelConfig
+from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModelConfig
+from veomni.models.custom.vision_encoder.modeling_qwen35_vision_encoder import BeeBeeVLQwen35MoeVisionModelConfig
 from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -70,17 +71,28 @@ def _compose_vision_config(
         if vision_dict.get("intermediate_size", None) is None and getattr(base_vision_cfg, "text_config", None) is not None:
             vision_dict["intermediate_size"] = getattr(base_vision_cfg.text_config, "intermediate_size", None)
 
-    vision_dict.pop("model_type", None)
+    vision_type = vision_dict.pop("model_type", None)
 
-    vision_cfg = BeeBeeVLVisionModelConfig(
-        **vision_dict,
-        output_size=output_size,
-        image_downsample_size=image_downsample_size,
-        image_projector_type=image_projector_type,
-        return_hidden_states=False,
-        train_vision_projector=train_vision_projector,
-        freeze_vision_merger=freeze_vision_merger,
-    )
+    if vision_type  == "qwen2_5_vl":
+        vision_cfg = BeeBeeVLVisionModelConfig(
+            **vision_dict,
+            output_size=output_size,
+            image_downsample_size=image_downsample_size,
+            image_projector_type=image_projector_type,
+            return_hidden_states=False,
+            train_vision_projector=train_vision_projector,
+            freeze_vision_merger=freeze_vision_merger,
+        )
+    elif vision_type == "qwen3_5_moe":
+        vision_cfg = BeeBeeVLQwen35MoeVisionModelConfig(
+            **vision_dict,
+            output_size=output_size,
+            image_downsample_size=image_downsample_size,
+            image_projector_type=image_projector_type,
+            return_hidden_states=False,
+            train_vision_projector=train_vision_projector,
+            freeze_vision_merger=freeze_vision_merger,
+        )
 
     print(
         f"BeeBeeVLVisionModelConfig hidden_size={vision_cfg.hidden_size} "
@@ -259,11 +271,10 @@ def build_qwen3moe_omni_from_components(
     return model
 
 
-def merge_component_models():
+def merge_component_models(vision_model_path, save_directory):
     from transformers import AutoTokenizer, AutoProcessor
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
     language_model_path = "/mnt/afs/share/Qwen3-30B-A3B-Instruct-2507-veomni-merge"
-    vision_model_path = "/mnt/afs/share/qwen25_vl_encoder"
     whisper_audio_encoder_path = "/mnt/afs/share/Kimi-Audio-7B-Instruct/whisper-large-v3"
 
     processor = AutoProcessor.from_pretrained(vision_model_path)
@@ -314,16 +325,15 @@ def merge_component_models():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"total_params={total_params} trainable_params={trainable_params}")
     
-    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-veomni-down4"
+    # save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down4"
     print(f"正在将组装好的模型保存至: {save_directory} ...")
    
     processor.save_pretrained(save_directory)
     
-    # save_pretrained 会自动保存模型权重和配置 config.json
     model.save_pretrained(
         save_directory, 
-        safe_serialization=True, # 推荐使用 safetensors 格式，加载更快且更安全
-        max_shard_size="8GB"     # 因为 30B 模型很大，建议分块保存
+        safe_serialization=True, 
+        max_shard_size="8GB"     
     )
     tokenizer.save_pretrained(save_directory)
     print("模型保存完成！")
@@ -331,7 +341,10 @@ def merge_component_models():
 
 
 if __name__ == "__main__":
-    merge_component_models()
+    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
+    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen35encoder-veomni-down4"
+    merge_component_models(vision_path, save_directory)
+   
 
     # from veomni.models.custom.llava_qwen3moe.modeling_llava_qwen3moe_omni import LlavaQwen3MoeForCausalLM
 
@@ -344,5 +357,3 @@ if __name__ == "__main__":
     #         init_device="cuda",
     #         torch_dtype= "bfloat16",
     #         moe_implementation="fused",)
-
-    
