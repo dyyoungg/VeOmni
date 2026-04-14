@@ -25,7 +25,7 @@ from veomni.utils.constants import (
     _CHAT_TEMPLATES,
 
 )
-from veomni.data.multimodal.image_utils import qwen25vl_image_preprocess, get_adaptive_pool_size
+from veomni.data.multimodal.image_utils import get_adaptive_pool_size
 from veomni.data.data_collator import UlysessOmniDataSharderCollator
 from veomni.data.llavaomni_processor import OmniSampleProcessor, LongVideoProcessor
 from veomni.distributed.sequence_parallel import get_data_parallel_rank, get_data_parallel_world_size, get_ulysses_sequence_parallel_cpu_group
@@ -164,7 +164,7 @@ class UlyssesStreamingDataset(IterableDataset):
  
         self.dp_rank, self.dp_world_size = self._detect_distribution_mode()
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-        # ── Load data manifest ────────────────────────────────────────────────
+      
         self.data_list: List[Dict] = self._load_data_list(data_args.train_path)
        
         try:
@@ -1066,9 +1066,7 @@ def test_ulysess():
         id_consist = check_sp_consistency(input_ids, sp_group, "Input IDs",  step=i)
    
         msg = f"RANK: {rank} DP_Rank {dp_rank} | Shape: {input_ids.shape} | Consumed: {train_loader.samples_consumed}"
-        # ordered_print(msg, rank, world_size, local_rank)
         print(msg)
-        # time.sleep(3)
         del input_ids
 
 

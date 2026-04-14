@@ -72,12 +72,10 @@ from veomni.utils.model_utils import pretty_print_trainable_parameters
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.comm import get_data_parallel_world_size
 from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
-from veomni.utils.constants import get_image_video_audio_placeholder, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN
+from veomni.utils.constants import get_image_video_audio_placeholder
 
 
 logger = helper.create_logger(__name__)
-MAX_PIXELS = 768 * 28 * 28
-
 
 @dataclass
 class VLMTrainingArguments(TrainingArguments):
@@ -417,11 +415,7 @@ class VLMTrainer:
         self.train_steps = self.init_data_size * args.train.num_train_epochs
         print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
         parallel_state = get_parallel_state()
-        # 检查 fsdp_mesh 的 world size
-        fsdp_mesh_size = parallel_state.fsdp_mesh.size()  # 或 .numel()
-        sp_size = parallel_state.sp_size
-        dp_size = parallel_state.dp_size
-    
+        
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
             train_steps=self.init_data_size * args.train.num_train_epochs,

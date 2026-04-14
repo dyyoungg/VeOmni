@@ -554,8 +554,6 @@ class UlysessOmniDataSharderCollator:
  
         self.padding_features["input_ids"] = self.pad_token_id
  
-    # ── SP helpers ────────────────────────────────────────────────────────────
- 
     def _padded_length(self, original: int, dim_key: str) -> int:
         """Return the SP-aligned length for a given feature key."""
         if self.sp_size <= 1:
@@ -599,8 +597,6 @@ class UlysessOmniDataSharderCollator:
         start      = self.sp_rank * chunk_size
         return tensor.narrow(dim, start, chunk_size).contiguous()
  
-    # ── Main collation ────────────────────────────────────────────────────────
- 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         assert len(features) == 1, (
             f"UlysessOmniDataSharderCollator only supports batch_size=1 "
@@ -618,7 +614,6 @@ class UlysessOmniDataSharderCollator:
                 return torch.tensor(val, dtype=dtype)
             raise ValueError(f"Unsupported type: {type(val)}")
  
-        # ── 1. Text tokens ────────────────────────────────────────────────────
         if "input_ids" in raw:
             batch["input_ids"] = _to_tensor(raw["input_ids"], torch.long).unsqueeze(0)   # [1, T]
  
@@ -628,11 +623,10 @@ class UlysessOmniDataSharderCollator:
         if "attention_mask" in raw:
             batch["attention_mask"] = _to_tensor(raw["attention_mask"]).unsqueeze(0)     # [1, T]
  
-        # ── 2. Per-sample lengths ─────────────────────────────────────────────
         if "sample_lens" in raw:
             batch["seq_lens"] = _to_tensor(raw["sample_lens"], torch.int32)              # [N]
  
-        # ── 3. Label shift + inter-sample boundary masking ────────────────────
+        # ──Label shift + inter-sample boundary masking 
       
         if "labels" in batch and "seq_lens" in batch:
             labels = batch["labels"]                    # [1, T]
@@ -642,26 +636,14 @@ class UlysessOmniDataSharderCollator:
  
             # mask the last token of every sample except the final one
             # (the final sample's last position is already IGNORE from the shift pad)
-            # cu         = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
-            # boundaries = cu[1:-1]                       # inter-sample boundaries, [N-1]
-            # if boundaries.numel() > 0:
-            #     labels[0, boundaries - 1] = self.ignore_index
+            cu         = F.pad(batch["seq_lens"].cumsum(0), (1, 0), value=0)
+            boundaries = cu[1:-1]                       # inter-sample boundaries, [N-1]
+            if boundaries.numel() > 0:
+                labels[0, boundaries - 1] = self.ignore_index
  
             batch["labels"] = labels
  
-        # ── 4. Flash-attention metadata (BEFORE SP padding/slice) ─────────────
-        #
-        # The flash-attn varlen kernel requires:
-        #     cu_seqlens[-1] == length of the tensor actually passed in
-        #
-        # After SP padding the tensor length becomes T_padded, so cu_seqlens
-        # must reflect that.  We append a dummy segment [T_original, T_padded]
-        # rather than stretching the last real segment, so padding tokens are
-        # causally isolated.  Their labels are IGNORE_INDEX → no loss contribution.
-        #
-        # All SP ranks derive T_padded from the same deterministic formula, so
-        # cu_seqlens is identical across the SP group (required for correctness).
-        #
+
         if "seq_lens" in batch:
             seq_lens   = batch["seq_lens"]                              # [N], int32
             T_original = int(seq_lens.sum().item())
@@ -681,7 +663,6 @@ class UlysessOmniDataSharderCollator:
             batch["max_length_q"]  = max_seqlen     # plain int, not tensor
             batch["max_length_k"]  = max_seqlen
  
-        # ── 5. Vision modalities ──────────────────────────────────────────────
         merged_pv: List[torch.Tensor] = []
         for key in ("pixel_values", "pixel_values_video"):
             if key in raw and raw[key] is not None:
@@ -700,11 +681,7 @@ class UlysessOmniDataSharderCollator:
             if key in raw and raw[key] is not None:
                 batch[key] = _to_tensor(raw[key])
  
-        # ── 7. SP padding → SP slice ──────────────────────────────────────────
-        #
-        # Excluded from SP treatment (must be identical on every rank):
-        #   cu_seq_lens_q/k, max_length_q/k, seq_lens, image_grid_thw, audio_*
-        #
+        # SP padding → SP slice 
         for key, dim in self.sp_slice_features.items():
             if key not in batch:
                 continue

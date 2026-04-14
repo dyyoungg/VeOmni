@@ -7,7 +7,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Iterator
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -38,6 +38,7 @@ from veomni.utils.constants import (
     DEFAULT_AUDIO_END_TOKEN,
     DEFAULT_VISION_START_TOKEN,
     DEFAULT_VISION_END_TOKEN,
+    _CHAT_TEMPLATES
 )
 from veomni.data.multimodal.image_utils import (
     qwen25vl_image_preprocess,
@@ -75,37 +76,10 @@ class OmniSample:
         default_factory=lambda: {"image": 0, "video": 0, "audio": 0}
     )
 
-_CHAT_TEMPLATES = {
-    "qwen2": dict(
-        system="<|im_start|>system\n{}<|im_end|>",
-        system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
-        user="\n<|im_start|>user\n{}<|im_end|>",
-        assistant="\n<|im_start|>assistant\n{}<|im_end|>",
-        assistant_prefix="\n<|im_start|>assistant\n",
-        query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-    ),
-}
-
-_CHAT_TEMPLATES["qwen3"] = _CHAT_TEMPLATES["qwen2"]
-
-
 class OmniSampleProcessor:
     """
     单条样本处理器。每个 worker 进程各自持有一个独立实例。 
-    Parameters
-    ----------
-    tokenizer             : HuggingFace tokenizer（调用方负责 add_bos_token=False）
-    model_args            : model_arc / image_projector_type / mm_downsample_ratio 等
-    data_args             : audio_max_duration / audio_frame_length / sample_fps 等
-    training_args         : fix_image_size / jpeg_image_augmentation / image_decode_method 等
-    ceph_client           : aoss/petrel Client 实例
-    bos_client            : BosClient 实例（可为 None）
-    rank                  : 当前进程 rank，用于 SnowflakeGenerator 保证视频临时文件唯一性
-    7_fn : BaseDataLoader.build_inputs_token 的绑定方法
-                            （格式化逻辑依赖基类，保留注入方式）
-    preprocess_workers    : 图像预处理线程数，默认 4
     """
- 
     def __init__(
         self,
         tokenizer,
@@ -1287,7 +1261,7 @@ class LongVideoProcessor(OmniSampleProcessor):
         
         
     
-    def process(self, sample_data: Dict, sample_idx: int) -> Optional[OmniSample]:
+    def process(self, sample_data: Dict, sample_idx: int) -> Iterator[OmniSample]:
 
         yield sample_data
 

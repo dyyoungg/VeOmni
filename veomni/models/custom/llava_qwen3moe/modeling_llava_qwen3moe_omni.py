@@ -452,10 +452,6 @@ if __name__ == "__main__":
         output_size=5120,
     )
 
-    # print(audio_cfg)
-    # Foundation LLM config
-    # NOTE: use a tiny config for fast local sanity-check.
-    # The full 30B config init is very slow because it creates all expert weights.
     from transformers import Qwen3MoeConfig
 
     foundation_cfg = Qwen3MoeConfig(
@@ -523,7 +519,6 @@ if __name__ == "__main__":
     foundation_cfg.audio_token_id = audio_token_id
     foundation_cfg.video_token_id = video_token_id
     
-    # 构造序列: [BOS] + [IMAGE_TOKENS] + "Describe" + [AUDIO_TOKENS]
     new_input_ids = [bos_token_id]
     new_input_ids.extend([image_token_id] * num_img_tokens)
     new_input_ids.extend([100, 101, 102, 2738]) # 模拟 "Describe this"
@@ -540,7 +535,6 @@ if __name__ == "__main__":
     # 5. 运行 Forward 测试
     print("\n--- Running Forward ---")
     try:
-        # 这里的 model 是你定义的 LlavaQwen3MoeForCausalLM
         outputs = model(
             input_ids=input_ids,
             labels=labels,
