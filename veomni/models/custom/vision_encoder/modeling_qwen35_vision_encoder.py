@@ -29,7 +29,7 @@ from transformers import AutoConfig
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeVisionConfig
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads, ulysses_pad_and_slice
 from veomni.models.custom.llava_qwen3moe.base import BaseEncoderConfigMixin, BaseEncoderModelMixin
 from veomni.models.custom.llava_qwen3moe.projector import build_image_projector
 from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
@@ -128,24 +128,13 @@ class Qwen3_5MoeVisionFlashAttention2(nn.Module):
             .permute(1, 0, 2, 3)
         )
 
-        # ------------------------------------------------------------------
-        # Ulysses SP: each rank starts with [3, seq_local, heads_full, head_dim].
-        # All-to-all: → [3, seq_full, heads_local, head_dim] so that flash
-        # attention can attend over the full sequence on each rank.
-        # ------------------------------------------------------------------
-        unpadded_dim_size = cu_seqlens[-1]
-        sp_padding_size = 0
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+        sp_enabled = get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training
+        if sp_enabled:
             qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
-            sp_padding_size = qkv.size(1) - unpadded_dim_size
-            if sp_padding_size > 0:
-                qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
-
+            
         q, k, v = qkv.unbind(0)  # each [seq_full, heads_local, head_dim]
 
-        # Apply rotary position embeddings
         if position_embeddings is None:
-            # Fallback: build cos/sin from raw rotary freqs (non-SP path)
             emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
             cos, sin = emb.cos(), emb.sin()
         else:
@@ -159,9 +148,7 @@ class Qwen3_5MoeVisionFlashAttention2(nn.Module):
             q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
         )
        
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            if sp_padding_size > 0:
-                attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
+        if sp_enabled:
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -251,9 +238,17 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
         """
      
         hidden_states = self.patch_embed(hidden_states)  # [seq_local, hidden]
+        sp_enabled = (
+            get_parallel_state() is not None
+            and get_parallel_state().sp_enabled
+            and self.training
+        )
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        # Rotary position embedding: [seq_full, head_dim // 2]
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        if sp_enabled:
+            pos_embeds = ulysses_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=self.spatial_merge_size ** 2)
+       
+        hidden_states = hidden_states + pos_embeds
+      
 
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -263,39 +258,23 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        unpadded_dim_size = cu_seqlens[-1]  # = total tokens across all images
 
-        sp_enabled = (
-            get_parallel_state() is not None
-            and get_parallel_state().sp_enabled
-            and self.training
-        )
-
-        # ------------------------------------------------------------------ #
-        # 4. Add learned positional embeddings                                #
-        #                                                                     #
-        #    In SP mode, hidden_states is the local shard                     #
-        #    [seq_local_padded, hidden] where the full sequence has been      #
-        #    split contiguously across ranks:                                 #
-        #        rank r owns tokens [r*seq_local : (r+1)*seq_local]           #
-        #    We slice pos_embeds accordingly and only update valid (non-pad)  #
-        #    positions.                                                        #
-        # ------------------------------------------------------------------ #
-        if sp_enabled:
-            ulysses_rank = get_parallel_state().ulysses_rank
-            local_seq_len = hidden_states.size(0)   # = ceil(seq_full / sp_size), padded
-            start_idx = ulysses_rank * local_seq_len
-            valid_len = max(0, min(local_seq_len, int(unpadded_dim_size) - start_idx))
-            if valid_len > 0:
-                hidden_states[:valid_len] = (
-                    hidden_states[:valid_len] + pos_embeds[start_idx : start_idx + valid_len]
-                )
-        else:
-            hidden_states = hidden_states + pos_embeds
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        unpadded_seq_len = int(cu_seqlens[-1])
+        pad_seq_len = 0
+        seq_len = hidden_states.size(0)
+        rotary_pos_emb = rotary_pos_emb.reshape(unpadded_seq_len, -1)
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        if sp_enabled:
+            sp_size = get_parallel_state().ulysses_size
+            pad_seq_len = seq_len * sp_size - unpadded_seq_len
+            if pad_seq_len > 0:
+                emb = pad_tensor(emb, dim=0, padding_size=pad_seq_len)
+                new_cumsum = cu_seqlens[-1] + pad_seq_len
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
+        position_embeddings = (emb.cos(), emb.sin())
 
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
@@ -317,7 +296,7 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
        
             sp_padding_size = (
                 hidden_states.size(0) * get_parallel_state().ulysses_size
-                - int(unpadded_dim_size) // merge_unit
+                - unpadded_seq_len // merge_unit
             )
             hidden_states = gather_seq_scatter_heads(
                 hidden_states,

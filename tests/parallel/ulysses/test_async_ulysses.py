@@ -1,10 +1,6 @@
 import sys
-
-import torch
-import torch.distributed as c10d
-
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
+import torch.distributed as c10d
 
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     print("c10d NCCL not available, skipping tests", file=sys.stderr)
@@ -13,6 +9,8 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
+import torch
+
 
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
@@ -22,6 +20,7 @@ from veomni.distributed.sequence_parallel.data import gather_outputs, slice_inpu
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 from veomni.utils.import_utils import is_torch_npu_available
+
 
 from .attention import Attention
 from .utils import (
@@ -172,6 +171,6 @@ if __name__ == "__main__":
         "test_distributed must not have initialized CUDA context on main process"
     )
 
-    set_seed(seed=0, full_determinism=True)
+    set_seed(seed=0, full_determinism=False)
     enable_high_precision_for_bf16()
     run_tests()

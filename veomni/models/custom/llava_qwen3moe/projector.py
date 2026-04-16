@@ -47,7 +47,8 @@ class AudioConvUpScaleProjector(nn.Module):
             x = torch.cat([x, pad_tensor], dim=1)  # 在时间维度 padding
         new_seq_len = target_seq_len // self.linear_compress_ratio
         x = x.reshape(bs, new_seq_len, audio_hidden_size * self.linear_compress_ratio)
-        if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+        sp_enabled = self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled
+        if sp_enabled:
             sp_world_size = get_parallel_state().sp_size
             remainder = x.shape[1] % sp_world_size
             if remainder > 0:
@@ -59,7 +60,7 @@ class AudioConvUpScaleProjector(nn.Module):
         x = self.gelu(x)
         x = self.linear2(x)
 
-        if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
+        if sp_enabled:
             x  = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             if remainder > 0:
                 x = unpad_tensor(x, dim=1, padding_size=pad_len)
@@ -130,7 +131,8 @@ class DynamicAvgPoolProjector(nn.Module):
             seq_len.extend(tokens)
         
         hidden_states = torch.cat(outputs, dim=0)  # [m, hidden_size//sp]
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+        sp_enabled = get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training
+        if sp_enabled:
             sp_group = get_parallel_state().ulysses_group
             sp_world_size = get_parallel_state().ulysses_size
             remainder = hidden_states.shape[0] % sp_world_size
@@ -145,7 +147,7 @@ class DynamicAvgPoolProjector(nn.Module):
             # hidden_states = _Gather.apply(sp_group, hidden_states, 0, False)
 
         hidden_states = self.mlp(hidden_states)  # [m, out_hidden]
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+        if sp_enabled:
 
             hidden_states = gather_seq_scatter_heads(hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group)
             # hidden_states = _Slice.apply(get_parallel_state().ulysses_group, hidden_states, 1, True)

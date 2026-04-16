@@ -213,7 +213,7 @@ def flash_attention_forward(
         )
 
     # This is before the transpose
-    seq_len = query.shape[2]
+    seq_len = query.shape[2] # [bs, head, seq, hidden]
 
     if any(dim == 0 for dim in query.shape):
         raise ValueError(

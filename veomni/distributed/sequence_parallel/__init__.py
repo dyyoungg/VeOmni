@@ -45,6 +45,7 @@ from .data import (
     slice_input_tensor,
     slice_input_tensor_scale_grad,
     sp_pad_and_slice,
+    ulysses_pad_and_slice
 )
 from .loss import reduce_sequence_parallel_loss
 from .ulysses import (

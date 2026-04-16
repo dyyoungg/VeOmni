@@ -14,7 +14,7 @@ from veomni.models.custom.llava_qwen3moe.base import BaseEncoderModelMixin, Base
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVisionConfig
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLRMSNorm, apply_rotary_pos_emb_vision, Qwen2_5_VLMLP
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads, ulysses_pad_and_slice
 from transformers import AutoConfig
 
 
@@ -85,34 +85,31 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
+        seq_length = hidden_states.shape[0] # 
         # ulysses sp patch: qkv projection
         qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
         # [3, seq, heads, hidden]
-        unpadded_dim_size = cu_seqlens[-1]
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+       
+        sp_enabled = get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training
+        if sp_enabled:
             qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
-            sp_padding_size = qkv.size(1) - unpadded_dim_size
-            if sp_padding_size > 0:
-                qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
+            
         q, k, v = qkv.unbind(0)
         # [seq, heads//sp, hidden]
-
         if position_embeddings is None:
             emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
         else:
             cos, sin = position_embeddings # cos sin :[seq, hidden]
-        # 
+        
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin) # [seq, head//sp, hidden]
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)
 
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
+        if sp_enabled:
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
         
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -165,7 +162,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-
+        
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
             # Select dtype based on the following factors:
@@ -176,11 +173,9 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         unpadded_dim_size = cu_seqlens[-1]
-        
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
-            # rank = get_parallel_state().global_rank
-            # dp_rank = get_parallel_state().dp_rank
-            # print(f"RANK:{rank}, DP rank: {dp_rank}, image shape: {hidden_states.shape[0]}")
+        sp_enabled = get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training
+        sp_padding_size = 0
+        if sp_enabled:
             hidden_states = gather_seq_scatter_heads(
                 hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
@@ -197,20 +192,28 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+      
+        if sp_enabled:
             if sp_padding_size > 0:
                 hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
+                emb = pad_tensor(emb, dim=0, padding_size=sp_padding_size)
+                new_cumsum = cu_seqlens[-1] + sp_padding_size
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+                cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+
             hidden_states = gather_heads_scatter_seq(
                 hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
             )
-            
+            # emb = ulysses_pad_and_slice(emb, dim=0)
+
+        position_embeddings = (emb.cos(), emb.sin())
+  
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
+
             if self.gradient_checkpointing and self.training:
                 hidden_states = checkpoint(
                     blk.__call__, hidden_states, cu_seqlens_now, None, position_embeddings
@@ -226,7 +229,7 @@ class Qwen25ViTPretrainedModel(Qwen2_5_VisionTransformerPretrainedModel):
         
         reverse_indices = torch.argsort(window_index)
 
-        if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
+        if sp_enabled:
             sp_padding_size = hidden_states.size(0) * get_parallel_state().ulysses_size - seq_len // 4
             hidden_states = gather_seq_scatter_heads(
                 hidden_states, seq_dim=0, head_dim=1, group=get_parallel_state().ulysses_group
