@@ -30,11 +30,10 @@ from imageio.core import Request
 
 from veomni.utils.helper import read_data
 from veomni.utils.logging import get_logger
-from veomni.utils.constants import _CHAT_TEMPLATES
+from veomni.utils.constants import _CHAT_TEMPLATES, REMOTE_SERVER_PORT
 
 
 TIMEOUT = 30
-REMOTE_SERVER_PORT = 10017
 logger = get_logger(__name__)
 
 class TimeoutException(Exception):
@@ -71,6 +70,7 @@ class BaseDataLoader:
         self.remote_data_index = torch.multiprocessing.Value("i", 0)
 
         self.data_list: List = []
+        self.file_mapping = None
         data_path = data_args.eval_path if eval_mode else data_args.train_path
         self.load_data(data_path)
         
@@ -80,32 +80,49 @@ class BaseDataLoader:
     # ------------------------------------------------------------------
 
     def load_data(self, data_path: str) -> None:
-        if not self.data_args.offline_dataset_split:
-            random.seed(233)
-            num_epochs = int(self.training_args.num_train_epochs)
-            chunk_size = None  # computed after read
-
-            raw = read_data(data_path=data_path)
-            chunk_size = len(raw) // self.world_size
-            self.data_list = []
-            for _ in range(num_epochs):
-                random.shuffle(raw)
-                self.data_list.extend(
-                    raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
-                )
+        if self.eval_mode:
+            return
+        if self.training_args.remote_dataloader:
+            assert os.path.exists(getattr(self.data_args, "offset_file_path", "")), "remote dataloader need offset file. Please check the offset file path."
+            assert os.path.exists(getattr(self.data_args, "file_maping_path", "")), "remote dataloader need filemaping file. Please check the file_maping file path."
+           
+            mapping_path = getattr(self.data_args, "file_maping_path", "")
+            offsets_path = getattr(self.data_args, "offset_file_path", "")
             
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                self.file_mapping = json.load(f)
 
-            split_label = "test" if self.eval_mode else "train"
-            if split_label == "train":
-                print(f"{self.rank}: {split_label} data size {len(self.data_list)}")
+            self.data_list = np.load(offsets_path, mmap_mode='r')
+            
         else:
-            path = os.path.join(data_path, f"train_{self.rank}.jsonl")
-            try:
-                self.data_list.extend(read_data(data_path=path))
-            except Exception as e:
-                print(f"read jsonl data error: {e}")
-            print(f"{self.rank}: training data size {len(self.data_list)}")
-        self.data_list = [json.dumps(d).encode() for d in self.data_list]
+
+            if not self.data_args.offline_dataset_split:
+                random.seed(233)
+                num_epochs = int(self.training_args.num_train_epochs)
+                chunk_size = None  # computed after read
+
+                raw = read_data(data_path=data_path)
+                chunk_size = len(raw) // self.world_size
+                self.data_list = []
+                for _ in range(num_epochs):
+                    random.shuffle(raw)
+                    self.data_list.extend(
+                        raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
+                    )
+                
+
+                split_label = "test" if self.eval_mode else "train"
+                if split_label == "train":
+                    print(f"{self.rank}: {split_label} data size {len(self.data_list)}")
+            else:
+                path = os.path.join(data_path, f"train_{self.rank}.jsonl")
+                try:
+                    self.data_list.extend(read_data(data_path=path))
+                except Exception as e:
+                    print(f"read jsonl data error: {e}")
+                print(f"{self.rank}: training data size {len(self.data_list)}")
+
+            self.data_list = [json.dumps(d).encode() for d in self.data_list]
 
 
     def __len__(self) -> int:
@@ -160,7 +177,7 @@ class BaseDataLoader:
         else:
             for d in self.data_list:
                 self.data_queue.put(d)
-
+        time.sleep(2.0)
         self.is_launched = True
 
     def start_worker(self) -> None:
@@ -183,6 +200,10 @@ class BaseDataLoader:
                 self.worker_processes.append(p)
 
     def remote_server_loop(self) -> None:
+        import logging
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)  # 只打印 Error 级别的日志，屏蔽 200 OK
+        log.disabled = True
         app = Flask(__name__)
 
         @app.route("/ask_data", methods=["POST"])

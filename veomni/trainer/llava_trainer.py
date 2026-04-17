@@ -133,7 +133,8 @@ class VLMMDataArguments(DataArguments):
     preprocess_workers: int = field(default=2)
     sample_fps: int = field(default=4)
     use_finetune_fps: bool= field(default=False)
-    offset_file: str = field(default="")
+    offset_file_path: str = field(default="")
+    file_maping_path: str = field(default="")
 
 
 @dataclass
@@ -401,24 +402,23 @@ class VLMTrainer:
     def _build_lr_scheduler(self):
         args: VeOmniArguments = self.args
         # Build lr scheduler
+        if get_parallel_state() is not None:
+            dp_world_size = get_data_parallel_world_size()
+        else:
+            dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
         if args.train.remote_dataloader:
             self.init_data_size = len(self.train_dataloader.data_list)
         else:
-            if get_parallel_state() is not None:
-                dp_world_size = get_data_parallel_world_size()
-            else:
-                dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
+            self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
        
         self.start_step = 0
         self.video_trained_num = 0  
-        self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
-        self.train_steps = self.init_data_size * args.train.num_train_epochs
+        self.train_steps = self.init_data_size
         print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
-        parallel_state = get_parallel_state()
         
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
-            train_steps=self.init_data_size * args.train.num_train_epochs,
+            train_steps=self.train_steps,
             lr=args.train.optimizer.lr,
             lr_min=args.train.optimizer.lr_min,
             lr_decay_style=args.train.optimizer.lr_decay_style,
@@ -582,23 +582,26 @@ class VLMTrainer:
         Returns True if training should stop (data exhausted on any rank).
         """
         args = self.args
- 
+
         if args.train.remote_dataloader:
-            # Remote dataloader exposes an absolute index of consumed samples
-            data_tensor_in = torch.tensor(
-                self.train_dataloader.remote_data_index.value, dtype=torch.long, device=self.device
-            )
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            self._data_tensor_out = torch.zeros(world_size, dtype=torch.long, device=self.device)
             if dist.is_initialized():
-                dist.all_gather_into_tensor(self._data_tensor_out, data_tensor_in)
+                rank = dist.get_rank()
             else:
-                self._data_tensor_out[0] = data_tensor_in
- 
-            self.video_trained_num = int(self._data_tensor_out.sum().item())
+                rank = 0
+            if rank == 0:
+                current_global_index = self.train_dataloader.remote_data_index.value
+            else:
+                current_global_index = 0
+                
+            data_tensor = torch.tensor([current_global_index], dtype=torch.long, device=self.device)
+            
+            if dist.is_initialized():
+                dist.broadcast(data_tensor, src=0)
+            
+            self.video_trained_num = int(data_tensor.item())
             self.state.video_trained_num = self.video_trained_num
             self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
-            # Stop when total consumed >= init_data_size
+            
             return self.video_trained_num >= self.init_data_size - 1
         else:
             if hasattr(self.train_dataloader, "samples_consumed"):

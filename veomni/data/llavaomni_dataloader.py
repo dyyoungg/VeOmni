@@ -33,7 +33,8 @@ from veomni.utils.constants import (
     DEFAULT_AUDIO_TOKEN,
     DEFAULT_AUDIO_START_TOKEN,
     DEFAULT_AUDIO_END_TOKEN,
-    _CHAT_TEMPLATES
+    _CHAT_TEMPLATES,
+    REMOTE_SERVER_PORT
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
 from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample
@@ -353,6 +354,21 @@ class OmniDataloader(BaseDataLoader):
         sample_index = 0
         proc = psutil.Process(os.getpid())
 
+        file_cache = {}
+        MAX_CACHE_SIZE = 100  
+
+        def get_file_line(file_path: str, offset: int) -> str:
+            if file_path not in file_cache:
+                if len(file_cache) >= MAX_CACHE_SIZE:
+                    oldest_path = next(iter(file_cache))
+                    file_cache[oldest_path].close()
+                    del file_cache[oldest_path]
+                file_cache[file_path] = open(file_path, "r", encoding="utf-8")
+            
+            f = file_cache[file_path]
+            f.seek(offset)
+            return f.readline()
+
         while os.getppid() == ppid and not self.workers_done_event.is_set():
             if self.result_queue.qsize() > 4:
                 time.sleep(1)
@@ -360,28 +376,34 @@ class OmniDataloader(BaseDataLoader):
 
             if self.training_args.remote_dataloader:
                 if http_addr is None:
-                    if os.path.exists("/etc/mpi/hostfile"):
-                        with open("/etc/mpi/hostfile") as f:
-                            master_addr = f.readlines()[0].strip().split(" ")[0]
-                    else:
+                    master_addr = os.environ.get("MASTER_ADDR")
+                    if master_addr == "127.0.0.1":
+                        # single node
                         master_addr = socket.gethostname()
-                    http_addr = f"http://{master_addr}:10017/ask_data"
+                    http_addr = f"http://{master_addr}:{REMOTE_SERVER_PORT}/ask_data"
+                   
                 try:
                     response = requests.post(http_addr, json={})
                     data_index = response.json()["index"]
                 except Exception as e:
-                    print(f"ask data error: {e!r}")
+                    # logger.error(f"ask data error: {e!r}")
                     time.sleep(3)
                     continue
                 if data_index >= len(self.data_list) - 1:
                     status_event.set()
                     time.sleep(10)
                     continue
-                sample_data = self.data_list[data_index]
-                if self.data_args.offset_file:
-                    with open(self.data_args.offset_file, "r") as f:
-                        f.seek(sample_data)
-                        sample_data = json.loads(f.readline())
+                
+                try:
+                    file_id, offset = self.data_list[data_index]
+                    file_path = self.file_mapping[int(file_id)]
+                    line = get_file_line(file_path, int(offset))
+                    sample_data = json.loads(line)
+                    sample_index += 1
+                except Exception as e:
+                    logger.error(f"Read Error at index {data_index}: {e}")
+                    continue
+            
             else:
                 try:
                     sample_data = json.loads(self.data_queue.get(timeout=5))
@@ -396,7 +418,7 @@ class OmniDataloader(BaseDataLoader):
             else:
                 raise NotImplementedError("Unsupported sample_data format.")
             
-            if sample_index % 20 == 0:
+            if sample_index % 50 == 0:
                 mem_mb = proc.memory_info().rss / 1024**2
                 gen0, gen1, gen2 = gc.get_count()
                 if self.rank == 0:
@@ -416,6 +438,11 @@ class OmniDataloader(BaseDataLoader):
                         f"gc=({gen0},{gen1},{gen2})"
                     )
                 gc.collect()
+        try:
+            for f in file_cache.values():
+                f.close()
+        except:
+            pass
 
         if self.workers_done_event.is_set() or os.getppid() != ppid:
             self.result_queue.cancel_join_thread()

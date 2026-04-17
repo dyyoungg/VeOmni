@@ -19,9 +19,10 @@ data:
   sample_fps: 4
   finetune_sample_frames: 64
   preprocess_workers: 2
+  offset_file_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/offsets.npy
+  file_maping_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/file_mapping.json
 
 train:
-
   num_train_epochs: 1
   seed: 42
   local_rank: 0
@@ -36,7 +37,7 @@ train:
   freeze_vit: true
   freeze_vit_projector: false
   freeze_audio_tower: true
-  freeze_audio_projector: false
+  freeze_audio_projector: true
   freeze_llm: true
   # 优化器
   optimizer:
@@ -97,5 +98,5 @@ train:
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2
-  remote_dataloader: false
+  remote_dataloader: true
   broadcast_model_weights_from_rank0: true

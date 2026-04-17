@@ -373,7 +373,7 @@ class EnvironMeterCallback(Callback):
             logger.info("[MemTrace] baseline snapshot taken.")
         
         elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
-            # 之后每 200 步和基准对比
+            # 之后每 100 步和基准对比
             new_snapshot = tracemalloc.take_snapshot()
             top_stats = new_snapshot.compare_to(
                 self._tracemalloc_snapshot, 'lineno'
