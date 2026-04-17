@@ -36,7 +36,7 @@ train:
   freeze_vit: true
   freeze_vit_projector: false
   freeze_audio_tower: true
-  freeze_audio_projector: false
+  freeze_audio_projector: true
   freeze_llm: true
   # 优化器
   optimizer:

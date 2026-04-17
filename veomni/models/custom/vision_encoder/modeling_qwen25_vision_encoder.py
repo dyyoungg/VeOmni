@@ -268,13 +268,15 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
         return features, seq_len
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
-        pixel_values = torch.ones(1536, 3 * 2 * 14 * 14).to(dtype=self.dtype, device=self.device) #  [644,364]
+        patch_size = getattr(self.config, "patch_size", 14)
+        pixel_values = torch.ones(1536, 3 * 2 * patch_size **2).to(dtype=self.dtype, device=self.device) #  [644,364]
         grid_thw = torch.tensor([[1, 32, 48]], dtype=torch.int32, device=self.device)
         return {"features": pixel_values, "grid_thw": grid_thw}
 
     def dummy_forward(self):
         if getattr(self, "_dummy_data", None) is None:
-            pixel_values = torch.ones(1536, 3 * 2 * 14 * 14).to(dtype=self.dtype, device=self.device)
+            patch_size = getattr(self.config, "patch_size", 14)
+            pixel_values = torch.ones(1536, 3 * 2 * patch_size * patch_size).to(dtype=self.dtype, device=self.device)
             grid_thw = torch.tensor([[1, 32, 48]], dtype=torch.int32, device=self.device)
             if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
                 sp_world_size = get_parallel_state().sp_size

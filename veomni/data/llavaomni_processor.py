@@ -454,21 +454,18 @@ class OmniSampleProcessor:
             - extra_reserved_tokens
         )
         try:
-            if "start" in sample_data and "end" in sample_data:
-                imgs, _, total_tokens, _ = self.get_video_frames(
-                    video_file, res_token_num,
-                    sample_data["start"], sample_data["end"],
-                    method=self.training_args.image_decode_method,
-                )
-            else:
-                imgs, _, total_tokens, _ = self.get_video_frames(
-                    video_file, res_token_num,
-                    format=vformat,
-                    method=self.training_args.image_decode_method,
-                )
+           
+            imgs, _, total_tokens, _ = self.get_video_frames(
+                video_file, 
+                res_token_num,
+                sample_data.get("start",None), 
+                sample_data.get("end",None),
+                method=self.training_args.video_decode_method,
+                format=vformat
+            )
+            
             if not imgs:
                 return None
-            time.sleep(0.001)
             inputs = self.process_image_videos(video=imgs, merge_size=self.video_merge_size)
         except Exception as e:
             print(traceback.print_exc())
@@ -480,65 +477,47 @@ class OmniSampleProcessor:
         merge_size = self._get_merge_size_from_inputs(inputs)
         return pixels, thw, image_num, merge_size, total_tokens
     
-
     def extract_imagelist_from_videobytes(
         self,
         video_file,
         max_image_tokens: int,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
-        method: str = "imageio",
+        method: str = "decord",
         format: str = "",
         merge_size: int = 2,
     ) -> Optional[Tuple[List[Image.Image], int, int, Tuple[int, int]]]:
-        start_frame = 0
-        video = None
-        resolution = (640, 480)
-
+        
+        raw_img_list: List[Image.Image] = []
+        video_io = io.BytesIO(video_file) if isinstance(video_file, bytes) else video_file
+        
+        video_iter = None 
+        vr = None
         try:
-            if method == "pyav":
-                video_io = io.BytesIO(video_file)
-                container = av.open(video_io)
-                vs = container.streams.video[0]
-                framerate = float(vs.average_rate)
-                time_base = float(vs.time_base)
-                resolution = (vs.width, vs.height)
-                frame_per_time_base = 1 / (framerate * time_base)
-                duration = container.duration / 1_000_000
-                frame_count = int(duration * framerate)
-                end_frame = frame_count
-                if start_time is not None:
-                    start_frame = int(framerate * start_time)
-                if end_time is not None:
-                    end_frame = int(framerate * end_time)
-                frame_count = end_frame - start_frame
-                if frame_count == 0:
-                    start_frame, end_frame = 0, frame_count
-                    frame_count = end_frame - start_frame
-
-            elif method in ("imageio", "decord"):
-                video_io = io.BytesIO(video_file) if isinstance(video_file, bytes) else video_file
-
-                if format == "gif":
-                    try:
-                        video = iio.imread(video_io, index=None)
-                        frame_count = video.shape[0]
-                        resolution = (video.shape[2], video.shape[1])
-                    except Exception:
-                        video_io = io.BytesIO(video_file) if isinstance(video_file, bytes) else video_file
-                        gif_obj = Image.open(video_io)
-                        resolution = gif_obj.size
-                        frame_count = self._count_gif_frames(gif_obj)
-                        try:
-                            video = iio.imiter(video_file, plugin="pyav", thread_count=1)
-                        except Exception as e:
-                            print("[imageio imiter error]", repr(e))
-                            traceback.print_exc()
-                            raise
-                    end_frame = frame_count
-                    framerate = self.data_args.sample_fps
-                else:
-                    container = av.open(video_io)
+           
+            resolution = (640, 480)
+            framerate = 1.0
+            frame_count = 0
+            
+            is_gif = format.lower() == "gif"
+            if not is_gif:
+                if isinstance(video_file, str) and video_file.lower().endswith(".gif"):
+                    is_gif = True
+                elif isinstance(video_file, bytes) and video_file.startswith(b"GIF"):
+                    is_gif = True
+                
+            if is_gif:
+                method = "imageio"  
+                gif_obj = Image.open(video_io)
+                resolution = gif_obj.size
+                frame_count = self._count_gif_frames(gif_obj)
+                framerate = getattr(self.data_args, 'sample_fps', 2.0)
+                gif_obj.close()
+            else:
+                if isinstance(video_io, io.BytesIO):
+                    video_io.seek(0)
+                
+                with av.open(video_io) as container:
                     meta = iio.immeta(video_file, index=None)
                     if "duration" not in meta:
                         meta["duration"] = (
@@ -546,104 +525,108 @@ class OmniSampleProcessor:
                             if container.duration is not None
                             else None
                         )
-                    container.close()
-                    try:
-                        video = iio.imiter(video_file, plugin="pyav", thread_count=1)
-                    except Exception as e:
-                        print("[imageio imiter error]", repr(e))
-                        traceback.print_exc()
-                        raise
-                    first = next(iter(video))
-                    resolution_actual = (first.shape[1], first.shape[0])
-                    resolution_meta = meta.get("size") or meta.get("source_size")
-                    resolution = (
-                        resolution_meta
-                        if resolution_meta and resolution_meta == resolution_actual
-                        else resolution_actual
-                    )
-                    frame_count = int(meta["duration"] * meta["fps"])
-                    end_frame = frame_count
-                    framerate = meta["fps"]
-                    if start_time is not None:
-                        start_frame = int(meta["fps"] * start_time)
-                    if end_time is not None:
-                        end_frame = int(meta["fps"] * end_time)
-                    frame_count = end_frame - start_frame
-                    if frame_count == 0:
-                        start_frame, end_frame = 0, frame_count
-                        frame_count = end_frame - start_frame
+                
+                video_iter = iio.imiter(video_file, plugin="pyav", thread_count=1)
+                first = next(video_iter)
+                resolution_actual = (first.shape[1], first.shape[0])
+                resolution_meta = meta.get("size") or meta.get("source_size")
+                resolution = (
+                    resolution_meta
+                    if resolution_meta and resolution_meta == resolution_actual
+                    else resolution_actual
+                )
+                
+                framerate = meta.get("fps", 24.0)
+            
+                duration = meta.get("duration", 0)
+                frame_count = int(duration * framerate) if duration else 0
+                
+                if hasattr(video_iter, 'close'):
+                    video_iter.close()
+                video_iter = None
 
-        except Exception as e:
-            print(f"[ERROR] Failed to load video: {e}, type {type(video)}")
-            self._cleanup_shm(video_file)
-            return None
+            if frame_count <= 0:
+                logger.warning("[WARN] 无法获取有效的总帧数。")
+                return None
 
-        if video is None or (hasattr(video, "__len__") and len(video) == 0) or frame_count <= 0:
-            print("[WARN] No valid frames extracted.")
-            self._cleanup_shm(video_file)
-            return None
-        
-        each_token, resized_res = self.calculate_video_each_frame_token(
-            height=resolution[1], width=resolution[0], merge_size=merge_size
-        )
-        max_frames = int(max_image_tokens / each_token)
-        desired = (
-            min(self.data_args.finetune_sample_frames, max_frames)
-            if self.data_args.finetune_sample_frames > 0
-            else max_frames
-        )
-        frame_seq = self.get_seq_frames(
-            frame_count, desired, start_frame, end_frame, framerate
-        )
-        raw_img_list: List[Image.Image] = []
+            start_frame = int(framerate * start_time) if start_time is not None else 0
+            end_frame = int(framerate * end_time) if end_time is not None else frame_count
+            valid_frame_count = max(0, end_frame - start_frame)
+            
+            if valid_frame_count == 0:
+                start_frame, end_frame = 0, frame_count
+                valid_frame_count = end_frame - start_frame
 
-        if method == "pyav":
-            try:
-                for frame_number in frame_seq:
-                    target_time = frame_number / framerate
-                    target_frame = int(target_time / time_base)
-                    container.seek(
-                        target_frame, backward=True, stream=container.streams.video[0]
-                    )
-                    while True:
-                        frame = next(container.decode(video=0))
-                        if frame.pts + frame_per_time_base > target_frame:
-                            break
-                    raw_img_list.append(frame.to_image().convert("RGB"))
-                del container
-            except Exception:
-                method = "decord"
+            each_token, resized_res = self.calculate_video_each_frame_token(
+                height=resolution[1], width=resolution[0], merge_size=merge_size
+            )
+            
+            max_frames = int(max_image_tokens / each_token)
+            desired = (
+                min(getattr(self.data_args, 'finetune_sample_frames', max_frames), max_frames)
+                if getattr(self.data_args, 'finetune_sample_frames', 0) > 0
+                else max_frames
+            )
+            
+            frame_seq = self.get_seq_frames(
+                valid_frame_count, desired, start_frame, end_frame, framerate
+            )
 
-        if method == "decord" and format != "gif":
-            try:
-                from decord import VideoReader, cpu
+            if not frame_seq:
+                return None
+
+            if method == "decord":
+                try:
+                    from decord import VideoReader, cpu
+                    if isinstance(video_io, io.BytesIO):
+                        video_io.seek(0)
+                    vr = VideoReader(video_io, ctx=cpu(0), num_threads=1)
+                    frames_np = vr.get_batch(frame_seq).asnumpy()
+                    raw_img_list = [Image.fromarray(img).convert("RGB") for img in frames_np]
+                except Exception as e:
+                    logger.warning(f"[WARN] Decord 抽取失败，降级使用 imageio 重新抽取: {e}")
+                    method = "imageio"  
+                
+            if method == "imageio":
                 if isinstance(video_io, io.BytesIO):
                     video_io.seek(0)
-                vr = VideoReader(video_io, ctx=cpu(0), num_threads=1)
-                for img_np in vr.get_batch(frame_seq).asnumpy():
-                    raw_img_list.append(Image.fromarray(img_np).convert("RGB"))
-            except Exception:
-                method = "imageio"
-                raw_img_list = []
+                video_iter = iio.imiter(video_file, plugin="pyav", thread_count=1)
+                seq_sorted = sorted(frame_seq)
+                target_idx = 0
+                
+                for current_idx, image in enumerate(video_iter):
+                    if current_idx % 20 == 0:
+                        time.sleep(0.001)
+                    if current_idx == seq_sorted[target_idx]:
+                        raw_img_list.append(Image.fromarray(image).convert("RGB"))
+                        target_idx += 1
+                        if target_idx >= len(seq_sorted):
+                            break
 
-        if method == "imageio" or format == "gif":
-            img_index = 0
-            for idx, image in enumerate(video):
-                if idx % 20 == 0:
-                    time.sleep(0.001)
-                if idx == frame_seq[img_index]:
-                    raw_img_list.append(Image.fromarray(image).convert("RGB"))
-                    img_index += 1
-                    if img_index == len(frame_seq):
-                        break
-            if video is not None:
+        except Exception as e:
+            logger.warning(f"[ERROR] 视频帧抽取发生异常: {e}")
+            # traceback.print_exc()
+            return None
+            
+        finally:
+          
+            if vr is not None:
+                del vr
+                
+            if video_iter is not None and hasattr(video_iter, 'close'):
                 try:
-                    video.close()
+                    video_iter.close()
+                    del video_iter
                 except Exception:
                     pass
+            self._cleanup_shm(video_file)
+            
 
-        self._cleanup_shm(video_file)
-        return raw_img_list, frame_count, each_token, resized_res
+        if not raw_img_list:
+            logger.warning("[WARN] 未能成功提取到任何图像帧。")
+            return None
+
+        return raw_img_list, valid_frame_count, each_token, resized_res
 
     def get_video_frames(
         self,

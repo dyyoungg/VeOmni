@@ -110,7 +110,7 @@ class VLMTrainingArguments(TrainingArguments):
     dataloader_debug: bool = field(default=False)
     fix_image_size: bool = field(default=False)
     jpeg_image_augmentation: bool = field(default=False)
-    image_decode_method: str = field(default="decord")
+    video_decode_method: str = field(default="decord")
     remote_dataloader: bool = field(default=False)
     target_image_num: int = field(default=999)
     min_lr_rate: float = field(default=0.0)

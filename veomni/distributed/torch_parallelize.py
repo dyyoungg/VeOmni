@@ -568,6 +568,7 @@ def build_parallelize_model(
                 "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
             },
         )
+        model.enable_input_require_grads()
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")

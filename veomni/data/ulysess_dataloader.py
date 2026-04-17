@@ -10,6 +10,7 @@ import queue
 import threading
 import datetime
 import pickle
+import gc
 
 
 import math
@@ -260,39 +261,6 @@ class UlyssesStreamingDataset(IterableDataset):
             prev = item
         yield prev, True
  
-    def _process_with_timeout(
-        self, sample_data: Dict, sample_idx: int, timeout: float = 60.0) -> Optional[Any]:
-        """
-        在独立线程里处理样本，超时则放弃返回 None。
-        Python 无法强杀线程，daemon=True 保证进程退出时自动回收。
-        """
-        result_holder    = [None]
-        exception_holder = [None]
-        done_event       = threading.Event()
-
-        def _run():
-            try:
-                result_holder[0] = self._processor(sample_data, sample_idx)
-            except Exception as e:
-                exception_holder[0] = e
-            finally:
-                done_event.set()
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        finished = done_event.wait(timeout=timeout)
-
-        if not finished:
-            logger.warning(
-                f"[DP Rank {self.dp_rank}] Sample {sample_idx} timed out "
-                f"after {timeout}s, skipping. (thread still running in bg)"
-            )
-            return None  # 直接跳过，不等了
-
-        if exception_holder[0] is not None:
-            raise exception_holder[0]
-
-        return result_holder[0]
  
     def __iter__(self):
        
@@ -324,14 +292,18 @@ class UlyssesStreamingDataset(IterableDataset):
                                 for item, is_last in self._iterate_with_lookahead(result):
                                     yield (global_idx, sub_idx, is_last, item)
                                     sub_idx += 1
+                                result = None
                             else:
                                 yield (global_idx, 0, True, result)
+                                result = None
                         else:
                             yield (global_idx, 0, True, None)
+                            result = None
                         # print(f"rank {self.rank}, sample idx: {global_idx}")
                         local_counter += 1
-                        if i % 10 == 0:
+                        if local_counter % 50 == 0:
                             time.sleep(0.001)  # yield GIL briefly
+                            gc.collect()
     
                     except Exception as e:
                         traceback.print_exc()
@@ -362,7 +334,7 @@ class ReorderingDataLoader:
     MAX_BUFFER_SIZE the head is forcibly emitted to avoid unbounded memory use.
     """
  
-    MAX_BUFFER_SIZE = 500
+    MAX_BUFFER_SIZE = 200
  
     def __init__(self, dataloader):
         self.dataloader = dataloader
@@ -407,6 +379,7 @@ class ReorderingDataLoader:
             while heap and heap[0][0] == next_global and heap[0][1] == next_sub:
                 _, _, b_is_last, b_data = heapq.heappop(heap)
                 yield from _advance(b_data, b_is_last)
+                
  
         while True:
             batch = get_next_item()
@@ -416,6 +389,7 @@ class ReorderingDataLoader:
  
             if g_idx == next_global and s_idx == next_sub:
                 yield from _advance(data, is_last)
+                del data
                 yield from _drain()
  
             elif g_idx >= next_global:
@@ -438,6 +412,7 @@ class ReorderingDataLoader:
                 b_g, b_s, b_is_last, b_data = heapq.heappop(heap)
                 next_global, next_sub = b_g, b_s
                 yield from _advance(b_data, b_is_last)
+                del b_data
                 yield from _drain()
  
         # Drain remaining buffer at end of epoch
@@ -445,6 +420,7 @@ class ReorderingDataLoader:
             b_g, b_s, b_is_last, b_data = heapq.heappop(heap)
             next_global, next_sub = b_g, b_s
             yield from _advance(b_data, b_is_last)
+            del b_data  
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +582,7 @@ class MultimodalPacker:
         # ── Emit remaining buffer ─────────────────────────────────────────────
         if self._cur_len > 0:
             yield self._flush()
+            self._reset_buffer() 
 
 
 # ---------------------------------------------------------------------------
@@ -862,13 +839,14 @@ class PrefetchingPackedLoader:
                         return
  
                     batch_buf.append(packed)
- 
+                    del packed  
                     if len(batch_buf) == self.batch_size:
                         self._emit(batch_buf)
-                        batch_buf = []
+                        batch_buf.clear()
  
                 if batch_buf and not self.stop_event.is_set():
                     self._emit(batch_buf)
+                    batch_buf.clear()
  
                 logger.info(
                     f"[Rank {self.rank}] Epoch {self.epoch} finished. "
@@ -944,6 +922,7 @@ class PrefetchingPackedLoader:
                         self.samples_consumed += 1
  
             yield item
+            item = None
             self.queue.task_done()
  
 
@@ -975,8 +954,8 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         raw_dataset,
         batch_size=None,           # disable auto-batching; items are already dicts
         num_workers=getattr(training_args, "dataloader_num_workers", 2),
-        prefetch_factor=getattr(training_args, "dataloader_prefetch_factor", 1),
-        persistent_workers=True,
+        prefetch_factor=getattr(training_args, "dataloader_prefetch_factor", 2),
+        persistent_workers=False,
     )
  
     # ── Reorder across workers ────────────────────────────────────────────────

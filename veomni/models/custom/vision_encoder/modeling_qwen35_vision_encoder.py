@@ -349,10 +349,9 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
         return features, seq_len
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
-        """Dummy inputs for weight initialisation / compilation warm-up."""
-        # 1536 patches of size (temporal=2, patch=14, patch=14) for a 32×48 grid
+        patch_size = getattr(self.config, "patch_size", 16)
         pixel_values = torch.ones(
-            1536, 3 * 2 * 14 * 14, dtype=self.dtype, device=self.device
+            1536, 3 * 2 * patch_size * patch_size, dtype=self.dtype, device=self.device
         )
         grid_thw = torch.tensor([[1, 32, 48]], dtype=torch.int32, device=self.device)
         return {"features": pixel_values, "grid_thw": grid_thw}
@@ -360,8 +359,9 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
     def dummy_forward(self):
         """Run a single forward pass with dummy data (used by SP initialisation)."""
         if getattr(self, "_dummy_data", None) is None:
+            patch_size = getattr(self.config, "patch_size", 16)
             pixel_values = torch.ones(
-                1536, 3 * 2 * 14 * 14, dtype=self.dtype, device=self.device
+                1536, 3 * 2 * patch_size * patch_size, dtype=self.dtype, device=self.device
             )
             grid_thw = torch.tensor([[1, 32, 48]], dtype=torch.int32, device=self.device)
             if get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training:
