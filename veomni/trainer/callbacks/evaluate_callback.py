@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dis
 import json
 import os
 import random
@@ -53,7 +54,7 @@ class EvaluateCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.eval_steps and state.global_step % args.train.eval_steps == 0:
+        if args.train.eval_steps and (state.global_step % args.train.eval_steps==0 or state.global_step==1):
             self._evaluate(state)
     
     @property
@@ -93,12 +94,12 @@ class EvaluateCallback(Callback):
             local = local / dist.get_world_size()
         return local.item()
     
-    def _all_reduce_category(self, category_acc: dict) -> dict:
+    def _all_reduce_category(self, category_acc: dict, all_categories: set) -> dict:
         """Per-category right_count / total_count aggregated across all ranks."""
         results = {}
         device  = self._device
-        for c in sorted(category_acc.keys()):
-            acc_list = category_acc[c]
+        for c in sorted(all_categories):
+            acc_list = category_acc.get(c, []) 
             right = (
                 torch.tensor(
                     [a.item() if isinstance(a, torch.Tensor) else float(a)
@@ -143,7 +144,7 @@ class EvaluateCallback(Callback):
         #     )
         
         output = model(**data)
-        dist.barrier()
+       
         raw_target = data["labels"][0, -1].item()
         if raw_target in id_dict1:
             target_idx    = id_dict1[raw_target]
@@ -351,7 +352,7 @@ class EvaluateCallback(Callback):
         rank   = self._rank
         device = self._device
  
-        eval_dl = getattr(self.trainer, "eva_dataloader", None)
+        eval_dl = getattr(self.trainer, "eval_dataloader", None)
         if eval_dl is None:
             logger.warning_rank0("[Eval] No eval dataloader (trainer.eva_dataloader) found, skipping.")
             return
@@ -372,9 +373,9 @@ class EvaluateCallback(Callback):
  
         with torch.no_grad():
             for idx, data in enumerate(eval_dl):
-                if rank == 0 and idx % 5 == 0:
-                    logger.info(f"[Eval] step={state.global_step}  idx={idx}")
- 
+                if rank==0 and idx % 2 == 0:
+                    logger.info(f"[Eval] rank: {rank} step={state.global_step}  idx={idx}")
+
                 # ── device transfer ───────────────────────────────────────
                 bf16_keys = {"images", "pixel_values", "pixel_values_videos", "audio_features"}
                 for k, v in data.items():
@@ -423,8 +424,9 @@ class EvaluateCallback(Callback):
             val = self._all_reduce_mean(values)
             if val is not None:
                 evaluate_logs[metric_key] = val
- 
-        evaluate_logs.update(self._all_reduce_category(category_acc))
+
+        all_categories = getattr(eval_dl, "categories", set())
+        evaluate_logs.update(self._all_reduce_category(category_acc, all_categories))
         evaluate_logs["step"]  = state.global_step
         evaluate_logs["epoch"] = round(float(state.epoch), 4)
  

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import Traceback
 import os
 import json
 from abc import ABC
@@ -114,6 +115,7 @@ class VLMTrainingArguments(TrainingArguments):
     remote_dataloader: bool = field(default=False)
     target_image_num: int = field(default=999)
     min_lr_rate: float = field(default=0.0)
+    router_aux_loss_coef: float = field(default=0.001)
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
 
 
@@ -152,7 +154,7 @@ class VLMMModelArguments(ModelArguments):
     model_arc: Optional[str] = field(default="qwen2")
 
     vision_tower: Optional[List[str]] = field(default=None)
-    mm_downsample_ratio: int = field(default=1)
+    mm_downsample_ratio: int = field(default=16)
     audio_downsample_ratio: int = field(default=10)
     audio_frame_length: int = field(default=320)
     num_mel_bins: Optional[int] = field(default=128)
@@ -254,6 +256,8 @@ class VLMTrainer:
                 torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
                 attn_implementation=args.model.ops_implementation.attn_implementation,
                 moe_implementation=args.model.ops_implementation.moe_implementation,
+                encoder_data_balance=args.model.encoder_data_balance,
+                encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
             )
         elif self.model_config.model_type == "llavaqwen2_omni":
             self.model = build_llavaqwen2_omni_from_pretrained(
@@ -261,6 +265,8 @@ class VLMTrainer:
                 init_device=args.train.init_device,
                 torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
                 attn_implementation=args.model.ops_implementation.attn_implementation,
+                encoder_data_balance=args.model.encoder_data_balance,
+                encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
             )
 
         else:
@@ -288,7 +294,10 @@ class VLMTrainer:
         logger.info_rank0(f"image pad token {image_token_id}, video pad token: {video_token_id}, audio pad token:{audio_token_id}")
         if self.model_config.model_type == "llavaqwen3moe_omni":
             self.model.config.output_router_logits = True
-      
+            self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
+            
+        self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
+        self.model.config.encoder_data_balance_sorting_algo = self.args.model.encoder_data_balance_sorting_algo
 
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.args
@@ -319,6 +328,10 @@ class VLMTrainer:
             if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni"):
                 self.model.model.requires_grad_(False)
                 self.model.lm_head.requires_grad_(False)
+        else:
+            self.model.model.requires_grad_(True)
+            self.model.lm_head.requires_grad_(True)
+
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
@@ -335,7 +348,7 @@ class VLMTrainer:
             self.train_dataloader = get_train_dataloader(data_args, training_args, model_args, tokenizer)
         dist.barrier()
         
-        self.eva_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
+        self.eval_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
     
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.args
@@ -602,7 +615,6 @@ class VLMTrainer:
             self.state.video_trained_num = self.video_trained_num
             self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
             
-            return self.video_trained_num >= self.init_data_size - 1
         else:
             if hasattr(self.train_dataloader, "samples_consumed"):
                 remain_data = len(self.train_dataloader.data_list) - self.train_dataloader.samples_consumed
@@ -631,17 +643,15 @@ class VLMTrainer:
             # Update fractional epoch for callbacks / logging
             self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
  
-            # Return True when at least one rank has no data left
-            return bool((self._data_tensor_out <= 0).any())
     
 
     def train_step(
         self,
-        data_iterator: Any,
+        micro_batches: Any,
     ) -> Dict[str, float]:
         args = self.args
         
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        # micro_batches: List[Dict[str, Any]] = next(data_iterator)
         if isinstance(micro_batches, dict):
             micro_batches = [micro_batches]
         
@@ -676,7 +686,7 @@ class VLMTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        should_stop = self._sync_video_trained_num()
+        self._sync_video_trained_num()
 
         warmup_steps = int(
             self.train_steps * args.train.optimizer.lr_warmup_ratio
@@ -694,7 +704,7 @@ class VLMTrainer:
         del micro_batches
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
-        return should_stop
+    
 
         
 
@@ -739,20 +749,33 @@ class VLMTrainer:
             self.state.epoch = float(epoch)
 
             self.on_epoch_begin()
-            should_stop = False
             start = self.start_step
+
             for step in range(start, self.init_data_size):
                 self.current_step = step
                 try:
-                    should_stop = self.train_step(data_iterator)
+                    micro_batches = next(data_iterator)
+                    has_data = 1
+                except:
+                    import traceback
+                    traceback.print_exc()
+                    logger.info(f"epoch:{epoch} rank:{self.args.train.global_rank} Dataloader finished.")
+                    micro_batches = None
+                    has_data = 0
 
-                except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
-                    break
+                if dist.is_initialized():
+                    status_tensor = torch.tensor([has_data], dtype=torch.long, device=self.device)
+                    dist.all_reduce(status_tensor, op=dist.ReduceOp.MIN)
+                    should_continue = (status_tensor.item() == 1)
+                else:
+                    should_continue = (has_data == 1)
                 
-                if should_stop:
-                    logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping.")
+                if not should_continue:
+                    logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping cleanly.")
                     break
+                self.train_step(micro_batches)
+
+
             self.start_step = 0
             dist.barrier()
             self.train_dataloader.close()

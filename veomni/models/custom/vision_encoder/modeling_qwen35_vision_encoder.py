@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from flash_attn import flash_attn_varlen_func
@@ -37,6 +38,8 @@ from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_m
     Qwen3_5MoeVisionMLP,
     apply_rotary_pos_emb_vision,
 )
+from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
+from veomni.utils.data_balance.balance_sorting_algo import post_mbs_balancing_greedy_without_pad
 
 def pad_tensor(x: Tensor, dim: int, padding_size: int, padding_value: int = 0) -> Tensor:
     """Append `padding_size` slices of `padding_value` along `dim`."""
@@ -332,6 +335,26 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
             out_hidden=config.output_size,
             downsample_ratio=config.image_downsample_size,
         )
+        self._encoder_data_balance: Optional[Qwen3VLEncoderDataBalance] = None
+        use_encoder_data_balance = getattr(config, "encoder_data_balance", False)
+        if use_encoder_data_balance:
+            spatial_merge_unit = self._get_spatial_merge_unit(config)
+            sorting_algo_name = getattr(
+                config, "encoder_data_balance_sorting_algo", "post_mbs_balancing_greedy_without_pad"
+            )
+            self._encoder_data_balance = Qwen3VLEncoderDataBalance(
+                spatial_merge_unit=spatial_merge_unit,
+                sorting_algo_name=sorting_algo_name,
+            )
+
+    @staticmethod
+    def _get_spatial_merge_unit(encoder_cfg) -> int:
+        if hasattr(encoder_cfg, "spatial_merge_unit"):
+            return encoder_cfg.spatial_merge_unit
+        # Derive from spatial_merge_size (standard Qwen2VL naming)
+        if hasattr(encoder_cfg, "spatial_merge_size"):
+            return encoder_cfg.spatial_merge_size ** 2
+        return 4 
 
     def set_projector_trainable_only(self):
         """Freeze the backbone; keep mm_projector (and optionally the merger) trainable."""
@@ -343,8 +366,28 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
             self.merger.requires_grad_(True)
 
     def lm_encode(self, features: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
-       
-        features = super().forward(features, grid_thw)
+        use_balance = (
+            self._encoder_data_balance is not None
+            and self.training
+            and dist.is_initialized()
+            and self._encoder_data_balance.dp_group.size() > 1
+            and (not get_parallel_state().sp_enabled)
+        )
+        if use_balance:
+            # Step 1: Redistribute patches across DP ranks for balanced ViT compute.
+            balanced_pixels, balanced_thw = self._encoder_data_balance.balance_data(
+                features, grid_thw, data_type="image"
+            )
+            raw_features = super().forward(balanced_pixels, balanced_thw)
+            features, _ = self._encoder_data_balance.data_bridge(
+                hidden_state=raw_features,
+                deepstack_feature_lists=[],
+                require_grad=self.training,
+                data_type="image",
+            )
+        else:
+            features = super().forward(features, grid_thw)
+      
         features, seq_len = self.mm_projector(features, grid_thw)
         return features, seq_len
 

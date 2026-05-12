@@ -211,9 +211,12 @@ class BaseDataLoader:
             ret = {"index": self.remote_data_index.value}
             self.remote_data_index.value += 1
             return ret
-
+        master_addr = os.environ.get("MASTER_ADDR")
+        if master_addr == "127.0.0.1":
+            # single node
+            master_addr = socket.gethostname()
         app.run(
-            host=socket.gethostname(),
+            host=master_addr,
             port=REMOTE_SERVER_PORT,
             debug=False,
             use_reloader=False,
@@ -295,7 +298,11 @@ class BaseDataLoader:
                 yield data
             except queue.Empty:
                 if self.check_all_workers_done():
-                    return
+                    time.sleep(5.0)
+                    if self.batch_data_queue.empty():
+                        return 
+                    else:
+                        continue 
 
     @abstractmethod
     def worker_loop(self, status_event):

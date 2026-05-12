@@ -136,7 +136,7 @@ class OmniSampleProcessor:
             raise ValueError(f"error loading processor: {e}")
         self.image_patch_size = getattr(self.image_config, "patch_size")
         self.image_factor = self.image_patch_size * 2
-        print("image patch size:", self.image_patch_size)
+        # print("image patch size:", self.image_patch_size)
         self._threadpool = ThreadPoolExecutor(max_workers=self.preprocess_workers)
         
  

@@ -151,6 +151,8 @@ def build_llavaqwen2_omni_from_pretrained(
     torch_dtype: Literal["bfloat16", "float32"] = "bfloat16",
     attn_implementation: str = "veomni_flash_attention_2_with_sp",
     # moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
+    encoder_data_balance: Optional[bool] = False,
+    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     freeze_except_projectors: bool = True,
 ) -> LlavaQwen2ForCausalLM:
     """
@@ -169,9 +171,12 @@ def build_llavaqwen2_omni_from_pretrained(
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation)
+        omni_config.encoder_config.image_config.encoder_data_balance = encoder_data_balance
+        omni_config.encoder_config.image_config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
+        
     if getattr(omni_config.encoder_config, "audio_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.audio_config, attn_implementation)
-    
+        
     
     model = _build_empty_omni_model(omni_config, torch_dtype=torch_dtype)
     if not empty_init:

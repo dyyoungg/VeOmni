@@ -155,6 +155,8 @@ def build_qwen3moe_omni_from_pretrained(
     torch_dtype: Literal["bfloat16", "float32"] = "bfloat16",
     attn_implementation: str = "veomni_flash_attention_2_with_sp",
     moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
+    encoder_data_balance: Optional[bool] = False,
+    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     freeze_except_projectors: bool = True,
 ) -> LlavaQwen3MoeForCausalLM:
     """
@@ -173,6 +175,8 @@ def build_qwen3moe_omni_from_pretrained(
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation, None)
+        omni_config.encoder_config.image_config.encoder_data_balance = encoder_data_balance
+        omni_config.encoder_config.image_config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
     if getattr(omni_config.encoder_config, "audio_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.audio_config, attn_implementation, None)
     
@@ -301,7 +305,7 @@ def merge_component_models(vision_model_path, save_directory):
         },
         init_device="cuda",
         torch_dtype="bfloat16",
-        image_downsample_size=4,
+        image_downsample_size=16,
         image_projector_type= "dynamic_avgpool",
         audio_downsample_size = 10,
         audio_projector_type="conv_channel_upscale",
@@ -342,7 +346,7 @@ def merge_component_models(vision_model_path, save_directory):
 
 if __name__ == "__main__":
     vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
-    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen35encoder-veomni-down4"
+    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
     merge_component_models(vision_path, save_directory)
    
 

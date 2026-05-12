@@ -454,7 +454,7 @@ class VideoTqdmCallback(Callback):
             eval_suffix = f" | eval@{eval_step}[{eval_summary}]"
  
         postfix = f"{epoch_progress} | {global_step} | {metrics_str} | {eval_suffix}"
-        self.data_loader_tqdm.set_postfix_str(postfix)
+        self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         delta = state.video_trained_num - self._last_video_trained_num
         self.data_loader_tqdm.update(max(delta, 1))
         self._last_video_trained_num = state.video_trained_num

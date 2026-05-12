@@ -356,7 +356,7 @@ class OmniDataloader(BaseDataLoader):
 
         file_cache = {}
         MAX_CACHE_SIZE = 100  
-
+        session = requests.Session()
         def get_file_line(file_path: str, offset: int) -> str:
             if file_path not in file_cache:
                 if len(file_cache) >= MAX_CACHE_SIZE:
@@ -383,17 +383,22 @@ class OmniDataloader(BaseDataLoader):
                     http_addr = f"http://{master_addr}:{REMOTE_SERVER_PORT}/ask_data"
                    
                 try:
-                    response = requests.post(http_addr, json={})
+                    response = session.post(http_addr, json={}, timeout=5)
                     data_index = response.json()["index"]
                 except Exception as e:
                     # logger.error(f"ask data error: {e!r}")
                     time.sleep(3)
                     continue
                 if data_index >= len(self.data_list) - 1:
+                    print(f"rank {dist.get_rank()}, data index: {data_index}")
+                    if hasattr(self, 'new_input_ids') and len(self.new_input_ids) > 0:
+                        self._flush_pack_buffer()
+                        self._clear_pack_buffer()
+                    
                     status_event.set()
                     time.sleep(10)
                     continue
-                
+                file_path = None
                 try:
                     file_id, offset = self.data_list[data_index]
                     file_path = self.file_mapping[int(file_id)]
@@ -402,6 +407,14 @@ class OmniDataloader(BaseDataLoader):
                     sample_index += 1
                 except Exception as e:
                     logger.error(f"Read Error at index {data_index}: {e}")
+                    if file_path is not None and file_path in file_cache:
+                        try:
+                            file_cache[file_path].close()
+                        except:
+                            pass
+                        del file_cache[file_path]
+                    
+                    time.sleep(1) 
                     continue
             
             else:
@@ -671,7 +684,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         self.image_merge_size = 2
         self.video_merge_size = 2
         self.data_list = self._load_eval_data(data_args.eval_path)
-        self.categories = {d.get('category', 'unknown'): 1 for d in self.data_list}
+        self.categories = {d.get('category', 'unknown') for d in self.data_list}
         
         print(f"Eval dataset initialized. Total size: {len(self.data_list)}")
    
