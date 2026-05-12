@@ -310,7 +310,7 @@ class EnvironMeterCallback(Callback):
         step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step,  worker_metrics_queue=wq)
 
         step_train_metrics = {
-            "total_loss": loss,
+            "loss_avg": loss,
            
         }
         step_train_metrics.update(loss_dict)
@@ -322,10 +322,10 @@ class EnvironMeterCallback(Callback):
             for k, v in step_train_metrics.items()
         }
         step_train_metrics["time_profiling/iter_time"] = delta_time
-        current_loss = step_train_metrics["training/total_loss"]
+        current_loss = step_train_metrics["training/loss_avg"]
         self._loss_window.append(current_loss)
         train_loss = sum(self._loss_window) / len(self._loss_window)
-        step_train_metrics["training/total_loss"] = train_loss
+        step_train_metrics["training/loss_avg"] = train_loss
 
         # step_train_metrics["training/raw_loss"] = current_loss
      
@@ -343,7 +343,7 @@ class EnvironMeterCallback(Callback):
         logging_steps = getattr(self.trainer.args.train, "logging_steps", 10)
 
         if state.global_step % logging_steps == 0:
-            global_loss =  step_train_metrics["training/total_loss"]
+            global_loss =  step_train_metrics["training/loss_avg"]
             train_info = (
                 f"[step {state.global_step}] "
                 f"loss: {global_loss:.4f}  "
