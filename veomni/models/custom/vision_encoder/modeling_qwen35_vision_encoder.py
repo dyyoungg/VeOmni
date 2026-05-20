@@ -57,7 +57,7 @@ def unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 
 class BeeBeeVLQwen35MoeVisionModelConfig(BaseEncoderConfigMixin, Qwen3_5MoeVisionConfig):
    
-    model_type = "beebee_vl_qwen35moe_vision_model"
+    model_type = "beebee_qwen35moe_vision_model"
 
     def __init__(
         self,
@@ -416,7 +416,7 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
             self._dummy_data = {"features": pixel_values, "grid_thw": grid_thw}
         return self.lm_encode(**self._dummy_data)
 
-AutoConfig.register("beebee_vl_qwen35moe_vision_model", BeeBeeVLQwen35MoeVisionModelConfig)
+AutoConfig.register("beebee_qwen35moe_vision_model", BeeBeeVLQwen35MoeVisionModelConfig)
 
 
 def extract_ViT_weights():

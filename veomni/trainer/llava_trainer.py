@@ -116,6 +116,7 @@ class VLMTrainingArguments(TrainingArguments):
     target_image_num: int = field(default=999)
     min_lr_rate: float = field(default=0.0)
     router_aux_loss_coef: float = field(default=0.001)
+    output_router_logits: bool = field(default=True)
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
 
 
@@ -293,7 +294,7 @@ class VLMTrainer:
         self.model.omni_config.audio_token_id = audio_token_id
         logger.info_rank0(f"image pad token {image_token_id}, video pad token: {video_token_id}, audio pad token:{audio_token_id}")
         if self.model_config.model_type == "llavaqwen3moe_omni":
-            self.model.config.output_router_logits = True
+            self.model.config.output_router_logits = self.args.train.output_router_logits
             self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
             
         self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
@@ -778,8 +779,8 @@ class VLMTrainer:
 
             self.start_step = 0
             dist.barrier()
-            self.train_dataloader.close()
             self.on_epoch_end()
+            self.train_dataloader.close()
 
             self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")

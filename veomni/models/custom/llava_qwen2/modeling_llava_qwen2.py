@@ -66,9 +66,10 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
         # Keep the full omni config so `save_pretrained()` can persist encoder configs too.
         super().__init__(config.foundation_config)
         self.foundation_config = config.foundation_config
-        # `load_model_weights()` ties embeddings based on `model.config.tie_word_embeddings`.
-        # Ensure it matches the foundation LLM setting.
-        self.config.tie_word_embeddings = getattr(self.foundation_config, "tie_word_embeddings", True)
+      
+        self.config.tie_word_embeddings = getattr(self.foundation_config, "tie_word_embeddings", False)
+        if not hasattr(self, "all_tied_weights_keys") and not self.config.tie_word_embeddings:
+            self.all_tied_weights_keys = {}
 
         dtype = getattr(config.foundation_config, "dtype", None)
         if dtype is None or dtype == torch.bfloat16 or dtype == "bfloat16" or dtype == "bf16":
@@ -225,7 +226,18 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
 
         # Position ids: build/check from the gathered full seq, then slice after SP restore.
         if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+            past_length = 0
+            if past_key_values is not None:
+                if hasattr(past_key_values, "get_seq_length"):
+                    past_length = past_key_values.get_seq_length()
+                elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
+                    past_length = past_key_values[0][0].shape[2]
+            
+           
+            position_ids = torch.arange(
+                past_length, past_length + seq_len, 
+                dtype=torch.long, device=input_ids.device
+            ).unsqueeze(0)
         else:
             # Best-effort normalize; we expect last dim to match gathered seq.
             if position_ids.ndim == 3 and position_ids.shape[1] == 3:

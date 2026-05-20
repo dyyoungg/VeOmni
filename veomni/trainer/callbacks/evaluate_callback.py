@@ -18,7 +18,11 @@ import random
 import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
+import unicodedata
  
+import jiwer
+import opencc
+from jiwer import transforms as tr 
 import torch
 import torch.distributed as dist
 from transformers.cache_utils import DynamicCache
@@ -201,12 +205,7 @@ class EvaluateCallback(Callback):
         audios, audio_feature_len,
     ) -> tuple[float, torch.device]:
         """Greedy / top-p/k generation loop followed by WER / CER scoring."""
-        import unicodedata
- 
-        import jiwer
-        import opencc
-        from jiwer import transforms as tr
- 
+        
         tokenizer  = self.trainer.tokenizer
         device     = self._device
         MAX_GEN    = 32
@@ -287,7 +286,7 @@ class EvaluateCallback(Callback):
             )
             # Audio inputs are only meaningful on the first decode step.
             if step == 0:
-                model_kwargs["audio_features"]      = audios
+                model_kwargs["audio_features"] = audios
                 model_kwargs["audio_features_lens"] = audio_feature_len
  
             out     = model(**model_kwargs)

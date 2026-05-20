@@ -212,7 +212,7 @@ class BaseDataLoader:
             self.remote_data_index.value += 1
             return ret
         master_addr = os.environ.get("MASTER_ADDR")
-        if master_addr == "127.0.0.1":
+        if master_addr is None:
             # single node
             master_addr = socket.gethostname()
         app.run(

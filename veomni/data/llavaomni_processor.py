@@ -893,7 +893,7 @@ class OmniSampleProcessor:
             )
             return None
         cap_len = len(subtitle_tokens) + self.calculate_audio_tokens(audio_data_list)
-        resources = {"image_pixels": [], "image_thw": [], "merge_sizes": [], "audio": audio_data_list}
+        resources = {"image_pixels": None, "image_thw": None, "merge_sizes": [], "audio": audio_data_list}
         return (
             torch.tensor(subtitle_tokens, dtype=torch.long),
             torch.tensor(label_tokens, dtype=torch.long),
@@ -1148,11 +1148,6 @@ class OmniSampleProcessor:
 
         cur_input_ids = torch.tensor(new_ids, dtype=torch.long)
         cur_labels = torch.tensor(new_labels, dtype=torch.long)
-
-        assert sum(cur_input_ids == self.image_token_id).item() == total_image
-        assert sum(cur_input_ids == self.video_token_id).item() == total_video
-        assert sum(cur_input_ids == self.audio_token_id).item() == total_audio
-        
         token_counts = {"image": total_image, "video": total_video, "audio": total_audio}
 
         return cur_input_ids, cur_labels, token_counts

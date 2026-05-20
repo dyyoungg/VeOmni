@@ -34,7 +34,7 @@ def unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 
 
 class BeeBeeVLVisionModelConfig(BaseEncoderConfigMixin, Qwen2_5_VLVisionConfig):
-    model_type = "beebee_vl_vision_model"
+    model_type = "beebee_vision_model"
     def __init__(
         self,
         return_hidden_states=False,
@@ -329,4 +329,4 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
         return self.lm_encode(**self._dummy_data)
     
 
-AutoConfig.register("beebee_vl_vision_model", BeeBeeVLVisionModelConfig)
+AutoConfig.register("beebee_vision_model", BeeBeeVLVisionModelConfig)

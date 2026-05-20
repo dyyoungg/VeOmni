@@ -64,9 +64,8 @@ class AudioConvUpScaleProjector(nn.Module):
             x  = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             if remainder > 0:
                 x = unpad_tensor(x, dim=1, padding_size=pad_len)
-
+      
         num_tokens = [(l + self.audio_downsample_ratio - 1)// self.audio_downsample_ratio for l in feature_length]
-        
         valid_outputs = []
         for i in range(bs):
             valid_segment = x[i, :num_tokens[i], :]

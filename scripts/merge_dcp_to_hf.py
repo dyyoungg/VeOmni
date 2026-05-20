@@ -152,7 +152,7 @@ def main():
     parser.add_argument(
         "--shard-size",
         type=int,
-        default=2_000_000_000,
+        default=8_000_000_000,
         help="Maximum shard size in bytes (default: 2GB)",
     )
     args = parser.parse_args()

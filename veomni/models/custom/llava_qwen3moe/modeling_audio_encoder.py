@@ -10,7 +10,7 @@ from transformers import AutoConfig
 
 
 class BeeBeeAudioModelConfig(BaseEncoderConfigMixin, WhisperConfig):
-    model_type = "beebee_vl_audio_model"
+    model_type = "beebee_audio_model"
 
     def __init__(
         self,
@@ -74,4 +74,4 @@ class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
             self._dummy_data = {"features": features, "feature_lengths": feature_lens}
         return self.lm_encode(**self._dummy_data)
     
-AutoConfig.register("beebee_vl_audio_model", BeeBeeAudioModelConfig)
+AutoConfig.register("beebee_audio_model", BeeBeeAudioModelConfig)

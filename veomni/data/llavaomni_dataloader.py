@@ -244,40 +244,44 @@ class OmniDataloader(BaseDataLoader):
         total = len(self.data_list)
         remaining = self.data_queue.qsize() if hasattr(self, "data_queue") else 0
         trained_index = total - remaining
-
+   
         return {
             "data_path":     self.data_args.train_path,
             "trained_index": max(trained_index, 0),
+            "remote_data_index": self.remote_data_index.value
         }
 
     def load_state_dict(self, state: Dict) -> None:
         saved_path   = state.get("data_path", "")
         resume_index = state.get("trained_index", 0)
+        remote_index = state.get("remote_data_index", 0)
+        self.remote_data_index.value = remote_index
 
-        if saved_path and saved_path != self.data_args.train_path:
-            logger.warning(
-                f"[Dataloader] data_path mismatch: "
-                f"checkpoint='{saved_path}' vs current='{self.data_args.train_path}'. "
-                f"Starting from scratch."
+        if not self.training_args.remote_dataloader:
+            if saved_path and saved_path != self.data_args.train_path:
+                logger.warning(
+                    f"[Dataloader] data_path mismatch: "
+                    f"checkpoint='{saved_path}' vs current='{self.data_args.train_path}'. "
+                    f"Starting from scratch."
+                )
+                return
+
+            if resume_index <= 0:
+                return
+
+            total = len(self.data_list)
+            if resume_index >= total:
+                logger.warning(
+                    f"[Dataloader] trained_index={resume_index} >= total={total}, "
+                    f"data exhausted, starting from scratch."
+                )
+                return
+
+            self.data_list = self.data_list[resume_index:]
+            logger.info(
+                f"[Dataloader] Resumed: skipped {resume_index}/{total}, "
+                f"{len(self.data_list)} samples remaining."
             )
-            return
-
-        if resume_index <= 0:
-            return
-
-        total = len(self.data_list)
-        if resume_index >= total:
-            logger.warning(
-                f"[Dataloader] trained_index={resume_index} >= total={total}, "
-                f"data exhausted, starting from scratch."
-            )
-            return
-
-        self.data_list = self.data_list[resume_index:]
-        logger.info(
-            f"[Dataloader] Resumed: skipped {resume_index}/{total}, "
-            f"{len(self.data_list)} samples remaining."
-        )
 
     def build_inputs_token(
         self,
@@ -377,9 +381,11 @@ class OmniDataloader(BaseDataLoader):
             if self.training_args.remote_dataloader:
                 if http_addr is None:
                     master_addr = os.environ.get("MASTER_ADDR")
-                    if master_addr == "127.0.0.1":
+                    
+                    if master_addr is None:
                         # single node
                         master_addr = socket.gethostname()
+                    
                     http_addr = f"http://{master_addr}:{REMOTE_SERVER_PORT}/ask_data"
                    
                 try:
@@ -475,7 +481,7 @@ class OmniDataloader(BaseDataLoader):
             print(f"Error saving token counted data: {e}")
 
     def _validate_truncation(self, input_ids: torch.Tensor, counts: Dict) -> bool:
-       
+        
         img_ok = sum(input_ids == self.image_token_id).item() == counts.get("image", 0)
         vid_ok = sum(input_ids == self.video_token_id).item() == counts.get("video", 0)
         aud_ok = sum(input_ids == self.audio_token_id).item() == counts.get("audio", 0)
@@ -760,7 +766,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         else:
             return None
 
-        input_ids, labels = self.processor._expand_multimodal_tokens(
+        input_ids, labels, _ = self.processor._expand_multimodal_tokens(
             input_ids, label_tokens, 
             audio_feature_len=actual_audio_len
         )
@@ -769,8 +775,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             input_ids=input_ids, 
             labels=labels, 
             category=category,
-            audio_feature=audio_mel, 
-            audio_feature_len=raw_audio_len, 
+            audio_features=audio_mel, 
+            audio_features_lens=raw_audio_len, 
             text=text, 
             language=language,
             options_num=len(sample_data.get("candidates", []))
@@ -862,9 +868,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             video_thw=thw if visual_mode == "video" else None,
             audio_feature_len=actual_audio_len
         )
-        data_len = len(input_ids)
-        if data_len > 4096:
-            print(data_len, question)
+       
         return self._build_return_dict(
             input_ids=input_ids, 
             labels=labels, 
@@ -873,7 +877,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             image_grid_thw=thw if visual_mode == "image" else None,
             pixel_values_video=pixels if visual_mode == "video" else None,
             video_grid_thw=thw if visual_mode == "video" else None,
-            audio_features=audio_mel, audio_features_lens=raw_audio_len,
+            audio_features=audio_mel, 
+            audio_features_lens=raw_audio_len,
             options_num=len(sample_data.get("candidates", []))
         )
 
@@ -1045,10 +1050,10 @@ if __name__ == "__main__":
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    data_args.max_seq_len = 4096
-    training_args.model_max_length = 4096
+    data_args.max_seq_len = 8192
+    training_args.model_max_length = 8192
     training_args.num_train_epochs = 1
-    model_args.model_path = "/mnt/afs/yangdeyu/GameMLLM/llava_dev/LLaVA_hub/checkpoints/1221_llava_omni_qwen25vl_32B_st4_2e6"
+    model_args.model_path = "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
     model_args.vision_tower = "/mnt/afs/share/qwen25_vl_encoder"
     data_args.eval_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_audio_text_ocr_eval.json"
     
@@ -1056,14 +1061,16 @@ if __name__ == "__main__":
     model_args.mm_downsample_ratio = 4
     model_args.model_arc = "qwen2"
     training_args.per_device_train_batch_size = 1
-
+    training_args.remote_dataloader = True
+    data_args.offset_file_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/offsets.npy"
+    data_args.file_maping_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/file_mapping.json"
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        "/mnt/afs/share/Qwen25-14B-Instruct/",
+        "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16",
         model_max_length=training_args.model_max_length,
         use_fast=True,
     )
 
-    dataloader = get_eval_dataloader(
+    dataloader = get_train_dataloader(
         tokenizer=tokenizer,
         data_args=data_args,
         training_args=training_args,
@@ -1074,12 +1081,12 @@ if __name__ == "__main__":
     rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
     if rank == 0:
         pbar = tqdm(total=len(dataloader), desc="Processing", unit="batch")
-    # dataloader.launch()
+    dataloader.launch()
     print("launched the dataloader!!!")
     t1 = time.time()
     for i, data in enumerate(dataloader):
-        print(i, data["category"], len(data["input_ids"][0]), data["cu_seq_lens_q"][1] )
-        assert len(data["input_ids"][0]) == data["cu_seq_lens_q"][1]
+        print(i, len(data["input_ids"][0]), data["cu_seq_lens_q"][-1] )
+        assert len(data["input_ids"][0]) == data["cu_seq_lens_q"][-1]
         print("#############")
         
         if rank == 0:

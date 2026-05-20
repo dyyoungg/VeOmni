@@ -310,7 +310,7 @@ class EnvironMeterCallback(Callback):
         step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step,  worker_metrics_queue=wq)
 
         step_train_metrics = {
-            "loss_avg": loss,
+            "total_loss": loss,
            
         }
         step_train_metrics.update(loss_dict)
@@ -322,16 +322,19 @@ class EnvironMeterCallback(Callback):
             for k, v in step_train_metrics.items()
         }
         step_train_metrics["time_profiling/iter_time"] = delta_time
-        current_loss = step_train_metrics["training/loss_avg"]
+        current_loss = step_train_metrics["training/total_loss"]
         self._loss_window.append(current_loss)
         train_loss = sum(self._loss_window) / len(self._loss_window)
-        step_train_metrics["training/loss_avg"] = train_loss
+        step_train_metrics["training/total_loss"] = train_loss
 
         # step_train_metrics["training/raw_loss"] = current_loss
      
-        lr = max(self.trainer.lr_scheduler.get_last_lr())
-        step_train_metrics["training/lr"] = lr
-
+        lrs = self.trainer.lr_scheduler.get_last_lr()
+        lr_llm = lrs[2]
+        lr_vit = lrs[0]
+        step_train_metrics["training/lr"] = lr_llm
+        step_train_metrics["training/lr_vit"] = lr_vit
+        
         step_env_metrics.update(step_train_metrics)
 
         self.trainer.step_train_metrics = step_train_metrics
@@ -343,12 +346,12 @@ class EnvironMeterCallback(Callback):
         logging_steps = getattr(self.trainer.args.train, "logging_steps", 10)
 
         if state.global_step % logging_steps == 0:
-            global_loss =  step_train_metrics["training/loss_avg"]
+            global_loss =  step_train_metrics["training/total_loss"]
             train_info = (
                 f"[step {state.global_step}] "
                 f"loss: {global_loss:.4f}  "
                 f"grad_norm: {grad_norm:.3f}  "
-                f"lr: {lr:.6e}  "
+                f"lr: {lr_llm:.6e}  "
                 f"time: {delta_time:.2f}s"
             )
             logger.info(train_info)

@@ -50,9 +50,9 @@ class CheckpointerCallback(Callback):
             self._cleanup_old_checkpoints(state.global_step)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            self._save_checkpoint(state)
-            self._cleanup_old_checkpoints(state.global_step)
+        # if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
+        self._save_checkpoint(state)
+        self._cleanup_old_checkpoints(state.global_step)
 
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
