@@ -183,7 +183,7 @@ def get_cosine_schedule_with_warmup(
         if current_step < num_warmup_steps:
             return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
 
-        min_lr_ratio = min_lr / init_lr
+        min_lr_ratio = float(min_lr) / float(init_lr)
         if current_step > lr_decay_steps:
             return min_lr_ratio
 

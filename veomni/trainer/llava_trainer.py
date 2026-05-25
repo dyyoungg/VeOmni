@@ -778,8 +778,8 @@ class VLMTrainer:
 
 
             self.start_step = 0
-            dist.barrier()
             self.on_epoch_end()
+            dist.barrier()
             self.train_dataloader.close()
 
             self.start_step = 0
