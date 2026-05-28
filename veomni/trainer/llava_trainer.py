@@ -138,6 +138,13 @@ class VLMMDataArguments(DataArguments):
     use_finetune_fps: bool= field(default=False)
     offset_file_path: str = field(default="")
     file_maping_path: str = field(default="")
+    
+    # subtitle_video_config
+    max_subtitle_token_num: int = field(default=2048)
+    high_resolution_interval: float = field(default=0.0)
+    sub_native_resolution: bool = field(default=False)
+    compress_fps: bool = field(default=False)
+    minimum_image_token_num: int = field(default=10)
 
 
 @dataclass
