@@ -1,7 +1,7 @@
 # configs/llava_train.yaml
 model:
-  model_path: /mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16
-  config_path: /mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16
+  model_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4/checkpoints/hf_ckpt
+  config_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4/checkpoints/hf_ckpt
   model_arc: qwen2
   vision_tower: /mnt/afs/share/Qwen35_A3B_vision_encoder
   mm_downsample_ratio: 16
@@ -43,8 +43,8 @@ train:
   # 优化器
   optimizer:
     type: adamw
-    lr: 2.0e-4
-    lr_min: 1.0e-4
+    lr: 1.0e-4
+    lr_min: 5.0e-5
     weight_decay: 0.0
     max_grad_norm: 1.0
     lr_decay_style: cosine
@@ -52,10 +52,10 @@ train:
     lr_warmup_ratio: 0.05
     lr_start: 0.0
 
-  vit_lr: 2.0e-4
+  vit_lr: 1.0e-4
   min_lr_rate: 0.1
   enable_mixed_precision: false
-  moe_load_balance_monitor_interval: 50
+  moe_load_balance_monitor_interval: 100
   router_aux_loss_coef: 0.001
   enable_batch_invariant_mode: false
   eval_steps: 200
@@ -84,8 +84,9 @@ train:
 
   # checkpoint
   checkpoint:
-    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/llavaomni_30A3B_qwen35encoder_puretext
+    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4
     save_steps: 1000
+    save_epochs: 1
     save_total_limit: 2
     manager: dcp
     save_hf_weights: false
@@ -95,7 +96,7 @@ train:
   wandb:
     enable: true
     project: llavaomni
-    name: 0511_llavaomni_30A3B_qwen35encoder_puretext
+    name: 0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2

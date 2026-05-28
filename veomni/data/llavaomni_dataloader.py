@@ -810,7 +810,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         question = sample_data['question']
         answer = sample_data['answer']
         
-        # 1. 构建基础 Text Tokens
+
         has_visual = "path" in sample_data or "image_path" in sample_data or 'wukong' in category
         audio_list = []
         
@@ -825,7 +825,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 question_tokens = self.build_inputs_token(question, input_type="query_format", return_tensor=False)
             else:
                 question_tokens, audio_list = self._build_mixed_audio_tokens(sample_data, question, category)
-                if not question_tokens: return None
+                if not question_tokens: 
+                    return None
                 
             no_loss_txt = 'My best option: ('
             with_loss_txt = f"{chr(ord('A') + answer_idx)}"

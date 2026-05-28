@@ -1115,7 +1115,7 @@ class OmniSampleProcessor:
         """Qwen2.5-VL 核心的占位符展开逻辑"""
         new_ids, new_labels = [], []
         i_idx, v_idx, a_idx = 0, 0, 0
-        total_image, total_video, total_audio = 0, 0, 0
+        total_image_token, total_video_token, total_audio_token = 0, 0, 0
 
         for i, token_id in enumerate(input_ids):
             if token_id == IMAGE_TOKEN_INDEX and image_thw is not None:
@@ -1125,7 +1125,7 @@ class OmniSampleProcessor:
                 new_ids.extend([self.image_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
                 i_idx += 1
-                total_image += num
+                total_image_token += num
                 
             elif token_id == VIDEO_TOKEN_INDEX and video_thw is not None:
                 t, h, w = video_thw[v_idx]
@@ -1134,21 +1134,21 @@ class OmniSampleProcessor:
                 new_ids.extend([self.video_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
                 v_idx += 1
-                total_video += num
+                total_video_token += num
                 
             elif token_id == AUDIO_TOKEN_INDEX and audio_feature_len:
                 num = audio_feature_len[a_idx].item()
                 new_ids.extend([self.audio_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
                 a_idx += 1
-                total_audio += num
+                total_audio_token += num
             else:
                 new_ids.append(token_id)
                 new_labels.append(labels[i])
 
         cur_input_ids = torch.tensor(new_ids, dtype=torch.long)
         cur_labels = torch.tensor(new_labels, dtype=torch.long)
-        token_counts = {"image": total_image, "video": total_video, "audio": total_audio}
+        token_counts = {"image": total_image_token, "video": total_video_token, "audio": total_audio_token}
 
         return cur_input_ids, cur_labels, token_counts
 
