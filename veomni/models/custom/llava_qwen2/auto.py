@@ -6,6 +6,8 @@ import json
 import os
 import torch
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel, AutoTokenizer, AutoProcessor
+import glob
+from safetensors.torch import load_file
 
 from veomni.models.custom.llava_qwen2.configuration_llava_qwen2 import LlavaQwen2Config
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
@@ -187,7 +189,7 @@ def build_llavaqwen2_omni_from_pretrained(
     return model
 
 
-def build_qwen3moe_omni_from_components(
+def build_qwen25_omni_from_components(
     foundation_config_path: str,
     foundation_weights_path: str,
     *,
@@ -214,6 +216,7 @@ def build_qwen3moe_omni_from_components(
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
 
     foundation_cfg = AutoConfig.from_pretrained(foundation_config_path, trust_remote_code=True)
+    
     output_size = int(getattr(foundation_cfg, "hidden_size"))
 
     _set_foundation_dtype_in_config(foundation_cfg, torch_dtype)
@@ -272,7 +275,7 @@ def build_qwen3moe_omni_from_components(
     return model
 
 
-def merge_component_models(vision_model_path, save_directory):
+def merge_component_models(vision_model_path, save_directory, load_mm_projector=True):
    
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
     language_model_path = "/mnt/afs/share/Qwen25-14B-Instruct"
@@ -284,7 +287,7 @@ def merge_component_models(vision_model_path, save_directory):
         padding_side="right", 
         use_fast=False
     )
-    model = build_qwen3moe_omni_from_components(
+    model = build_qwen25_omni_from_components(
         foundation_config_path=language_model_path,
         foundation_weights_path=language_model_path,
         encoders={
@@ -299,7 +302,7 @@ def merge_component_models(vision_model_path, save_directory):
         },
         init_device="cuda",
         torch_dtype="bfloat16",
-        image_downsample_size= 4,
+        image_downsample_size= 16,
         image_projector_type= "dynamic_avgpool",
         audio_downsample_size = 10,
         audio_projector_type="conv_channel_upscale",
@@ -309,6 +312,59 @@ def merge_component_models(vision_model_path, save_directory):
     print(f"image_encoder: {type(model.image_encoder) if model.image_encoder is not None else None}")
     print(f"audio_encoder: {type(model.audio_encoder) if model.audio_encoder is not None else None}")
     
+    lm_weight_prefixes = (
+        "model.layers.",
+        "model.embed_tokens.",
+        "model.norm.",
+        "lm_head."
+    )
+    vision_prefix = ("model.vision_tower.vision_tower.", )
+    if load_mm_projector:
+        language_model_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/checkpoints/omni_models/0728_llava_omni_qwen25vl_14B_16x_4k_st2_kimiwhisper_10x_unfreezeaudio_omnidata_text500w_lr2e-6"
+        print("正在迁移原模型 mm_projector 权重...")
+
+        projector_key_mapping = {
+            "model.mm_projector.mlp.0.bias": "image_encoder.mm_projector.mlp.0.bias",
+            "model.mm_projector.mlp.0.weight": "image_encoder.mm_projector.mlp.0.weight",
+            "model.mm_projector.mlp.2.bias": "image_encoder.mm_projector.mlp.2.bias",
+            "model.mm_projector.mlp.2.weight": "image_encoder.mm_projector.mlp.2.weight",
+            "model.vision_tower.vision_tower.": "image_encoder."
+        }
+    
+        explicit_weights_to_load = {}
+        
+        weight_files = glob.glob(os.path.join(language_model_path, "*.safetensors"))
+        if not weight_files:
+            weight_files = glob.glob(os.path.join(language_model_path, "pytorch_model*.bin"))
+            
+        for w_file in weight_files:
+            if w_file.endswith(".safetensors"):
+                state_dict = load_file(w_file)
+            else:
+                state_dict = torch.load(w_file, map_location="cpu")
+                
+            for key, tensor in state_dict.items():
+           
+                if key in projector_key_mapping:
+                    new_key = projector_key_mapping[key]
+                    explicit_weights_to_load[new_key] = tensor
+                    print(f"  已提取并重命名 Projector 权重: {key} -> {new_key}")
+                
+
+                elif key.startswith(lm_weight_prefixes):
+                    explicit_weights_to_load[key] = tensor
+
+                elif key.startswith(vision_prefix):
+                    new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
+                    explicit_weights_to_load[new_key] = tensor
+
+        if explicit_weights_to_load:
+            print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
+            missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
+            print("语言模型主干及 mm_projector 权重显式加载成功！")
+        else:
+            print("警告: 未从指定路径中提取到任何匹配的权重，请确认权重文件内的 Key 是否正确。")
+        # ----------------------------------------------------------------------------------------
     
     special_tokens_dict_map = {
         "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN, DEFAULT_AUDIO_START_TOKEN,DEFAULT_AUDIO_END_TOKEN]
@@ -337,7 +393,7 @@ def merge_component_models(vision_model_path, save_directory):
     model.save_pretrained(
         save_directory, 
         safe_serialization=True, # 推荐使用 safetensors 格式，加载更快且更安全
-        max_shard_size="8GB"     # 因为 30B 模型很大，建议分块保存
+        max_shard_size="5GB"     # 因为 30B 模型很大，建议分块保存
     )
     tokenizer.save_pretrained(save_directory)
     print("模型保存完成！")
@@ -345,18 +401,8 @@ def merge_component_models(vision_model_path, save_directory):
 
 
 if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
-    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen35encoder-veomni-down4"
+    vision_path = "/mnt/afs/share/qwen25_vl_encoder"
+    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen25encoder-st4-veomni-down16"
     merge_component_models(vision_path, save_directory)
-   
-    # model_path = "/mnt/afs/share/llava_qwen30B_A3B-veomni-down4"
-    # cfg = AutoConfig.from_pretrained(model_path)
-    # print(cfg)
-    # if cfg.model_type == "llavaqwen3moe_omni":
-    #     model = build_qwen3moe_omni_from_pretrained(
-    #         model_path,
-    #         init_device="cuda",
-    #         torch_dtype= "bfloat16",
-    #         moe_implementation="fused",)
 
     
