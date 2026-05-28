@@ -155,7 +155,7 @@ def build_llavaqwen2_omni_from_pretrained(
     # moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
-    freeze_except_projectors: bool = True,
+    freeze_except_projectors: bool = False,
 ) -> LlavaQwen2ForCausalLM:
     """
     Load a *composite* omni model directory created by `model.save_pretrained(...)`.

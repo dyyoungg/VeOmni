@@ -303,36 +303,28 @@ class VLMTrainer:
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.args
         model_config = self.model_config
-       
-        if args.train.freeze_vit:
-            
-            if model_config.model_type in ("llavaqwen3moe_omni","llavaqwen2_omni"):
+
+        if model_config.model_type in ("llavaqwen3moe_omni","llavaqwen2_omni"):
+            if args.train.freeze_vit:
                 self.model.image_encoder.requires_grad_(False)
                 self.model.image_encoder.mm_projector.requires_grad_(True)
-            else:
-                raise NotImplementedError
-        
-        if args.train.freeze_audio_tower:
-            if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni"):
+           
+            if args.train.freeze_audio_tower:
                 self.model.audio_encoder.requires_grad_(False)
                 self.model.audio_encoder.audio_projector.requires_grad_(True)
-
-        if args.train.freeze_vit_projector:
-            if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni"):
+            
+            if args.train.freeze_vit_projector:
                 self.model.image_encoder.mm_projector.requires_grad_(False)
 
-        if args.train.freeze_audio_projector:
-            if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni"):
+            if args.train.freeze_audio_projector:
                 self.model.audio_encoder.audio_projector.requires_grad_(False)
 
-        if args.train.freeze_llm:
-            if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni"):
+            if args.train.freeze_llm:
                 self.model.model.requires_grad_(False)
                 self.model.lm_head.requires_grad_(False)
         else:
-            self.model.model.requires_grad_(True)
-            self.model.lm_head.requires_grad_(True)
-
+            raise NotImplementedError(f"{model_config.model_type} is not supported now.")
+           
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
