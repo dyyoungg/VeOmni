@@ -164,4 +164,14 @@ nsysoutput/
 
 # for personal specific claude instructions.
 .claude/CLAUDE.md
+
+configs/
+*.sh
+train_sh/
+ckpt/
 generate_offset.py
+exp_data/
+*.mp4
+*.jsonl
+*.txt
+*.json

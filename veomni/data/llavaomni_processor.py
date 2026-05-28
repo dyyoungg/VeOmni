@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any, Callable, Iterator
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import json
 import av
 import imageio.v3 as iio
 import librosa
@@ -50,6 +51,7 @@ from veomni.distributed.sequence_parallel import get_data_parallel_rank
 from veomni.data.multimodal.image_utils import get_adaptive_pool_size, jpeg_degrade, smart_resize
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils.logging import get_logger
+from decord import VideoReader, cpu
 
 
 logger = get_logger(__name__)
@@ -337,13 +339,38 @@ class OmniSampleProcessor:
                 **kwargs,
             )
 
+        # # video branch
+        # if not isinstance(video, list) or not all(
+        #     isinstance(f, Image.Image) for f in video
+        # ):
+        #     raise TypeError("'video' must be a list of PIL.Image.Image objects")
+        # return self.image_processor(
+        #     videos=[video],
+        #     return_tensors="pt",
+        #     merge_size=merge_size,
+        #     **kwargs,
+        # )
+        
         # video branch
-        if not isinstance(video, list) or not all(
-            isinstance(f, Image.Image) for f in video
-        ):
-            raise TypeError("'video' must be a list of PIL.Image.Image objects")
+        if not isinstance(video, list):
+            raise TypeError("'video' must be a list (List[Image.Image] or List[List[Image.Image]]).")
+
+        # 检查是单视频还是多视频段
+        if isinstance(video[0], list):
+            # 多视频段模式: List[List[Image.Image]] (LongVideoProcessor 多视频)
+            if not all(isinstance(f, Image.Image) for sublist in video for f in sublist):
+                raise TypeError("Elements of sublists in 'video' must be PIL.Image.Image objects.")
+            videos_to_process = video
+        elif isinstance(video[0], Image.Image):
+            # 单视频模式: List[Image.Image] 
+            if not all(isinstance(f, Image.Image) for f in video):
+                raise TypeError("Elements of 'video' must be PIL.Image.Image objects.")
+            videos_to_process = [video]
+        else:
+            raise TypeError("Unrecognized video format. Must be List[Image.Image] or List[List[Image.Image]].")
+
         return self.image_processor(
-            videos=[video],
+            videos=videos_to_process,
             return_tensors="pt",
             merge_size=merge_size,
             **kwargs,
@@ -577,7 +604,6 @@ class OmniSampleProcessor:
 
             if method == "decord":
                 try:
-                    from decord import VideoReader, cpu
                     if isinstance(video_io, io.BytesIO):
                         video_io.seek(0)
                     vr = VideoReader(video_io, ctx=cpu(0), num_threads=1)
@@ -1226,7 +1252,7 @@ class OmniSampleProcessor:
         )
     
 class LongVideoProcessor(OmniSampleProcessor):
-    def __init__(self, tokenizer, model_args, data_args, training_args, *, ceph_client, bos_client, rank, build_inputs_token_fn, preprocess_workers = 4):
+    def __init__(self, tokenizer, model_args, data_args, training_args, *, ceph_client, bos_client, rank, build_inputs_token_fn, preprocess_workers=4):
         super().__init__(tokenizer, 
                          model_args, 
                          data_args, 
@@ -1236,11 +1262,486 @@ class LongVideoProcessor(OmniSampleProcessor):
                          rank=rank, 
                          build_inputs_token_fn=build_inputs_token_fn, 
                          preprocess_workers=preprocess_workers)
-        
-        
     
+    def process_subtitle_srt(self, subtitle_bytes):
+        def encode_time(time_string):
+            hours, minutes, seconds = time_string.split(':')
+            seconds, milliseconds = seconds.split(',')
+            total_seconds = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(milliseconds) / 1000
+            return total_seconds
+
+        content = subtitle_bytes.decode('utf-8')
+        blocks = content.split('\n\n')  # split different parts
+        
+        subtitles = []
+        for block in blocks:
+            if block.strip():
+                lines = block.split('\n')  # split every line 
+                index = lines[0]
+                times = lines[1].split(' --> ')
+                start_time = encode_time(times[0])
+                end_time = encode_time(times[1])
+                text = ' '.join(lines[2:])  # subtitle may includes many lines
+                
+                subtitle = {
+                    'index': index,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'text': text
+                }   
+                subtitles.append(subtitle)
+        return subtitles
+    
+    def _get_subtitle_data(self, subtitle_path: str) -> List[Dict]:
+        """读取并解析 subtitle (支持 json、srt 格式)"""
+        try:
+            if "s3://" in subtitle_path:
+                raw_data = self.ceph_client.Get(subtitle_path)
+            elif "bos:/" in subtitle_path:
+                body = subtitle_path.split("bos:/")[-1].lstrip("/")
+                bucket, key = body.split("/", 1)
+                raw_data = self.bos_client.get_object(bucket, key).data.read()
+            else:
+                with open(subtitle_path, 'rb') as f:
+                    raw_data = f.read()
+            
+            if subtitle_path.endswith('.srt'):
+                subtitle_list = self.process_subtitle_srt(raw_data)
+            else:
+                json_file = json.loads(raw_data)
+                subtitle_list = []
+                ori_sub_list = json_file['body'] if "body" in json_file else json_file
+                
+                for i, s in enumerate(ori_sub_list):
+                    item = {
+                        'index': i, 
+                        'start_time': s['from'], 
+                        'end_time': s['to'], 
+                        'text': s['content']
+                    }
+                    if "ignore" in s: item['ignore'] = s['ignore']
+                    if 'image_line' in s: item['image_line'] = s['image_line']
+                    elif 'active_line' in s: item['text'] = s['active_line']
+                    if 'fps4' in s: item['fps4'] = s['fps4']
+                    subtitle_list.append(item)
+            return subtitle_list
+        except Exception as e:
+            logger.error(f"[Subtitle Error] Failed to read {subtitle_path}: {e}")
+            return []
+
+    def _get_required_interval(self, time_until_start: float, is_fps4: bool) -> float:
+        """动态FPS压缩逻辑"""
+        if time_until_start < 10 and not is_fps4:
+            return 1.0 / 1.0  # 1 FPS
+        elif time_until_start < 10 and is_fps4:
+            return 1.0 / 4.0  # 4 FPS
+        elif time_until_start < 20:
+            return 1.0 / 0.5  # 0.5 FPS
+        else:
+            return 1.0 / 0.1  # 0.1 FPS
+            
+    def resize_to_max_side(self, resolution, max_side=644):
+        # 找出最大边（长边）
+        (width, height) = resolution
+        long_side = max(width, height)
+        if long_side < max_side:
+            return resolution
+        # 比例因子
+        scale = max_side / long_side
+        # 缩放后的新尺寸，保留整数
+        new_width = int(round(width * scale))
+        new_height = int(round(height * scale))
+        return new_width, new_height
+
+
     def process(self, sample_data: Dict, sample_idx: int) -> Iterator[OmniSample]:
+        video_file = self.get_video_path(sample_data)
+        subtitle_path = sample_data.get("subtitle_path", "")
+        if not video_file or not subtitle_path:
+            return
 
-        yield sample_data
+        subtitle_list = self._get_subtitle_data(subtitle_path)
+        if not subtitle_list:
+            return
 
+        system_prompt = sample_data.get("system_prompt", "You are a helpful assistant.")
+        if self.model_args.model_arc in ['qwen2', 'qwen3']:
+            sys_text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n生成该视频的字幕<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            sys_text = "Human: 生成该视频的字幕 Assistant:"
+            
+        system_tokens = torch.tensor(self.tokenizer(sys_text)["input_ids"], dtype=torch.long)
+
+        vr = None
+        reader_state = {
+            "backend": "decord",
+            "video_iter": None,
+            "current_idx": -1,
+            "last_frame_array": None  # 存最后一次解码的原始 numpy 数组，应付重复帧
+        }
+        
+        
+        try:
+            # 优先尝试 Decord
+            vr = VideoReader(video_file, ctx=cpu(0))
+            fps = vr.get_avg_fps()
+            total_frames = len(vr)
+            init_resolution = (vr[0].shape[1], vr[0].shape[0])
+            
+        except Exception as e:
+            logger.warning(f"[WARN] Decord 初始化失败: {e}。开始降级使用 imageio 解析基础信息。{sample_data}")
+            reader_state["backend"] = "imageio"
+            vr = None
+            try:
+                # 如果 Decord 炸了，降级尝试用 av 和 imageio 获取视频元信息
+                with av.open(video_file) as container:
+                    stream = container.streams.video[0]
+                    fps = float(stream.average_rate) if stream.average_rate else 24.0
+                    
+                    # 取第一帧来确定绝对真实的分辨率
+                    video_iter = iio.imiter(video_file, plugin="pyav", thread_count=1)
+                    first_frame = next(video_iter)
+                    init_resolution = (first_frame.shape[1], first_frame.shape[0])
+                    if hasattr(video_iter, 'close'):
+                        video_iter.close()
+                    
+                    # 获取总帧数
+                    if stream.frames and stream.frames > 0:
+                        total_frames = stream.frames
+                    else:
+                        duration = container.duration / 1_000_000.0 if container.duration else 0.0
+                        if duration == 0.0 and stream.duration:
+                            duration = stream.duration * float(stream.time_base)
+                        total_frames = int(duration * fps)
+                        
+                if total_frames <= 0 or fps <= 0:
+                    raise ValueError(f"无效的视频属性: fps={fps}, frames={total_frames}")
+                    
+            except Exception as e2:
+                # 连 imageio 都解析不出来，说明视频彻底损坏，放弃
+                logger.error(f"[ERROR] ImageIO 兜底解析失败，视频 {video_file} 彻底损坏: {e2} {sample_data}")
+                self._cleanup_shm(video_file)
+                return
+
+        safe_max_frame = max(0, total_frames - 5) 
+        
+        try:
+            # 分辨率计算
+            if self.data_args.sub_native_resolution:
+                input_resolution = init_resolution
+            else:
+                if init_resolution == (1280, 720):
+                    input_resolution = (self.model_args.mm_image_size[0], self.model_args.mm_image_size[1])
+                else:
+                    input_resolution = self.resize_to_max_side(init_resolution, self.model_args.mm_image_size[0])
+            
+            # 预估 Token (为了切分 Chunk 判断)
+            each_low_res_token, resized_resolution = self.calculate_video_each_frame_token(
+                height=input_resolution[1], width=input_resolution[0], merge_size=self.video_merge_size
+            )
+            each_high_res_token, _ = self.calculate_video_each_frame_token(
+                height=init_resolution[1], width=init_resolution[0], merge_size=self.video_merge_size
+            )
+            
+            if self.data_args.high_resolution_interval > 0.0:
+                denominator = self.data_args.high_resolution_interval * self.data_args.sample_fps
+                ratio = (init_resolution[0] * init_resolution[1]) / (input_resolution[0] * input_resolution[1])
+                numerator = self.data_args.high_resolution_interval * self.data_args.sample_fps - 2.0 + ratio * 2.0
+                each_res_token = int(each_low_res_token * numerator / denominator)
+
+            max_len = self.tokenizer.model_max_length
+            video_token_tensor = torch.tensor([VIDEO_TOKEN_INDEX], dtype=torch.long)
+            ignore_tensor = torch.tensor([IGNORE_INDEX], dtype=torch.long)
+            start_img_tensor = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_START_TOKEN)], dtype=torch.long)
+            end_img_tensor = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_END_TOKEN)], dtype=torch.long)
+
+            # ====== 状态维护 ======
+            tokens = [system_tokens]
+            labels = [torch.full((system_tokens.shape[0],), IGNORE_INDEX, dtype=torch.long)]
+            types = ["system"]  # 用于清理: system, vision_start, video, vision_end, text
+            video_segments = [None] # 只对 "video" 有效，保存 (resolution, frame_indices)
+
+            token_num = len(system_tokens)
+            text_token_num = len(system_tokens)
+            global_valid_image_count = 0
+            valid_text_count = 0 
+            minimum_image_token_num = getattr(self.data_args, 'minimum_image_token_num', 60)
+            cur_time = 0
+            for sub_idx, sub in enumerate(subtitle_list):
+                start_time = sub['start_time']
+                end_time = min(sub['end_time'], start_time + 10)
+                
+                # 动态 FPS 帧抽取
+                frame_indices = []
+                if not sub.get('ignore', False):
+                    sample_fps = 4 if (sub.get('fps4', False) or 'image_line' in sub) else self.data_args.sample_fps
+                    
+                    raw_times = []
+                    while cur_time < end_time:
+                        raw_times.append(cur_time)
+                        cur_time += 1.0 / sample_fps
+
+                    if getattr(self.data_args, 'compress_fps', True):
+                        last_kept_time = -float('inf')
+                        for t in raw_times:
+                            time_until_start = end_time - t
+                            req_interval = self._get_required_interval(time_until_start, sub.get('fps4', False))
+                            if (t >= last_kept_time + req_interval - 1e-9) or (sub.get('fps4', False) and t >= last_kept_time + req_interval - 0.03):
+                                frame_indices.append(min(int(t * fps), safe_max_frame))
+                                last_kept_time = t
+                    else:
+                        frame_indices = [min(int(t * fps), safe_max_frame) for t in raw_times]
+
+                    cur_gap_token_est = len(frame_indices) * each_res_token # 取中间保守估计
+                    
+                    if valid_text_count == 0 or cur_gap_token_est > max_len - self.data_args.max_subtitle_token_num:
+                        if len(frame_indices) > minimum_image_token_num:
+                            frame_indices = frame_indices[-minimum_image_token_num:]
+
+                # 分辨率交错判断并打包视频段
+                cur_tokens, cur_labels, cur_types, cur_segments = [], [], [], []
+                cur_token_num = 0
+
+                if frame_indices:
+                    groups = [] 
+                    current_group_res = None
+                    current_group_frames = []
+
+                    for idx in frame_indices:
+                        if not getattr(self.data_args, 'no_image', False):
+                            global_valid_image_count += 1
+                            # 还原交错逻辑
+                            if self.data_args.high_resolution_interval > 0.0:
+                                interval = int(self.data_args.high_resolution_interval * sample_fps)
+                                pattern = [0] * (interval - 2) + [1, 1]
+                                res_mode = pattern[(global_valid_image_count - 1) % len(pattern)]
+                                res = init_resolution if res_mode == 1 else resized_resolution
+                            else:
+                                res = resized_resolution
+
+                            if current_group_res is None: current_group_res = res
+                            if res != current_group_res:
+                                groups.append((current_group_res, current_group_frames))
+                                current_group_res = res
+                                current_group_frames = [idx]
+                            else:
+                                current_group_frames.append(idx)
+                    
+                    if current_group_frames:
+                        groups.append((current_group_res, current_group_frames))
+
+                    # 过滤空组
+                    valid_groups = []
+                    for res, f_indices in groups:
+                        if len(f_indices) % 2 != 0:
+                            f_indices.append(f_indices[-1]) # 补帧
+                        if f_indices:
+                            valid_groups.append((res, f_indices))
+
+                    if valid_groups:
+                        # 整个 subtitle 段落只加一次 start end
+                        if getattr(self.model_args, 'split_img_token', True) and not getattr(self.data_args, 'no_image', False):
+                            cur_tokens.append(start_img_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("vision_start")
+                            cur_segments.append(None)
+                            cur_token_num += 1
+
+                        # 中间变分辨率只追加 <video> token 占位符
+                        for res, f_indices in valid_groups:
+                            seg_tokens = len(f_indices) * (each_high_res_token if res == init_resolution else each_low_res_token)
+                            cur_tokens.append(video_token_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("video")
+                            cur_segments.append((res, f_indices))
+                            cur_token_num += seg_tokens
+
+                        if getattr(self.model_args, 'split_img_token', True) and not getattr(self.data_args, 'no_image', False):
+                            cur_tokens.append(end_img_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("vision_end")
+                            cur_segments.append(None)
+                            cur_token_num += 1
+
+                # 追加文本
+                sub_text = random.choice(sub['image_line']) if 'image_line' in sub else sub['text']
+                text_tensor = torch.tensor(self.tokenizer(sub_text)["input_ids"], dtype=torch.long)
+                
+                cur_tokens.append(text_tensor)
+                if sub.get('ignore', False):
+                    cur_labels.append(torch.full((text_tensor.shape[0],), IGNORE_INDEX, dtype=torch.long))
+                else:
+                    cur_labels.append(text_tensor)
+                cur_types.append("text")
+                cur_segments.append(None)
+                cur_token_num += len(text_tensor)
+
+                # 判断 Chunk 切分并清理过期 Token
+                if token_num + cur_token_num > max_len or sub_idx == len(subtitle_list) - 1:
+                    
+                    # 尝试构建 Chunk
+                    chunk = self._build_chunk(tokens, labels, types, video_segments, vr, video_file, reader_state)
+
+                    
+                    # 如果遇到无法处理的视频文件，构建失败，丢弃整个视频直接返回
+                    if chunk is None:
+                        logger.error(f"[Discard Video] Discarding whole session for sample_data {sample_data} video {video_file} due to extraction failure.")
+                        return  
+                    
+                    yield chunk
+                    del chunk
+                    
+                    # ========= 清理机制 =========
+                    valid_text_count = 0
+                    remove_indices = []
+                    for i in range(1, len(tokens)): # 保留 system_tokens (索引0)
+                        if types[i] in ["vision_start", "video", "vision_end"]:
+                            remove_indices.append(i)
+                        elif types[i] == "text":
+                            # 过去的文本不再计算 Loss，仅作为历史 Context
+                            labels[i] = labels[i] * 0 + IGNORE_INDEX
+                            # 超出最大历史长度则弹出
+                            if text_token_num > getattr(self.data_args, 'max_subtitle_token_num', 2048):
+                                remove_indices.append(i)
+                                text_token_num -= len(tokens[i])
+
+                    for i in reversed(remove_indices):
+                        tokens.pop(i)
+                        labels.pop(i)
+                        types.pop(i)
+                        video_segments.pop(i)
+                    token_num = text_token_num
+                    # =================================================
+
+                # 合并当前步
+                tokens.extend(cur_tokens)
+                labels.extend(cur_labels)
+                types.extend(cur_types)
+                video_segments.extend(cur_segments)
+                token_num += cur_token_num
+                text_token_num += len(text_tensor)
+                valid_text_count += len(text_tensor)
+                
+        except Exception as e:
+            logger.error(f"Error processing sample_data {sample_data} video {video_file}:  {e}")
+            return
+        finally:
+            # 统一关闭清理
+            if vr is not None:
+                del vr
+            if reader_state["video_iter"] is not None:
+                try:
+                    reader_state["video_iter"].close()
+                    del reader_state["video_iter"]
+                except Exception:
+                    pass
+            self._cleanup_shm(video_file)
+            import gc
+            gc.collect()
+
+    def _build_chunk(self, tokens: List[torch.Tensor], labels: List[torch.Tensor], types: List[str], video_segments: List[Any], vr, video_file: str, reader_state: Dict) -> Optional[OmniSample]:
+        """将积累的视频帧和 Tokens 打包成 Qwen2.5-VL 需要的格式"""
+        from PIL import Image
+        video_clips = []
+
+        for seg in video_segments:
+            if seg is not None:
+                res, f_indices = seg
+                pil_frames = []
+                
+                # 尝试用 decord 
+                if reader_state["backend"] == "decord" and vr is not None:
+                    try:
+                        frames_np = vr.get_batch(f_indices).asnumpy()
+                        pil_frames = [Image.fromarray(img).convert("RGB").resize(res, Image.Resampling.BICUBIC) for img in frames_np]
+                    except Exception as e:
+                        logger.warning(f"[WARN] Decord 失败，全局切换到 imageio: {e}")
+                        reader_state["backend"] = "imageio"
+                
+                # decord失败或全局已经是imageio，执行流式兜底提取
+                if reader_state["backend"] == "imageio":
+                    if reader_state["video_iter"] is None:
+                        reader_state["video_iter"] = iio.imiter(video_file, plugin="pyav", thread_count=1)
+                        reader_state["current_idx"] = -1
+                        reader_state["last_frame_array"] = None
+
+                    v_iter = reader_state["video_iter"]
+
+                    for target in f_indices:
+                        frame_found = False
+                        
+                        # 目标帧就是刚读过的上一帧（即重复帧），直接复用
+                        if target == reader_state["current_idx"] and reader_state["last_frame_array"] is not None:
+                            # 拿原始数组重新按照当前要求的 res 缩放 (应对跨段落分辨率不同的情况)
+                            img_pil = Image.fromarray(reader_state["last_frame_array"]).convert("RGB").resize(res, Image.Resampling.BICUBIC)
+                            pil_frames.append(img_pil)
+                            continue
+                            
+                        # 发生回退乱序（你确认不会发生，防范性 break）
+                        if target < reader_state["current_idx"]:
+                            break
+                            
+                        # 目标帧在后面，正常向后遍历直到追上 target
+                        while reader_state["current_idx"] < target:
+                            try:
+                                image_array = next(v_iter)
+                                reader_state["current_idx"] += 1
+                                
+                                if reader_state["current_idx"] % 20 == 0:
+                                    time.sleep(0.001)
+                                
+                                # 追上目标帧了
+                                if reader_state["current_idx"] == target:
+                                    reader_state["last_frame_array"] = image_array # 留个底，以备下一个是重复帧
+                                    img_pil = Image.fromarray(image_array).convert("RGB").resize(res, Image.Resampling.BICUBIC)
+                                    pil_frames.append(img_pil)
+                                    frame_found = True
+                                    break
+                            except StopIteration:
+                                break # 视频读完了提前 EOF
+                        
+                        # 如果没找到（比如 EOF 或者遇到乱序），直接放弃当前段落
+                        if not frame_found:
+                            break
+
+                # 校验：如果抽取出来的数量和要求的数量对不上，说明 EOF 或损坏
+                if len(pil_frames) < len(f_indices):
+                    logger.error(f"[Discard Segment] Expected {len(f_indices)} frames but got only {len(pil_frames)}. Marking whole video as failed.")
+                    return None
+                
+                video_clips.append(pil_frames)
+
+        pixel_values_videos = None
+        video_grid_thw = None
+        # Qwen2.5-VL 特征处理
+        if video_clips:
+            inputs = self.process_image_videos(video=video_clips, merge_size=self.video_merge_size)
+            pixel_values_videos = inputs["pixel_values_videos"]
+            video_grid_thw = inputs["video_grid_thw"]
+            
+            del video_clips
+            del inputs
+
+
+        # Token 拼接与展开
+        flat_tokens = torch.cat(tokens, dim=0).tolist()
+        flat_labels = torch.cat(labels, dim=0).tolist()
+
+        cur_input_ids, cur_labels, token_counts = self._expand_multimodal_tokens(
+            input_ids=flat_tokens, 
+            labels=flat_labels, 
+            image_thw=None, 
+            video_thw=video_grid_thw, 
+            audio_feature_len=[]
+        )
+
+        return OmniSample(
+            input_ids=cur_input_ids,
+            labels=cur_labels,
+            caption_len=len(cur_input_ids),
+            pixel_values_video=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            attention_mask_len=[len(cur_input_ids)],
+            token_counts=token_counts,
+        )
 
