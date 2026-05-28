@@ -20,6 +20,7 @@ from torch.multiprocessing import Lock, Manager
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import transformers
+from typing import Iterator
 
 try:
     from aoss_client.client import Client as CephClient
@@ -37,7 +38,7 @@ from veomni.utils.constants import (
     REMOTE_SERVER_PORT
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
-from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample
+from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, LongVideoProcessor
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils import helper
 
@@ -238,6 +239,23 @@ class OmniDataloader(BaseDataLoader):
             preprocess_workers=getattr(self.data_args, "preprocess_workers", 2),
         )
         self.processor.init_image_processor()
+        
+        # 实例化长视频字幕的 Processor
+        self.long_video_processor = LongVideoProcessor(
+            tokenizer=self.tokenizer,
+            model_args=self.model_args,
+            data_args=self.data_args,
+            training_args=self.training_args,
+            ceph_client=self.ceph_client,
+            bos_client=self.bos_client,
+            rank=self.rank,
+            build_inputs_token_fn=self.build_inputs_token,
+            preprocess_workers=getattr(self.data_args, "preprocess_workers", 2),
+        )
+        # 共享底层的 vision_processor 和 threadpool 防止显存/内存 OOM
+        self.long_video_processor.image_processor = self.processor.image_processor
+        self.long_video_processor.image_config = getattr(self.processor, "image_config", None)
+        self.long_video_processor._threadpool = self.processor._threadpool
     
     def state_dict(self) -> Dict:
  
@@ -376,6 +394,7 @@ class OmniDataloader(BaseDataLoader):
         while os.getppid() == ppid and not self.workers_done_event.is_set():
             if self.result_queue.qsize() > 4:
                 time.sleep(1)
+                gc.collect()
                 continue
 
             if self.training_args.remote_dataloader:
@@ -432,8 +451,18 @@ class OmniDataloader(BaseDataLoader):
                     continue
 
             if isinstance(sample_data, dict):
-                
                 self.worker_loop_finetune(sample_data, sample_index)
+                
+            elif isinstance(sample_data, list):
+                # Susbtitle List 格式：[video_path, subtitle_path, (可选的 system_prompt)]
+                formatted_data = {
+                    "video": sample_data[0],
+                    "subtitle_path": sample_data[1]
+                }
+                if len(sample_data) > 2:
+                    formatted_data["system_prompt"] = sample_data[2]
+                
+                self.worker_loop_finetune(formatted_data, sample_index, is_long_video=True)
             else:
                 raise NotImplementedError("Unsupported sample_data format.")
             
@@ -594,15 +623,31 @@ class OmniDataloader(BaseDataLoader):
     
     # ------------------------------------------------------------------
     # Finetune worker: dispatch + batch packing
-    # ------------------------------------------------------------------
-    def worker_loop_finetune(self, sample_data: Dict, sample_idx: int) -> None:
-       
-        sample: Optional[OmniSample] = self.processor.process(sample_data, sample_idx)
-        if sample is None:
+    # ------------------------------------------------------------------    
+    def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False) -> None:        
+        # 根据标记选择处理器
+        processor = self.long_video_processor if is_long_video else self.processor
+        
+        samples = processor.process(sample_data, sample_idx)
+        if samples is None:
             return
-      
+            
+        # 兼容单样本(短数据)和迭代器(长视频数据)两种返回格式
+        if isinstance(samples, Iterator):
+            try:
+                for sample in samples:
+                    if sample is None:
+                        continue
+                    self._process_single_sample(sample_data, sample, processor)
+            finally:
+                if hasattr(samples, 'close'):
+                    samples.close()
+        else:
+            self._process_single_sample(sample_data, samples, processor)
+
+    def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any) -> None:
         if getattr(self.data_args, "save_token_counted_data", False):
-            system_token = self.processor._build_system_token(sample_data)
+            system_token = processor._build_system_token(sample_data, 0)
             self._save_token_counts(
                 sample_data, system_token, sample.token_counts, sample.caption_len
             )
@@ -1051,25 +1096,38 @@ if __name__ == "__main__":
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    data_args.max_seq_len = 8192
-    training_args.model_max_length = 8192
+    data_args.max_seq_len = 4096
+    training_args.model_max_length = 4096
     training_args.num_train_epochs = 1
     model_args.model_path = "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
     model_args.vision_tower = "/mnt/afs/share/qwen25_vl_encoder"
     data_args.eval_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_audio_text_ocr_eval.json"
     
-    data_args.dataloader_num_workers = 4
-    model_args.mm_downsample_ratio = 4
+    training_args.dataloader_num_workers = 0
+    model_args.mm_downsample_ratio = 16
     model_args.model_arc = "qwen2"
     training_args.per_device_train_batch_size = 1
-    training_args.remote_dataloader = True
-    data_args.offset_file_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/offsets.npy"
-    data_args.file_maping_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/file_mapping.json"
+    
+    # subtitle
+    data_args.sample_fps = 1
+    data_args.compress_fps = True
+    data_args.high_resolution_interval = 4
+    data_args.max_subtitle_token_num = 2048
+    data_args.minimum_image_token_num = 60
+    model_args.mm_image_size = [644, 364]
+    
+    # training_args.remote_dataloader = True
+    # data_args.offset_file_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/offsets.npy"
+    # data_args.file_maping_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/file_mapping.json"
+    data_args.train_path = "/mnt/afs/jiayi/code/LLaVA_hub/scripts/test_json/test_sub.jsonl"
+    # data_args.file_maping_path = "/mnt/afs/jiayi/code/LLaVA_hub/scripts/test_json/test_sub.jsonl"
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16",
         model_max_length=training_args.model_max_length,
         use_fast=True,
     )
+    
+    
 
     dataloader = get_train_dataloader(
         tokenizer=tokenizer,
@@ -1086,11 +1144,22 @@ if __name__ == "__main__":
     print("launched the dataloader!!!")
     t1 = time.time()
     for i, data in enumerate(dataloader):
-        print(i, len(data["input_ids"][0]), data["cu_seq_lens_q"][-1] )
-        assert len(data["input_ids"][0]) == data["cu_seq_lens_q"][-1]
-        print("#############")
+        print("rank", rank)
+        # print(i, len(data["input_ids"][0]), data["cu_seq_lens_q"][-1] )
+        # assert len(data["input_ids"][0]) == data["cu_seq_lens_q"][-1]
+        # print("#############")
         
-        if rank == 0:
-            pbar.set_postfix({"time": f"{time.time() - t1:.2f}s"})
-            pbar.update(1)
-        t1 = time.time()
+        # if rank == 0:
+        #     pbar.set_postfix({"time": f"{time.time() - t1:.2f}s"})
+        #     pbar.update(1)
+        # t1 = time.time()
+        
+        input_ids = data["input_ids"]
+        print("input_ids", input_ids)
+        input_ids[input_ids == 151656] = 15
+        # input_ids[input_ids == -300] = 15
+        
+        print("#"*20)
+        print(tokenizer.decode(input_ids.cpu().view(-1).tolist()))
+        print("#"*20)
+        

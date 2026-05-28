@@ -164,3 +164,8 @@ nsysoutput/
 
 # for personal specific claude instructions.
 .claude/CLAUDE.md
+
+configs/
+*.sh
+train_sh/
+ckpt/
