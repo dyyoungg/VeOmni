@@ -157,7 +157,7 @@ def build_qwen3moe_omni_from_pretrained(
     moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
-    freeze_except_projectors: bool = True,
+    freeze_except_projectors: bool = False,
 ) -> LlavaQwen3MoeForCausalLM:
     """
     Load a *composite* omni model directory created by `model.save_pretrained(...)`.
@@ -348,16 +348,4 @@ if __name__ == "__main__":
     vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
     save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
     merge_component_models(vision_path, save_directory)
-   
-
-    # from veomni.models.custom.llava_qwen3moe.modeling_llava_qwen3moe_omni import LlavaQwen3MoeForCausalLM
-
-    # model_path = "/mnt/afs/share/llava_qwen30B_A3B-veomni-down4"
-    # cfg = AutoConfig.from_pretrained(model_path)
-    # print(cfg)
-    # if cfg.model_type == "llavaqwen3moe_omni":
-    #     model = build_qwen3moe_omni_from_pretrained(
-    #         model_path,
-    #         init_device="cuda",
-    #         torch_dtype= "bfloat16",
-    #         moe_implementation="fused",)
+    
