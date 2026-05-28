@@ -164,3 +164,4 @@ nsysoutput/
 
 # for personal specific claude instructions.
 .claude/CLAUDE.md
+generate_offset.py
