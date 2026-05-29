@@ -110,6 +110,7 @@ class CheckpointerCallback(Callback):
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
+        helper.empty_cache()
         self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
 
         # Empty cache and barrier
