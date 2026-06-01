@@ -217,6 +217,9 @@ def build_qwen3moe_omni_from_components(
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
 
     foundation_cfg = AutoConfig.from_pretrained(foundation_config_path, trust_remote_code=True)
+    if getattr(foundation_cfg, "foundation_config", None) is not None:
+        foundation_cfg = foundation_cfg.foundation_config
+   
     output_size = int(getattr(foundation_cfg, "hidden_size"))
 
     _set_foundation_dtype_in_config(foundation_cfg, torch_dtype, )
@@ -314,6 +317,32 @@ def merge_component_models(vision_model_path, save_directory):
     print(f"Built omni model: {type(model)}")
     print(f"image_encoder: {type(model.image_encoder) if model.image_encoder is not None else None}")
     print(f"audio_encoder: {type(model.audio_encoder) if model.audio_encoder is not None else None}")
+
+    st1_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4/checkpoints/hf_ckpt"
+    explicit_weights_to_load = {}
+    import glob
+    from safetensors.torch import load_file
+
+        
+    weight_files = glob.glob(os.path.join(st1_path, "*.safetensors"))
+ 
+    lm_weight_prefixes = (
+        "model.layers.",
+        "model.embed_tokens.",
+        "model.norm.",
+        "lm_head."
+    )
+    for w_file in weight_files:
+        if w_file.endswith(".safetensors"):
+            state_dict = load_file(w_file)
+        else:
+            state_dict = torch.load(w_file, map_location="cpu")
+            
+        for key, tensor in state_dict.items():
+            if key.startswith(lm_weight_prefixes) or key.startswith("audio_encoder."):
+                explicit_weights_to_load[key] = tensor
+
+    
     special_tokens_dict = [DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_PAD_TOKEN]
     special_tokens_dict_map = {
         "additional_special_tokens": special_tokens_dict
@@ -329,6 +358,11 @@ def merge_component_models(vision_model_path, save_directory):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"total_params={total_params} trainable_params={trainable_params}")
     
+    if explicit_weights_to_load:
+        print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
+        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
+
+
     # save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down4"
     print(f"正在将组装好的模型保存至: {save_directory} ...")
    
@@ -345,7 +379,7 @@ def merge_component_models(vision_model_path, save_directory):
 
 
 if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
-    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
+    vision_path = "/mnt/afs/share/qwen25_vl_encoder"
+    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen25encoder_veomni-down16"
     merge_component_models(vision_path, save_directory)
     

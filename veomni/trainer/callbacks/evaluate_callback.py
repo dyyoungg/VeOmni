@@ -58,7 +58,7 @@ class EvaluateCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.eval_steps and (state.global_step % args.train.eval_steps==0 or state.global_step==1):
+        if args.train.eval_steps and (state.global_step % args.train.eval_steps==0 or (state.global_step==1 and args.train.eval_first)):
             self._evaluate(state)
     
     @property

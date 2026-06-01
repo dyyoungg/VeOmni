@@ -45,6 +45,8 @@ class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
     def __init__(self, config: BeeBeeAudioModelConfig):
         super().__init__(config)
         self.config = config
+        self.freeze_audio_encoder = False
+        self.freeze_audio_projector = False
         self.audio_projector = build_audio_projector(projector_type=config.audio_projector_type, 
                                                     encoder_hidden=config.d_model, 
                                                     out_hidden=config.output_size, 
@@ -56,9 +58,17 @@ class BeeBeeVLAudioModel(BaseEncoderModelMixin, WhisperEncoder):
        
     
     def lm_encode(self, features: torch.Tensor, feature_lengths: torch.Tensor, **kwargs) -> torch.Tensor:
-        hidden_state = super().forward(input_features=features, input_seq_lens=feature_lengths).last_hidden_state # [b, max_seq, hidden]
+        if self.freeze_audio_encoder:
+            with torch.no_grad():
+                hidden_state = super().forward(input_features=features, input_seq_lens=feature_lengths).last_hidden_state # [b, max_seq, hidden]
+        else:
+            hidden_state = super().forward(input_features=features, input_seq_lens=feature_lengths).last_hidden_state # [b, max_seq, hidden]
 
-        hidden_state, seq_len = self.audio_projector(hidden_state, feature_lengths)
+        if self.freeze_audio_projector:
+            with torch.no_grad():
+                hidden_state, seq_len = self.audio_projector(hidden_state, feature_lengths)
+        else:
+            hidden_state, seq_len = self.audio_projector(hidden_state, feature_lengths)
         return hidden_state, seq_len
 
 

@@ -330,7 +330,7 @@ class EnvironMeterCallback(Callback):
         # step_train_metrics["training/raw_loss"] = current_loss
      
         lrs = self.trainer.lr_scheduler.get_last_lr()
-        lr_llm = lrs[2]
+        lr_llm = lrs[-1]
         lr_vit = lrs[0]
         step_train_metrics["training/lr"] = lr_llm
         step_train_metrics["training/lr_vit"] = lr_vit
