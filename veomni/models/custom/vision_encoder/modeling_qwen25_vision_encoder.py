@@ -255,6 +255,8 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
                                                   out_hidden=config.output_size, 
                                                   downsample_ratio=self.config.image_downsample_size)
         self._encoder_data_balance: Optional[Qwen3VLEncoderDataBalance] = None
+        self.freeze_vit = False
+        self.freeze_image_projector = False
         use_encoder_data_balance = getattr(config, "encoder_data_balance", False)
         if use_encoder_data_balance:
             spatial_merge_unit = self._get_spatial_merge_unit(config)
@@ -298,7 +300,11 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
             balanced_pixels, balanced_thw = self._encoder_data_balance.balance_data(
                 features, grid_thw, data_type="image"
             )
-            raw_features = super().forward(balanced_pixels, balanced_thw)
+            if self.freeze_vit:
+                with torch.no_grad():
+                    raw_features = super().forward(balanced_pixels, balanced_thw)
+            else:
+                raw_features = super().forward(balanced_pixels, balanced_thw)
             features, _ = self._encoder_data_balance.data_bridge(
                 hidden_state=raw_features,
                 deepstack_feature_lists=[],
@@ -306,9 +312,17 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
                 data_type="image",
             )
         else:
-            features = super().forward(features, grid_thw)
-       
-        features, seq_len = self.mm_projector(features, grid_thw)
+            if self.freeze_vit:
+                with torch.no_grad():
+                    features = super().forward(features, grid_thw)
+            else:
+                features = super().forward(features, grid_thw)
+
+        if self.freeze_image_projector:
+            with torch.no_grad():
+                features, seq_len = self.mm_projector(features, grid_thw)
+        else:
+            features, seq_len = self.mm_projector(features, grid_thw)
         return features, seq_len
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:

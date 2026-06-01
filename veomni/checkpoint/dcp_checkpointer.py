@@ -27,6 +27,7 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -410,6 +411,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
+            planner=DefaultLoadPlanner(allow_partial_load=True),
         )
         # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
 

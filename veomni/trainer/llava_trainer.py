@@ -118,7 +118,7 @@ class VLMTrainingArguments(TrainingArguments):
     router_aux_loss_coef: float = field(default=0.001)
     output_router_logits: bool = field(default=True)
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
-
+    eval_first: bool = field(default=True)
 
 @dataclass
 class VLMMDataArguments(DataArguments):
@@ -314,18 +314,22 @@ class VLMTrainer:
         if model_config.model_type in ("llavaqwen3moe_omni","llavaqwen2_omni"):
             if args.train.freeze_vit:
                 self.model.image_encoder.requires_grad_(False)
+                self.model.image_encoder.freeze_vit = True
                 self.model.image_encoder.mm_projector.requires_grad_(True)
            
             if args.train.freeze_audio_tower:
                 self.model.audio_encoder.requires_grad_(False)
+                self.model.audio_encoder.freeze_audio_encoder = True
                 self.model.audio_encoder.audio_projector.requires_grad_(True)
             
             if args.train.freeze_vit_projector:
                 self.model.image_encoder.mm_projector.requires_grad_(False)
+                self.model.image_encoder.freeze_image_projector = True
 
             if args.train.freeze_audio_projector:
                 self.model.audio_encoder.audio_projector.requires_grad_(False)
-
+                self.model.audio_encoder.freeze_audio_projector = True
+                
             if args.train.freeze_llm:
                 self.model.model.requires_grad_(False)
                 self.model.lm_head.requires_grad_(False)
@@ -399,6 +403,9 @@ class VLMTrainer:
             {"params": audio_params, "lr": args.train.vit_lr},
             {"params": llm_params, "lr": args.train.optimizer.lr},
         ]
+        print("vit params", param_groups[0]["params"])
+
+        print("llm params", param_groups[-1]["params"])
 
         # Build optimizer
         self.optimizer = build_optimizer(
