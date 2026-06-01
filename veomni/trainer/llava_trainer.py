@@ -329,7 +329,7 @@ class VLMTrainer:
             if args.train.freeze_audio_projector:
                 self.model.audio_encoder.audio_projector.requires_grad_(False)
                 self.model.audio_encoder.freeze_audio_projector = True
-                
+
             if args.train.freeze_llm:
                 self.model.model.requires_grad_(False)
                 self.model.lm_head.requires_grad_(False)
@@ -403,10 +403,7 @@ class VLMTrainer:
             {"params": audio_params, "lr": args.train.vit_lr},
             {"params": llm_params, "lr": args.train.optimizer.lr},
         ]
-        print("vit params", param_groups[0]["params"])
-
-        print("llm params", param_groups[-1]["params"])
-
+  
         # Build optimizer
         self.optimizer = build_optimizer(
             self.model,
