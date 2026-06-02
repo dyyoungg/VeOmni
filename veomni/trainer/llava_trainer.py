@@ -303,7 +303,8 @@ class VLMTrainer:
         if self.model_config.model_type == "llavaqwen3moe_omni":
             self.model.config.output_router_logits = self.args.train.output_router_logits
             self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
-            
+        self.model_config.freeze_vit = self.args.train.freeze_vit
+        self.model_config.freeze_audio = self.args.train.freeze_audio_tower
         self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
         self.model.config.encoder_data_balance_sorting_algo = self.args.model.encoder_data_balance_sorting_algo
 

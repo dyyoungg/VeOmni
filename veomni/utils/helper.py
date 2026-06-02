@@ -220,10 +220,15 @@ class EnvironMeter:
     def step(self, delta_time: float, global_step: int, worker_metrics_queue=None) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0 or len(self.audio_seqlens) > 0:
             flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens, audio_seqlens=self.audio_seqlens
+                self.batch_seqlens, delta_time, 
+                images_seqlens=self.images_seqlens, 
+                audio_seqlens=self.audio_seqlens,
+                freeze_vit=self.config.freeze_vit,
+                freeze_audio=self.config.freeze_audio
             )
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
+            
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
