@@ -415,6 +415,8 @@ class VeomniFlopsCounter:
     
     def _estimate_llavaqwen2_omni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         llm_config = getattr(self.config, "foundation_config", self.config)
+        freeze_vit = kwargs.get("freeze_vit", True)
+        freeze_audio = kwargs.get("freeze_audio", True)
         hidden_size = llm_config.hidden_size
         vocab_size = llm_config.vocab_size
         num_hidden_layers = llm_config.num_hidden_layers
@@ -451,6 +453,8 @@ class VeomniFlopsCounter:
                     vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, image_config)
                 else:
                     vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+                vit_flops = vit_flops * (2.0 / 6.0) if freeze_vit else vit_flops
+                
             else:
                 vit_flops = 0
         else:
@@ -464,6 +468,8 @@ class VeomniFlopsCounter:
                 audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
             else:
                 audio_flops = 0
+            audio_flops = audio_flops * (2.0 / 6.0) if freeze_audio else audio_flops
+
         else:
             audio_flops = 0
 
@@ -473,13 +479,14 @@ class VeomniFlopsCounter:
     
     def _estimate_llavaqwen3moeOmni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         llm_config = getattr(self.config, "foundation_config", self.config)
-
+        freeze_vit = kwargs.get("freeze_vit", True)
+        freeze_audio = kwargs.get("freeze_audio", True)
         hidden_size = llm_config.hidden_size
         vocab_size = llm_config.vocab_size
         num_hidden_layers = llm_config.num_hidden_layers
         num_key_value_heads = llm_config.num_key_value_heads
         num_attention_heads = llm_config.num_attention_heads
-        intermediate_size = llm_config.intermediate_size
+        moe_intermediate_size = llm_config.moe_intermediate_size
         # MoE 相关
         num_experts = getattr(llm_config, "num_experts", 1)
         num_experts_per_tok = getattr(llm_config, "num_experts_per_tok", 1)
@@ -498,7 +505,7 @@ class VeomniFlopsCounter:
 
         # MoE FFN：只有被激活的 expert 参与计算
         # 每个 token 激活 num_experts_per_tok 个 expert
-        moe_ffn_N_per_token = hidden_size * intermediate_size * 3 * num_experts_per_tok
+        moe_ffn_N_per_token = hidden_size * moe_intermediate_size * 3 * num_experts_per_tok
         # shared expert 每个 token 都要过
         shared_ffn_N = hidden_size * shared_expert_intermediate_size * 3 if shared_expert_intermediate_size > 0 else 0
 
@@ -530,6 +537,9 @@ class VeomniFlopsCounter:
                     vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
             else:
                 vit_flops = 0
+            
+            vit_flops = vit_flops * (2.0 / 6.0) if freeze_vit else vit_flops
+
         else:
             vit_flops = 0
 
@@ -541,6 +551,9 @@ class VeomniFlopsCounter:
                 audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
             else:
                 audio_flops = 0
+            
+            audio_flops = audio_flops * (2.0 / 6.0) if freeze_audio else audio_flops
+
         else:
             audio_flops = 0
 
