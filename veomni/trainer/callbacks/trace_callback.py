@@ -334,7 +334,7 @@ class EnvironMeterCallback(Callback):
         lr_vit = lrs[0]
         step_train_metrics["training/lr"] = lr_llm
         step_train_metrics["training/lr_vit"] = lr_vit
-        
+        step_train_metrics["mfu"] = step_env_metrics.get('system_metric/mfu', 0)
         step_env_metrics.update(step_train_metrics)
 
         self.trainer.step_train_metrics = step_train_metrics
@@ -435,6 +435,8 @@ class VideoTqdmCallback(Callback):
                 return f"{k.split('/', 1)[-1]}: {v:.3e}"   # lr 用科学计数法
             elif "iter_time" in k:
                 return f"{k.split('/', 1)[-1]}: {v:.2f}"
+            elif "mfu" in k:
+                return f"{k.split('/', 1)[-1]}: {v:.3f}"
             else:
                 return f"{k.split('/', 1)[-1]}: {v:.4f}"
             

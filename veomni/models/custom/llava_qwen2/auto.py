@@ -278,12 +278,12 @@ def build_qwen25_omni_from_components(
 def merge_component_models(vision_model_path, save_directory, load_mm_projector=True):
    
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
-    language_model_path = "/mnt/afs/share/Qwen2.5-32B-Instruct"
+    language_model_path = "/mnt/afs/share/Qwen25-14B-Instruct"
     whisper_audio_encoder_path = "/mnt/afs/share/Kimi-Audio-7B-Instruct/whisper-large-v3"
     processor = AutoProcessor.from_pretrained(vision_model_path)
     print("正在加载语言模型的 Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20251229_continue_game_sub_audio_asr_curriculum_fps1_ocr_vqa_accu1_lr2e5", 
+        "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436", 
         padding_side="right", 
         use_fast=False
     )
@@ -321,7 +321,7 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
     vision_prefix = ("model.vision_tower.vision_tower.", )
     explicit_weights_to_load = {}
     if load_mm_projector:
-        language_model_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260504_stage6_32B"
+        language_model_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436"
         print("正在迁移原模型 mm_projector 权重...")
         embed_weights_num = 0
         projector_key_mapping = {
@@ -433,7 +433,7 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
 
 if __name__ == "__main__":
     vision_path = "/mnt/afs/share/qwen25_vl_encoder"
-    save_directory =  "/mnt/afs/share/20260504_stage6_32B"
+    save_directory =  "/mnt/afs/share/20260324_beebee_memory_14B"
     merge_component_models(vision_path, save_directory, load_mm_projector=True)
 
    
