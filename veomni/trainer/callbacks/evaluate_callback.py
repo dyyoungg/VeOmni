@@ -134,19 +134,6 @@ class EvaluateCallback(Callback):
 
         rank = self._rank
     
-        # if "cu_seq_lens_q" in data:
-        #     q = data["cu_seq_lens_q"]
-        #     k_ = data.get("cu_seq_lens_k", q)
-        #     logger.info(f"[EvalDebug] cu_seqlens_q  = {q.tolist()}")
-        #     logger.info(f"[EvalDebug] max_seqlen_q  = {data.get('max_length_q')}")
-        #     if "input_ids" in data:
-        #         logger.info(f"[EvalDebug] input_ids total tokens = {data['input_ids'].shape}")
-        #     
-        #     actual_tokens = data["input_ids"].shape[-1]
-        #     assert q[-1].item() == actual_tokens, (
-        #         f"cu_seqlens_q[-1]={q[-1].item()} != actual_tokens={actual_tokens}"
-        #     )
-        
         output = model(**data)
        
         raw_target = data["labels"][0, -1].item()
@@ -167,7 +154,7 @@ class EvaluateCallback(Callback):
         try:
             opt_logits = output["logits"][0, -2, option_indices[:options_num]]
             opt_probs  = torch.softmax(opt_logits, dim=-1)
- 
+            pred_idx = opt_logits.argmax().item()  # 获取模型选择的索引
             acc  = opt_logits.argmax() == target_idx
             prob = opt_probs[target_idx]
  
@@ -178,7 +165,7 @@ class EvaluateCallback(Callback):
             all_prob   = all_probs[raw_target]
 
            
-            return acc, prob, all_acc, all_prob
+            return acc, prob, all_acc, all_prob, pred_idx, target_idx
  
         except Exception as exc:
             logger.warning(f"[Eval MCQ] Batch failed: {exc}")
@@ -343,7 +330,7 @@ class EvaluateCallback(Callback):
  
         hypothesis = tokenizer.decode(output_ids, skip_special_tokens=True)
         metric     = _score(gt_str, hypothesis, language)
-        return metric, gen_device or device
+        return metric, gen_device or device, hypothesis
 
     def _evaluate(self, state: TrainerState) -> None:
         args   = self.trainer.args
@@ -367,6 +354,7 @@ class EvaluateCallback(Callback):
         all_prob_results:  list = []
         all_acc_results:   list = []
         category_acc: dict      = defaultdict(list)
+        local_predictions: list = []
  
         model.eval()
  
@@ -374,7 +362,8 @@ class EvaluateCallback(Callback):
             for idx, data in enumerate(eval_dl):
                 if rank==0 and idx % 2 == 0:
                     logger.info(f"[Eval] rank: {rank} step={state.global_step}  idx={idx}")
-
+                
+                raw_data = data.pop("raw_data", None)[0]
                 # ── device transfer ───────────────────────────────────────
                 bf16_keys = {"images", "pixel_values", "pixel_values_videos", "audio_features"}
                 for k, v in data.items():
@@ -383,14 +372,16 @@ class EvaluateCallback(Callback):
                         data[k]   = v.to(device=device, dtype=tgt_dtype)
  
                 category: str = data.pop("category")[0]
-                
+                pred_record = raw_data.copy()
                 # ── dispatch to eval mode ─────────────────────────────────
                 if category in ASR_CATEGORIES:
                     # generation-based: MAX_GEN forwards per sample
-                    metric, _ = self._eval_asr_batch(model, data)
+                    metric, _, hypothesis= self._eval_asr_batch(model, data)
                     category_acc[category].append(
                         torch.tensor(metric, dtype=torch.float, device=device)
                     )
+                    pred_record["prediction"] = hypothesis
+                    pred_record["metric"] = metric
  
                 else:
                     # MCQ: 1 forward per sample
@@ -398,7 +389,7 @@ class EvaluateCallback(Callback):
                         model, data, id_dict1, indices1, id_dict2, indices2,
                     )
                     if result is not None:
-                        acc, prob, all_acc, all_prob = result
+                        acc, prob, all_acc, all_prob, pred_idx, target_idx= result
                         acc_results.append(acc)
                         prob_results.append(prob)
                         all_acc_results.append(all_acc)
@@ -407,9 +398,32 @@ class EvaluateCallback(Callback):
                         if "wukong" in category:
                             category_acc["wukong"].append(acc)
  
-        
+                        pred_record["prediction"] = chr(ord('A') + pred_idx)
+                        pred_record["ground_truth"] = chr(ord('A') + target_idx)
+                        pred_record["is_correct"] = acc.item() if isinstance(acc, torch.Tensor) else acc
+                
+                if getattr(self.trainer.args, "save_predictions", True):
+                    local_predictions.append(pred_record)
+
         if dist.is_initialized():
             dist.barrier()
+
+        if getattr(self.trainer.args, "save_predictions", True):
+            if dist.is_initialized():
+                gather_list = [None] * dist.get_world_size()
+                dist.all_gather_object(gather_list, local_predictions)
+                if rank == 0:
+                    all_predictions = [item for sublist in gather_list for item in sublist]
+            else:
+                all_predictions = local_predictions
+ 
+            if rank == 0:
+                out_dir = args.train.checkpoint.output_dir
+                os.makedirs(out_dir, exist_ok=True)
+                pred_file = os.path.join(out_dir, f"eval_predictions_step{state.global_step}.json")
+                with open(pred_file, "w", encoding="utf-8") as f:
+                    json.dump(all_predictions, f, ensure_ascii=False, indent=4)
+                logger.info(f"[Eval] Saved consolidated predictions to {pred_file}")
  
         # ── aggregate across ranks ────────────────────────────────────────
         evaluate_logs: dict = {}

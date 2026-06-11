@@ -278,12 +278,12 @@ def build_qwen25_omni_from_components(
 def merge_component_models(vision_model_path, save_directory, load_mm_projector=True):
    
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
-    language_model_path = "/mnt/afs/share/Qwen25-14B-Instruct"
+    language_model_path = "/mnt/afs/share/Qwen2.5-32B-Instruct"
     whisper_audio_encoder_path = "/mnt/afs/share/Kimi-Audio-7B-Instruct/whisper-large-v3"
     processor = AutoProcessor.from_pretrained(vision_model_path)
     print("正在加载语言模型的 Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        language_model_path, 
+        "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20251229_continue_game_sub_audio_asr_curriculum_fps1_ocr_vqa_accu1_lr2e5", 
         padding_side="right", 
         use_fast=False
     )
@@ -319,10 +319,11 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
         "lm_head."
     )
     vision_prefix = ("model.vision_tower.vision_tower.", )
+    explicit_weights_to_load = {}
     if load_mm_projector:
-        language_model_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/checkpoints/omni_models/0728_llava_omni_qwen25vl_14B_16x_4k_st2_kimiwhisper_10x_unfreezeaudio_omnidata_text500w_lr2e-6"
+        language_model_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260504_stage6_32B"
         print("正在迁移原模型 mm_projector 权重...")
-
+        embed_weights_num = 0
         projector_key_mapping = {
             "model.mm_projector.mlp.0.bias": "image_encoder.mm_projector.mlp.0.bias",
             "model.mm_projector.mlp.0.weight": "image_encoder.mm_projector.mlp.0.weight",
@@ -331,7 +332,7 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
             "model.vision_tower.vision_tower.": "image_encoder."
         }
     
-        explicit_weights_to_load = {}
+        
         
         weight_files = glob.glob(os.path.join(language_model_path, "*.safetensors"))
         if not weight_files:
@@ -352,22 +353,24 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
                 
 
                 elif key.startswith(lm_weight_prefixes):
+                    if key.startswith("model.embed_tokens."):
+                        embed_weights_num = tensor.shape[0]
                     explicit_weights_to_load[key] = tensor
 
                 elif key.startswith(vision_prefix):
                     new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
                     explicit_weights_to_load[new_key] = tensor
 
-        if explicit_weights_to_load:
-            print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
-            missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
-            print("语言模型主干及 mm_projector 权重显式加载成功！")
-        else:
-            print("警告: 未从指定路径中提取到任何匹配的权重，请确认权重文件内的 Key 是否正确。")
-        # ----------------------------------------------------------------------------------------
-    
+                elif key.startswith("model.audio_encoder."):
+                    new_key = key.replace("model.audio_encoder.", "audio_encoder.")
+                    explicit_weights_to_load[new_key] = tensor
+                
+                elif key.startswith("model.audio_projector."):
+                    new_key = key.replace("model.audio_projector.", "audio_encoder.audio_projector.")
+                    explicit_weights_to_load[new_key] = tensor
+
     special_tokens_dict_map = {
-        "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN, DEFAULT_AUDIO_START_TOKEN,DEFAULT_AUDIO_END_TOKEN]
+        "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN]
     }
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict_map)
     audio_token_id = tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_PAD_TOKEN)
@@ -378,6 +381,34 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
     
     print(f"Tokenizer 新增了 {num_new_tokens} 个 token，当前词表总大小: {len(tokenizer)}")
     # `meta` model should still have parameter shapes; this is a quick sanity check.
+
+    if explicit_weights_to_load:
+        for key in ["model.embed_tokens.weight", "lm_head.weight"]:
+            if key in explicit_weights_to_load:
+                # 提取你训练好的 Checkpoint 权重，尺寸为 (151667, 5120)
+                ckpt_tensor = explicit_weights_to_load[key] 
+                
+                # 获取当前模型 resize 后的权重（作为底板），尺寸为 (152064, 5120)
+                if "embed_tokens" in key:
+                    base_tensor = model.model.embed_tokens.weight.data.clone()
+                else:
+                    base_tensor = model.lm_head.weight.data.clone()
+                
+                ckpt_vocab_size = ckpt_tensor.shape[0]
+                model_vocab_size = base_tensor.shape[0]
+                
+                if ckpt_vocab_size != model_vocab_size:
+                    print(f"正在对齐 {key}: 以训练权重({ckpt_vocab_size})为准，Copy 至当前模型({model_vocab_size})")
+                    
+                    base_tensor[:ckpt_vocab_size, :] = ckpt_tensor
+             
+                    explicit_weights_to_load[key] = base_tensor
+
+    # 3. 正常执行加载
+    if explicit_weights_to_load:
+        print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
+        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
+        print("语言模型主干及 mm_projector 权重显式加载成功！")
    
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -393,7 +424,7 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
     model.save_pretrained(
         save_directory, 
         safe_serialization=True, # 推荐使用 safetensors 格式，加载更快且更安全
-        max_shard_size="5GB"     # 因为 30B 模型很大，建议分块保存
+        max_shard_size="8GB"     # 因为 30B 模型很大，建议分块保存
     )
     tokenizer.save_pretrained(save_directory)
     print("模型保存完成！")
@@ -402,7 +433,7 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
 
 if __name__ == "__main__":
     vision_path = "/mnt/afs/share/qwen25_vl_encoder"
-    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen25encoder-st4-veomni-down16"
-    merge_component_models(vision_path, save_directory)
+    save_directory =  "/mnt/afs/share/20260504_stage6_32B"
+    merge_component_models(vision_path, save_directory, load_mm_projector=True)
 
-    
+   

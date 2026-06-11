@@ -88,7 +88,11 @@ class VLMTrainingArguments(TrainingArguments):
     freeze_audio_tower: bool = field(default=False, metadata={"help": "Whether or not to freeze the audio tower parameters."})
     freeze_audio_projector: bool = field(default=False, metadata={"help": "Whether or not to freeze the audio tower parameters."})
     freeze_llm: bool = field(default=False, metadata={"help": "Whether or not to freeze the llm parameters."})
-    
+    freeze_router: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to freeze the MoE router (gate) parameters, keeping the pretrained routing fixed while experts/attention still train."},
+    )
+
     vit_lr: float = field(
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
@@ -119,6 +123,7 @@ class VLMTrainingArguments(TrainingArguments):
     output_router_logits: bool = field(default=True)
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
     eval_first: bool = field(default=True)
+    save_predictions: bool = field(default=True)
 
 @dataclass
 class VLMMDataArguments(DataArguments):
@@ -334,6 +339,17 @@ class VLMTrainer:
             if args.train.freeze_llm:
                 self.model.model.requires_grad_(False)
                 self.model.lm_head.requires_grad_(False)
+
+            if args.train.freeze_router:
+                # Freeze every MoE router (gate) so the pretrained routing stays fixed
+                # while experts/attention continue to train. Router params live at
+                # `model.layers.<i>.mlp.gate.weight` (Qwen3MoeSparseMoeBlock.gate).
+                num_frozen = 0
+                for name, param in self.model.named_parameters():
+                    if name.endswith("mlp.gate.weight"):
+                        param.requires_grad_(False)
+                        num_frozen += 1
+                logger.info_rank0(f"freeze_router enabled: froze {num_frozen} MoE router (gate) params.")
         else:
             raise NotImplementedError(f"{model_config.model_type} is not supported now.")
            

@@ -58,6 +58,16 @@ class CheckpointerCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """Block until the last async save finishes before tearing down the process group."""
+        checkpointer = self.trainer.checkpointer
+        if getattr(checkpointer, "save_future", None) is not None:  # async save
+            logger.info_rank0("Waiting for the final async checkpoint save to finish...")
+            checkpointer.save_future.result()
+            checkpointer.save_future = None
+            dist.barrier()
+            logger.info_rank0("Final async checkpoint save finished.")
+
     def _load_checkpoint(self):
         """Load checkpoint from path."""
         args: "VeOmniArguments" = self.trainer.args

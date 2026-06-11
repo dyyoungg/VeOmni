@@ -190,6 +190,7 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
     metadata_configs = [
         ("audio_ground_truth_text", ("", "zh")),
         ("category", None),
+        ("raw_data", {})
     ]
     
     for key, default in metadata_configs:
@@ -824,7 +825,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             audio_features_lens=raw_audio_len, 
             text=text, 
             language=language,
-            options_num=len(sample_data.get("candidates", []))
+            options_num=len(sample_data.get("candidates", [])),
+            raw_data=sample_data
         )
 
     def build_inputs_qwen2(self, prompt_list: List[Dict], system_prompt:str="You are a helpful assistant."):
@@ -925,7 +927,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             video_grid_thw=thw if visual_mode == "video" else None,
             audio_features=audio_mel, 
             audio_features_lens=raw_audio_len,
-            options_num=len(sample_data.get("candidates", []))
+            options_num=len(sample_data.get("candidates", [])),
+            raw_data=sample_data
         )
 
     # ==========================================
@@ -1014,7 +1017,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             "attention_mask_len": None, "language": "en", "category": "unknown",
             "pixel_values": None, "image_grid_thw": None,
             "pixel_values_video": None, "video_grid_thw": None,
-            "audio_ground_truth_text": None, "options_num": torch.tensor([0], dtype=torch.long)
+            "audio_ground_truth_text": None, "options_num": torch.tensor([0], dtype=torch.long),
+            "raw_data": None
         }
         base.update(kwargs)
         

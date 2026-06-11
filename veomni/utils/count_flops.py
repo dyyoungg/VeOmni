@@ -559,6 +559,7 @@ class VeomniFlopsCounter:
 
         flops_all = dense_flops + attn_qkv_flops + vit_flops + audio_flops
         flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
+        print(f" vit flops:{vit_flops}, LLM flops: {dense_flops+attn_qkv_flops}, audio flops: {audio_flops}")
         return flops_achieved
 
     def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
