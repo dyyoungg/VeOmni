@@ -295,7 +295,7 @@ class OmniSampleProcessor:
     # ------------------------------------------------------------------
  
     def preprocess_image(
-        self, image: Image.Image, image_merge_size: Optional[int] = None
+        self, image: Image.Image, image_merge_size: Optional[int] = None, fix_sample_fps:bool=False
     ) -> List[Image.Image]:
         if image_merge_size is None:
             image_merge_size = self.image_merge_size
@@ -306,6 +306,10 @@ class OmniSampleProcessor:
             self.model_args.mm_image_size if self.training_args.fix_image_size else None
         )
         min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
+        if fix_sample_fps:
+            w, h = min_side * 5, min_side * 3
+            fix_size = (w, h)
+
         return qwen25vl_image_preprocess(
             image,
             mm_downsample_ratio=getattr(self.model_args, "mm_downsample_ratio", 4),
@@ -378,20 +382,24 @@ class OmniSampleProcessor:
 
 
     def calculate_video_each_frame_token(
-        self, height: int, width: int, merge_size: int = 2
+        self, height: int, width: int, merge_size: int = 2, fix_sample_fps:bool=False
     ) -> Tuple[int, Tuple[int, int]]:
         if self.training_args.fix_image_size:
             rw, rh = self.model_args.mm_image_size
         else:
             min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
-            rh, rw = smart_resize(
-                height=height,
-                width=width,
-                factor=self.image_patch_size * merge_size,
-                min_pixels=MIN_PIXELS_SEQ * self.image_factor **2,
-                max_pixels=MAX_PIXELS_SEQ * self.image_factor **2,
-                min_side=min_side
-            )
+            if fix_sample_fps:
+                rh, rw = min_side* 3, min_side * 5
+
+            else:
+                rh, rw = smart_resize(
+                    height=height,
+                    width=width,
+                    factor=self.image_patch_size * merge_size,
+                    min_pixels=MIN_PIXELS_SEQ * self.image_factor **2,
+                    max_pixels=MAX_PIXELS_SEQ * self.image_factor **2,
+                    min_side=min_side
+                )
         resolution = (rw, rh)
         proj = self.model_args.image_projector_type
 
@@ -434,9 +442,11 @@ class OmniSampleProcessor:
         start_frame: int,
         end_frame: int,
         framerate: float,
+        fix_sample_fps: bool=False
     ) -> List[int]:
-        if self.data_args.use_finetune_fps:
-            step = max(1, int(framerate / self.data_args.sample_fps))
+        if self.data_args.use_finetune_fps and fix_sample_fps:
+            sample_fps = 4
+            step = max(1, int(framerate / sample_fps))
             seq = list(range(start_frame, end_frame, step))
             if len(seq) > desired_num_frames:
                 seq = sorted(random.sample(seq, desired_num_frames))
@@ -480,6 +490,10 @@ class OmniSampleProcessor:
             - len(system_token)
             - extra_reserved_tokens
         )
+        fix_sample_fps = False
+        if isinstance(sample_data, dict):
+            fix_sample_fps = sample_data.get("sample_fps", False)
+
         try:
            
             imgs, _, total_tokens, _ = self.get_video_frames(
@@ -488,7 +502,8 @@ class OmniSampleProcessor:
                 sample_data.get("start",None), 
                 sample_data.get("end",None),
                 method=self.training_args.video_decode_method,
-                format=vformat
+                format=vformat,
+                fix_sample_fps=fix_sample_fps
             )
             
             if not imgs:
@@ -513,6 +528,7 @@ class OmniSampleProcessor:
         method: str = "decord",
         format: str = "",
         merge_size: int = 2,
+        fix_sample_fps: bool=False
     ) -> Optional[Tuple[List[Image.Image], int, int, Tuple[int, int]]]:
         
         raw_img_list: List[Image.Image] = []
@@ -585,18 +601,21 @@ class OmniSampleProcessor:
                 valid_frame_count = end_frame - start_frame
 
             each_token, resized_res = self.calculate_video_each_frame_token(
-                height=resolution[1], width=resolution[0], merge_size=merge_size
+                height=resolution[1], width=resolution[0], merge_size=merge_size, fix_sample_fps=fix_sample_fps
             )
             
             max_frames = int(max_image_tokens / each_token)
-            desired = (
-                min(getattr(self.data_args, 'finetune_sample_frames', max_frames), max_frames)
-                if getattr(self.data_args, 'finetune_sample_frames', 0) > 0
-                else max_frames
-            )
+            if not fix_sample_fps:
+                desired = (
+                    min(getattr(self.data_args, 'finetune_sample_frames', max_frames), max_frames)
+                    if getattr(self.data_args, 'finetune_sample_frames', 0) > 0
+                    else max_frames
+                )
+            else:
+                desired = max(max_frames, 200)
             
             frame_seq = self.get_seq_frames(
-                valid_frame_count, desired, start_frame, end_frame, framerate
+                valid_frame_count, desired, start_frame, end_frame, framerate, fix_sample_fps=fix_sample_fps
             )
 
             if not frame_seq:
@@ -663,6 +682,7 @@ class OmniSampleProcessor:
         method: str = "decord",
         format: str = "",
         merge_size: int = 2,
+        fix_sample_fps:bool=False
     ) -> Tuple[List, int, int, Tuple[int, int]]:
         if self.training_args.dataloader_debug:
             fake = [Image.new("RGB", (644, 364), (200, 200, 200))] * 30
@@ -676,12 +696,13 @@ class OmniSampleProcessor:
         results = self.extract_imagelist_from_videobytes(
             video_file, max_image_tokens, start_time, end_time,
             method=method, format=format, merge_size=merge_size,
+            fix_sample_fps=fix_sample_fps,
         )
         if results is None:
             return [], 0, 0, (0, 0)
 
         raw_imgs, frame_count, each_token, resolution = results
-        raw_imgs = self.preprocess_image(raw_imgs, image_merge_size=self.image_merge_size)
+        raw_imgs = self.preprocess_image(raw_imgs, image_merge_size=self.image_merge_size, fix_sample_fps=fix_sample_fps)
         # Qwen25VL requires an even number of frames
         if len(raw_imgs) % 2 == 1 and raw_imgs:
             raw_imgs.pop()

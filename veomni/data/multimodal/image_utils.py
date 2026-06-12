@@ -389,7 +389,7 @@ def _process_one_image(image_input, min_side, size_factor, mm_downsample_ratio, 
         if force_fixed_size is not None:
            
             target_w, target_h = force_fixed_size
-            divided_factor = IMAGE_FACTOR * 4
+            divided_factor = min_side
             if target_w % divided_factor != 0 or target_h % divided_factor != 0:
                 print(f"[Warning] force_fixed_size {force_fixed_size} is not divisible by {divided_factor}! "
                       f"Might cause shape mismatch in Conv Projector.")

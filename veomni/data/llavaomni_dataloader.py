@@ -991,7 +991,8 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             else:
                 imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, format=vformat)
                 
-            if not imgs: 
+            if not imgs:
+                print("eval data extrace video failed!!!!!!!!check video process!!") 
                 return None, None, "error"
             
             inputs = self.processor.process_image_videos(video=imgs, merge_size=self.video_merge_size)
@@ -999,7 +1000,16 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             
         elif image_path:
             try:
-                imgs = self.processor.get_image_list_from_paths([image_path])
+                if isinstance(image_path, str):
+                    image_path = [image_path]
+                if not isinstance(image_path, list):
+                    print(f"image path is not list, check data:{sample_data}")
+                    return None, None, "none"
+                imgs = self.processor.get_image_list_from_paths(image_path)
+                if not imgs:
+                    print("eval data extrace image failed!!!!!!!!check video process!!") 
+                    return None, None, "error"
+            
                 inputs = self.processor.process_image_videos(images=imgs, merge_size=self.image_merge_size) 
                 return inputs["pixel_values"], inputs['image_grid_thw'], "image"
             except Exception as e:
