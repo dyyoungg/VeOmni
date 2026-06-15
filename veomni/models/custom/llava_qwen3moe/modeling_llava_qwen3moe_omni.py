@@ -334,10 +334,16 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
             inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
 
         else:
-            fake_audio_embeds, fake_audio_len = self.audio_encoder.dummy_forward()
-            fake_audio_embeds = fake_audio_embeds.mean() * 0.0
-            fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds + fake_audio_embeds
+            audio_has_trainable = not (
+                getattr(self.audio_encoder, "freeze_audio_encoder", False)
+                or getattr(self.audio_encoder, "freeze_audio_projector", False)
+            )
+            if audio_has_trainable:
+                with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():
+                    fake_audio_embeds, fake_audio_len = self.audio_encoder.dummy_forward()
+                fake_audio_embeds = fake_audio_embeds.mean() * 0.0
+                fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds + fake_audio_embeds
 
     
         if sp_enabled:

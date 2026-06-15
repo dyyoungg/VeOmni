@@ -18,6 +18,8 @@ adapted for the Qwen3.5MoE vision architecture differences:
 
 from typing import Dict, Optional
 
+import os
+import contextlib
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -33,6 +35,28 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads, ulysses_pad_and_slice
 from veomni.models.custom.llava_qwen3moe.base import BaseEncoderConfigMixin, BaseEncoderModelMixin
 from veomni.models.custom.llava_qwen3moe.projector import build_image_projector
+
+
+# Lightweight, opt-in internal timing for the ViT forward. Enable by setting the
+# env var VIT_PROFILE=1. Results (seconds) are stashed on the module instance as
+# `_vit_timings` so the training loop / a callback can read them without touching
+# the forward signature. Disabled by default -> zero overhead (no extra syncs).
+_VIT_PROFILE = os.environ.get("VIT_PROFILE", "0") == "1"
+
+
+@contextlib.contextmanager
+def _vit_timer(store: dict, name: str):
+    """Record GPU time (seconds) for a section into `store[name]`. No-op unless VIT_PROFILE=1."""
+    if not _VIT_PROFILE:
+        yield
+        return
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    yield
+    end.record()
+    torch.cuda.synchronize()
+    store[name] = store.get(name, 0.0) + start.elapsed_time(end) / 1000.0
 from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
     Qwen3_5MoeVisionModel,
     Qwen3_5MoeVisionMLP,
@@ -240,59 +264,63 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
             Qwen25ViTPretrainedModel does.
         """
      
-        hidden_states = self.patch_embed(hidden_states)  # [seq_local, hidden]
-        sp_enabled = (
-            get_parallel_state() is not None
-            and get_parallel_state().sp_enabled
-            and self.training
-        )
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        if sp_enabled:
-            pos_embeds = ulysses_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=self.spatial_merge_size ** 2)
-       
-        hidden_states = hidden_states + pos_embeds
-      
+        self._vit_timings = {}
 
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(
-            dim=0,
-            # FA2 needs int32; onnx tracing needs the same dtype as grid_thw.
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        with _vit_timer(self._vit_timings, "vit_prep"):
+            hidden_states = self.patch_embed(hidden_states)  # [seq_local, hidden]
+            sp_enabled = (
+                get_parallel_state() is not None
+                and get_parallel_state().sp_enabled
+                and self.training
+            )
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+            if sp_enabled:
+                pos_embeds = ulysses_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=self.spatial_merge_size ** 2)
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        unpadded_seq_len = int(cu_seqlens[-1])
-        pad_seq_len = 0
-        seq_len = hidden_states.size(0)
-        rotary_pos_emb = rotary_pos_emb.reshape(unpadded_seq_len, -1)
+            hidden_states = hidden_states + pos_embeds
 
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        if sp_enabled:
-            sp_size = get_parallel_state().ulysses_size
-            pad_seq_len = seq_len * sp_size - unpadded_seq_len
-            if pad_seq_len > 0:
-                emb = pad_tensor(emb, dim=0, padding_size=pad_seq_len)
-                new_cumsum = cu_seqlens[-1] + pad_seq_len
-                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+            cu_seqlens = torch.repeat_interleave(
+                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+            ).cumsum(
+                dim=0,
+                # FA2 needs int32; onnx tracing needs the same dtype as grid_thw.
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        position_embeddings = (emb.cos(), emb.sin())
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+            unpadded_seq_len = int(cu_seqlens[-1])
+            pad_seq_len = 0
+            seq_len = hidden_states.size(0)
+            rotary_pos_emb = rotary_pos_emb.reshape(unpadded_seq_len, -1)
 
-        for blk in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = checkpoint(
-                    blk.__call__, hidden_states, cu_seqlens, None, position_embeddings
-                )
-            else:
-                hidden_states = blk(
-                    hidden_states,
-                    cu_seqlens=cu_seqlens,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            if sp_enabled:
+                sp_size = get_parallel_state().ulysses_size
+                pad_seq_len = seq_len * sp_size - unpadded_seq_len
+                if pad_seq_len > 0:
+                    emb = pad_tensor(emb, dim=0, padding_size=pad_seq_len)
+                    new_cumsum = cu_seqlens[-1] + pad_seq_len
+                    cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
-        hidden_states = self.merger(hidden_states)
+            position_embeddings = (emb.cos(), emb.sin())
+
+        with _vit_timer(self._vit_timings, "vit_blocks"):
+            for blk in self.blocks:
+                if self.gradient_checkpointing and self.training:
+                    hidden_states = checkpoint(
+                        blk.__call__, hidden_states, cu_seqlens, None, position_embeddings
+                    )
+                else:
+                    hidden_states = blk(
+                        hidden_states,
+                        cu_seqlens=cu_seqlens,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+
+        with _vit_timer(self._vit_timings, "vit_merger"):
+            hidden_states = self.merger(hidden_states)
 
         if sp_enabled:
             merge_unit = self.spatial_merge_size ** 2
@@ -397,6 +425,18 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
                     features = super().forward(features, grid_thw)
             else:
                 features = super().forward(features, grid_thw)
+
+        if _VIT_PROFILE and getattr(self, "_vit_timings", None):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                t = self._vit_timings
+                print(
+                    f"[VIT_PROFILE] prep={t.get('vit_prep', 0):.4f}s "
+                    f"blocks={t.get('vit_blocks', 0):.4f}s "
+                    f"merger={t.get('vit_merger', 0):.4f}s "
+                    f"tokens={int(grid_thw.prod(dim=1).sum().item())}",
+                    flush=True,
+                )
 
         if self.freeze_image_projector:
             with torch.no_grad():

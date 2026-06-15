@@ -304,7 +304,8 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
                 inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
         
         else:
-            fake_embeds, _ = self.image_encoder.dummy_forward()
+            with step_timer.measure("vit") if step_timer else contextlib.nullcontext():
+                fake_embeds, _ = self.image_encoder.dummy_forward()
             fake_embeds = fake_embeds.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
@@ -321,10 +322,22 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
             inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
 
         else:
-            fake_audio_embeds, fake_audio_len = self.audio_encoder.dummy_forward()
-            fake_audio_embeds = fake_audio_embeds.mean() * 0.0
-            fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds + fake_audio_embeds
+            # The dummy forward only exists to produce gradients for the audio
+            # encoder/projector so FSDP's backward reduce-scatter doesn't hang when
+            # a step has no audio data. When the audio tower AND projector are both
+            # frozen they hold no trainable params and are not part of FSDP's grad
+            # sync, so the dummy forward is pure wasted compute (a full-length
+            # Whisper forward, ~2s/step). Skip it in that case.
+            audio_has_trainable = not (
+                getattr(self.audio_encoder, "freeze_audio_encoder", False)
+                or getattr(self.audio_encoder, "freeze_audio_projector", False)
+            )
+            if audio_has_trainable:
+                with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():
+                    fake_audio_embeds, fake_audio_len = self.audio_encoder.dummy_forward()
+                fake_audio_embeds = fake_audio_embeds.mean() * 0.0
+                fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds + fake_audio_embeds
 
     
         if sp_enabled:

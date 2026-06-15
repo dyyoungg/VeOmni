@@ -570,6 +570,18 @@ def build_parallelize_model(
         )
         model.enable_input_require_grads()
 
+        # Optionally turn ViT recompute back off. The ViT has a small hidden dim so
+        # its activations are cheap to keep, while its recompute (a full 27-layer
+        # forward over tens of thousands of patch tokens) is a large share of step
+        # time. Disabling only the ViT keeps LLM checkpointing intact.
+        if not kwargs.pop("enable_gradient_checkpointing_vit", True):
+            image_encoder = getattr(model, "image_encoder", None)
+            if image_encoder is not None and hasattr(image_encoder, "gradient_checkpointing_disable"):
+                image_encoder.gradient_checkpointing_disable()
+                logger.info_rank0("Disable gradient checkpointing for the vision encoder (ViT).")
+    else:
+        kwargs.pop("enable_gradient_checkpointing_vit", None)
+
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
         model = parallelize_module(

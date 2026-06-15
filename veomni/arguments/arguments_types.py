@@ -160,6 +160,14 @@ class GradientCheckpointingConfig:
         default=True,
         metadata={"help": "Enable gradient checkpointing."},
     )
+    enable_vit: bool = field(
+        default=True,
+        metadata={
+            "help": "Enable gradient checkpointing for the vision encoder (ViT). Set False to keep "
+            "activations of the ViT (small hidden dim, cheap to store) and skip its recompute, "
+            "trading some memory for ViT forward/backward speed. Only takes effect when `enable` is True."
+        },
+    )
     debug: bool = field(
         default=False,
         metadata={

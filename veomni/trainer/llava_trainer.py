@@ -387,6 +387,7 @@ class VLMTrainer:
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             enable_mixed_precision=args.train.enable_mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            enable_gradient_checkpointing_vit=args.train.gradient_checkpointing.enable_vit,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             basic_modules=list(
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
@@ -420,7 +421,13 @@ class VLMTrainer:
             {"params": audio_params, "lr": args.train.vit_lr},
             {"params": llm_params, "lr": args.train.optimizer.lr},
         ]
-  
+        # Drop empty param groups. An empty group (e.g. when the audio tower and
+        # projector are both frozen) cannot be mapped back by DCP's
+        # set_optimizer_state_dict on resume (it matches groups by param FQN), so
+        # its hyperparams (betas/eps/...) get stripped and Adam.step() then raises
+        # `KeyError: 'betas'`. Keeping only non-empty groups avoids this.
+        param_groups = [g for g in param_groups if len(g["params"]) > 0]
+
         # Build optimizer
         self.optimizer = build_optimizer(
             self.model,
