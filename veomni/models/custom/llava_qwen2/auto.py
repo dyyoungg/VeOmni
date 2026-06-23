@@ -275,7 +275,7 @@ def build_qwen25_omni_from_components(
     return model
 
 
-def merge_component_models(vision_model_path, save_directory, load_mm_projector=True):
+def merge_component_models(vision_model_path, save_directory, vlm_path=None, load_mm_weight=True):
    
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
     language_model_path = "/mnt/afs/share/Qwen25-14B-Instruct"
@@ -320,8 +320,8 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
     )
     vision_prefix = ("model.vision_tower.vision_tower.", )
     explicit_weights_to_load = {}
-    if load_mm_projector:
-        language_model_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436"
+    if load_mm_weight:
+        language_model_path = vlm_path
         print("正在迁移原模型 mm_projector 权重...")
         embed_weights_num = 0
         projector_key_mapping = {
@@ -433,7 +433,8 @@ def merge_component_models(vision_model_path, save_directory, load_mm_projector=
 
 if __name__ == "__main__":
     vision_path = "/mnt/afs/share/qwen25_vl_encoder"
+    vlm_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436"
     save_directory =  "/mnt/afs/share/20260324_beebee_memory_14B"
-    merge_component_models(vision_path, save_directory, load_mm_projector=True)
+    merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
 
-   
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
