@@ -712,20 +712,31 @@ class OmniSampleProcessor:
     # 音频特征提取
     # ------------------------------------------------------------------
  
-    def _extract_audio_features(self, audio_list: List[torch.Tensor]) -> Tuple[Optional[torch.Tensor], List[int], Optional[torch.Tensor]]:
+    def _extract_audio_features(self, audio_list: List[torch.Tensor]) -> Tuple[Optional[torch.Tensor], List[int], Optional[torch.Tensor], List[int]]:
+        """
+        将音频列表按 30s 分块提取 mel 特征。
+
+        Returns:
+            audio_mel: [total_chunks, mel_bins, 3000]
+            actual_len: 每个 chunk 经过 projector downsample 后的 token 数
+            raw_len: 每个 chunk 的有效帧长（传给 whisper encoder）
+            audio_chunk_counts: 每条音频被分成的 chunk 数（用于 token 展开时分组）
+        """
         if not audio_list:
-            return None, [], None
+            return None, [], None, []
 
         CHUNK_SAMPLES = 480000  # 30s * 16kHz
         frame_len = self.model_args.audio_frame_length
         compress_ratio = self.model_args.audio_downsample_ratio
 
         all_chunks = []
-        chunk_frame_lens = []  # 每个 chunk 的有效帧长（conv2 stride=2 之后）
+        chunk_frame_lens = []  # 每个 chunk 的有效帧长
+        audio_chunk_counts = []  # 每条音频分成了几个 chunk
 
         for audio in audio_list:
             n_samples = len(audio)
             n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
+            audio_chunk_counts.append(n_chunks)
             for i in range(n_chunks):
                 start = i * CHUNK_SAMPLES
                 end = min((i + 1) * CHUNK_SAMPLES, n_samples)
@@ -743,17 +754,18 @@ class OmniSampleProcessor:
         audio_mel = torch.cat(all_chunks, dim=0)  # [total_chunks, mel_bins, 3000]
         raw_len = torch.tensor(chunk_frame_lens)
         actual_len = [(l + compress_ratio - 1) // compress_ratio for l in raw_len]
-        return audio_mel, actual_len, raw_len
+        return audio_mel, actual_len, raw_len, audio_chunk_counts
     
     def _process_audio_features(self, resources: Dict) -> Dict:
         audio_data_list = resources.get("audio", [])
-        
-        audio_mel, actual_len, raw_len = self._extract_audio_features(audio_data_list)
-        
+
+        audio_mel, actual_len, raw_len, audio_chunk_counts = self._extract_audio_features(audio_data_list)
+
         resources["audio_features"] = audio_mel
-        resources["audio_features_lens"] = raw_len  
+        resources["audio_features_lens"] = raw_len
         resources["actual_audio_feature_len"] = actual_len
-            
+        resources["audio_chunk_counts"] = audio_chunk_counts
+
         return resources
     
     
@@ -1183,11 +1195,14 @@ class OmniSampleProcessor:
     # ------------------------------------------------------------------
     def _expand_multimodal_tokens(
         self, input_ids: List[int], labels: List[int],
-        image_thw=None, video_thw=None, audio_feature_len: List[int]=None
+        image_thw=None, video_thw=None, audio_feature_len: List[int]=None,
+        audio_chunk_counts: List[int]=None
     ) -> Tuple[List[int], List[int]]:
         """Qwen2.5-VL 核心的占位符展开逻辑"""
         new_ids, new_labels = [], []
         i_idx, v_idx, a_idx = 0, 0, 0
+        # a_chunk_offset 指向 audio_feature_len 中当前音频首个 chunk 的位置
+        a_chunk_offset = 0
         total_image_token, total_video_token, total_audio_token = 0, 0, 0
 
         for i, token_id in enumerate(input_ids):
@@ -1199,7 +1214,7 @@ class OmniSampleProcessor:
                 new_labels.extend([IGNORE_INDEX] * num)
                 i_idx += 1
                 total_image_token += num
-                
+
             elif token_id == VIDEO_TOKEN_INDEX and video_thw is not None:
                 t, h, w = video_thw[v_idx]
                 m_h, m_w = get_adaptive_pool_size(h//2, w//2, self.model_args.mm_downsample_ratio)
@@ -1208,12 +1223,20 @@ class OmniSampleProcessor:
                 new_labels.extend([IGNORE_INDEX] * num)
                 v_idx += 1
                 total_video_token += num
-                
+
             elif token_id == AUDIO_TOKEN_INDEX and audio_feature_len:
-                num = audio_feature_len[a_idx].item()
+                # 每个 AUDIO_TOKEN_INDEX 对应一条完整音频（可能有多个 chunk）
+                n_chunks = audio_chunk_counts[a_idx] if audio_chunk_counts else 1
+                num = sum(
+                    audio_feature_len[a_chunk_offset + c].item()
+                    if hasattr(audio_feature_len[a_chunk_offset + c], 'item')
+                    else audio_feature_len[a_chunk_offset + c]
+                    for c in range(n_chunks)
+                )
                 new_ids.extend([self.audio_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
                 a_idx += 1
+                a_chunk_offset += n_chunks
                 total_audio_token += num
             else:
                 new_ids.append(token_id)
@@ -1272,9 +1295,11 @@ class OmniSampleProcessor:
         image_thw = multimodal_resources.get("image_thw")
         video_thw = multimodal_resources.get("video_thw")
         actual_audio_lens = multimodal_resources.get("actual_audio_feature_len", [])
+        audio_chunk_counts = multimodal_resources.get("audio_chunk_counts", [])
 
         cur_input_ids, cur_labels, token_counts = self._expand_multimodal_tokens(
-            cur_input_ids, cur_labels, image_thw, video_thw, actual_audio_lens
+            cur_input_ids, cur_labels, image_thw, video_thw, actual_audio_lens,
+            audio_chunk_counts=audio_chunk_counts
         )
 
         system_token = self._build_system_token(sample_data, sample_idx)

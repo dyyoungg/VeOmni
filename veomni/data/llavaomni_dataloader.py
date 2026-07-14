@@ -770,18 +770,18 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             return None 
         
     def process_audio_eval(self, sample_data: Dict) -> Optional[Dict]:
-       
+
         audio_data_list = self._load_and_pad_audios(sample_data)
-        if not audio_data_list: 
+        if not audio_data_list:
             return None
-        
-        audio_mel, actual_audio_len, raw_audio_len = self.processor._extract_audio_features(audio_data_list)
-        
+
+        audio_mel, actual_audio_len, raw_audio_len, audio_chunk_counts = self.processor._extract_audio_features(audio_data_list)
+
         # 2. 构建 Prompt Token
         category = sample_data["category"]
         language = sample_data.get("language", "en")
         text = sample_data.get("text", None)
-        
+
         if category in ["aishell", "librispeech", "cantonese", "commonvoice_ja"]:
             query_map = {
                 "zh": "请转录这段语音的内容。",
@@ -792,7 +792,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             query = query_map.get(language, "Please transcribe the audio content.")
             input_ids = self._build_audio_query_tokens(query)
             label_tokens = [IGNORE_INDEX] * len(input_ids)
-            
+
         elif category in ["MMAU", "vocalsound"]:
             question = sample_data.get("question", "")
             answer = sample_data.get("answer", "")
@@ -800,30 +800,31 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             for idx, c in enumerate(sample_data['candidates']):
                 question += f"\n({chr(ord('A') + idx)}) {c}\n" if idx == 0 else f"({chr(ord('A') + idx)}) {c}\n"
                 if c == answer: answer_idx = idx
-                
+
             question_tokens = self._build_audio_query_tokens(question)
             text_no_loss = 'My best option is ('
             text_with_loss = f"{chr(ord('A') + answer_idx)}"
             mask_len = len(self.tokenizer(text_no_loss)['input_ids'])
             answer_tokens = self.tokenizer(text_no_loss + text_with_loss)['input_ids']
-            
+
             input_ids = question_tokens + answer_tokens
             label_tokens = [IGNORE_INDEX] * len(question_tokens) + [IGNORE_INDEX] * mask_len + answer_tokens[-(len(answer_tokens) - mask_len):]
         else:
             return None
 
         input_ids, labels, _ = self.processor._expand_multimodal_tokens(
-            input_ids, label_tokens, 
-            audio_feature_len=actual_audio_len
+            input_ids, label_tokens,
+            audio_feature_len=actual_audio_len,
+            audio_chunk_counts=audio_chunk_counts
         )
 
         return self._build_return_dict(
-            input_ids=input_ids, 
-            labels=labels, 
+            input_ids=input_ids,
+            labels=labels,
             category=category,
-            audio_features=audio_mel, 
-            audio_features_lens=raw_audio_len, 
-            text=text, 
+            audio_features=audio_mel,
+            audio_features_lens=raw_audio_len,
+            text=text,
             language=language,
             options_num=len(sample_data.get("candidates", [])),
             raw_data=sample_data
@@ -892,14 +893,14 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             label_tokens += answer_tokens
 
      
-        audio_mel, actual_audio_len, raw_audio_len = self.processor._extract_audio_features(audio_list)
-        
+        audio_mel, actual_audio_len, raw_audio_len, audio_chunk_counts = self.processor._extract_audio_features(audio_list)
+
         max_image_tokens = self.tokenizer.model_max_length - len(subtitle_tokens) - len(system_token) - sum(actual_audio_len)
         pixels, thw, visual_mode = self._load_visual_features(sample_data, max_image_tokens)
-        
-        if visual_mode == "error": 
+
+        if visual_mode == "error":
             return None
-        
+
         # 添加 Vision 前缀 Token
         if thw is not None:
             image_num = thw[0][0].item() if visual_mode == "video" else len(thw)
@@ -909,12 +910,13 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
 
         cur_input_ids = system_token + subtitle_tokens
         cur_labels = [IGNORE_INDEX] * len(system_token) + label_tokens
-        
+
         input_ids, labels, _  = self.processor._expand_multimodal_tokens(
-            cur_input_ids, cur_labels, 
+            cur_input_ids, cur_labels,
             image_thw=thw if visual_mode == "image" else None,
             video_thw=thw if visual_mode == "video" else None,
-            audio_feature_len=actual_audio_len
+            audio_feature_len=actual_audio_len,
+            audio_chunk_counts=audio_chunk_counts
         )
        
         return self._build_return_dict(
