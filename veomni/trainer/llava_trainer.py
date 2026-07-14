@@ -121,6 +121,19 @@ class VLMTrainingArguments(TrainingArguments):
     min_lr_rate: float = field(default=0.0)
     router_aux_loss_coef: float = field(default=0.001)
     output_router_logits: bool = field(default=True)
+    mm_balance_coef: float = field(
+        default=0.0,
+        metadata={"help": "Coefficient for multimodal token load-balancing aux loss relative to text. "
+                  "1.0 = same as text (original behaviour), 0.0 = text-only balancing, 0.1 = light constraint to prevent expert collapse."},
+    )
+    modality_aware_routing: bool = field(
+        default=False,
+        metadata={"help": "When True, add a learnable per-modality bias to MoE router logits so the gate can distinguish text/vision/audio tokens."},
+    )
+    num_routing_modalities: int = field(
+        default=3,
+        metadata={"help": "Number of modality types for modality-aware routing (default 3: text=0, vision=1, audio=2)."},
+    )
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
     eval_first: bool = field(default=True)
     save_predictions: bool = field(default=True)
@@ -271,6 +284,8 @@ class VLMTrainer:
                 moe_implementation=args.model.ops_implementation.moe_implementation,
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                modality_aware_routing=args.train.modality_aware_routing,
+                num_routing_modalities=args.train.num_routing_modalities,
             )
         elif self.model_config.model_type == "llavaqwen2_omni":
             self.model = build_llavaqwen2_omni_from_pretrained(
@@ -308,6 +323,8 @@ class VLMTrainer:
         if self.model_config.model_type == "llavaqwen3moe_omni":
             self.model.config.output_router_logits = self.args.train.output_router_logits
             self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
+            self.model.omni_config.mm_balance_coef = self.args.train.mm_balance_coef
+            self.model.omni_config.modality_aware_routing = self.args.train.modality_aware_routing
         self.model_config.freeze_vit = self.args.train.freeze_vit
         self.model_config.freeze_audio = self.args.train.freeze_audio_tower
         self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
@@ -349,7 +366,20 @@ class VLMTrainer:
                     if name.endswith("mlp.gate.weight"):
                         param.requires_grad_(False)
                         num_frozen += 1
+                    if name.endswith("mlp.gate.modality_bias") and self.model.omni_config.modality_aware_routing:
+                        
+                        param.requires_grad_(False)
+                        num_frozen += 1
                 logger.info_rank0(f"freeze_router enabled: froze {num_frozen} MoE router (gate) params.")
+            else:
+                num_frozen = 0
+                for name, param in self.model.named_parameters():
+                    if name.endswith("mlp.gate.weight"):
+                        param.requires_grad_(True)
+                        num_frozen += 1
+                    if name.endswith("mlp.gate.modality_bias") and self.model.omni_config.modality_aware_routing:
+                        param.requires_grad_(True)
+                logger.info_rank0(f"unfreeze router enabled: unfreeze {num_frozen} MoE router (gate) params.")
         else:
             raise NotImplementedError(f"{model_config.model_type} is not supported now.")
            

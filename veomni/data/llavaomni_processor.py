@@ -273,8 +273,8 @@ class OmniSampleProcessor:
         except Exception:
             return None, None
 
-        max_len = self.model_args.audio_max_duration * sr
-        if len(y) > max_len:
+        max_len = self.model_args.audio_max_duration * sr if self.model_args.audio_max_duration else None
+        if max_len and len(y) > max_len:
             y = y[-max_len:]
         return torch.from_numpy(y), sr
     
@@ -715,12 +715,33 @@ class OmniSampleProcessor:
     def _extract_audio_features(self, audio_list: List[torch.Tensor]) -> Tuple[Optional[torch.Tensor], List[int], Optional[torch.Tensor]]:
         if not audio_list:
             return None, [], None
-        padded = pad_sequence(audio_list, batch_first=True, padding_value=0)
-        padded = pad_or_trim(padded)
-        audio_mel = log_mel_spectrogram(padded, n_mels=self.mel_bins)
-        
-        raw_len =  torch.tensor([math.ceil(len(audio) / self.model_args.audio_frame_length) for audio in audio_list])
+
+        CHUNK_SAMPLES = 480000  # 30s * 16kHz
+        frame_len = self.model_args.audio_frame_length
         compress_ratio = self.model_args.audio_downsample_ratio
+
+        all_chunks = []
+        chunk_frame_lens = []  # 每个 chunk 的有效帧长（conv2 stride=2 之后）
+
+        for audio in audio_list:
+            n_samples = len(audio)
+            n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
+            for i in range(n_chunks):
+                start = i * CHUNK_SAMPLES
+                end = min((i + 1) * CHUNK_SAMPLES, n_samples)
+                chunk = audio[start:end]
+
+                # 该 chunk 的有效帧数
+                chunk_frames = math.ceil(len(chunk) / frame_len)
+                chunk_frame_lens.append(chunk_frames)
+
+                # pad_or_trim 到标准 30s 长度，再提取 mel
+                chunk_padded = pad_or_trim(chunk.unsqueeze(0))  # [1, 480000]
+                chunk_mel = log_mel_spectrogram(chunk_padded, n_mels=self.mel_bins)  # [1, mel_bins, 3000]
+                all_chunks.append(chunk_mel)
+
+        audio_mel = torch.cat(all_chunks, dim=0)  # [total_chunks, mel_bins, 3000]
+        raw_len = torch.tensor(chunk_frame_lens)
         actual_len = [(l + compress_ratio - 1) // compress_ratio for l in raw_len]
         return audio_mel, actual_len, raw_len
     
@@ -737,17 +758,22 @@ class OmniSampleProcessor:
     
     
     def calculate_audio_tokens(self, audio_data_list: List[torch.Tensor]) -> int:
+        CHUNK_SAMPLES = 480000  # 30s * 16kHz
         frame_len = self.model_args.audio_frame_length
         ratio = self.model_args.audio_downsample_ratio
+
+        total = 0
+        for a in audio_data_list:
+            n_samples = len(a)
+            n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
+            for i in range(n_chunks):
+                chunk_samples = min(CHUNK_SAMPLES, n_samples - i * CHUNK_SAMPLES)
+                chunk_frames = math.ceil(chunk_samples / frame_len)
+                total += (chunk_frames + ratio - 1) // ratio
+
         if self.model_args.use_audio_start_end_token:
-            return sum(
-                (math.ceil(len(a) / frame_len) + ratio) // ratio + 2
-                for a in audio_data_list
-            )
-        return sum(
-            (math.ceil(len(a) / frame_len) + ratio) // ratio
-            for a in audio_data_list
-        )
+            total += 2 * len(audio_data_list)
+        return total
 
     # ------------------------------------------------------------------
     # 模态分发

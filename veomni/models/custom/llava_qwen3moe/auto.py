@@ -158,6 +158,8 @@ def build_qwen3moe_omni_from_pretrained(
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     freeze_except_projectors: bool = False,
+    modality_aware_routing: bool = False,
+    num_routing_modalities: int = 3,
 ) -> LlavaQwen3MoeForCausalLM:
     """
     Load a *composite* omni model directory created by `model.save_pretrained(...)`.
@@ -179,8 +181,12 @@ def build_qwen3moe_omni_from_pretrained(
         omni_config.encoder_config.image_config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
     if getattr(omni_config.encoder_config, "audio_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.audio_config, attn_implementation, None)
-    
-    
+
+    # Modality-aware routing: write into foundation_config so that every
+    # Qwen3MoeTopKRouter.__init__ creates the modality_bias parameter.
+    omni_config.foundation_config.modality_aware_routing = modality_aware_routing
+    omni_config.foundation_config.num_routing_modalities = num_routing_modalities
+
     model = _build_empty_omni_model(omni_config, torch_dtype=torch_dtype)
     if not empty_init:
         load_model_weights(model, omni_model_path, init_device)

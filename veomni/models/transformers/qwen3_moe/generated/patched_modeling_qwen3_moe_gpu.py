@@ -289,9 +289,24 @@ class Qwen3MoeTopKRouter(nn.Module):
         from veomni.utils.moe_monitor import router_forward_hook
         self.register_forward_hook(router_forward_hook)
 
-    def forward(self, hidden_states):
+        # Modality-aware routing: learnable per-modality bias on router logits.
+        # Initialized to zeros so it has no effect at the start of training,
+        # ensuring seamless continuation from a pretrained checkpoint.
+        if getattr(config, "modality_aware_routing", False):
+            num_modalities = getattr(config, "num_routing_modalities", 3)
+            self.modality_bias = nn.Parameter(torch.zeros(num_modalities, self.num_experts))
+        else:
+            self.modality_bias = None
+
+    def forward(self, hidden_states, modality_ids=None):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_probs = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+
+        # Add per-modality bias before softmax
+        if self.modality_bias is not None and modality_ids is not None:
+            modality_ids_flat = modality_ids.reshape(-1)  # (seq_len,)
+            router_probs = router_probs + self.modality_bias[modality_ids_flat]
+
         router_logits = torch.nn.functional.softmax(router_probs, dtype=torch.float, dim=-1)
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
@@ -307,10 +322,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.experts = Qwen3MoeExperts(config)
         self.gate = Qwen3MoeTopKRouter(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor, modality_ids=None) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped, modality_ids=modality_ids)
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -368,7 +383,12 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        # Pass modality_ids to MoE block when available
+        modality_ids = kwargs.get("modality_ids", None)
+        if isinstance(self.mlp, Qwen3MoeSparseMoeBlock) and modality_ids is not None:
+            hidden_states = self.mlp(hidden_states, modality_ids=modality_ids)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 

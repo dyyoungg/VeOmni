@@ -283,7 +283,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
     processor = AutoProcessor.from_pretrained(vision_model_path)
     print("正在加载语言模型的 Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436", 
+        vlm_path, 
         padding_side="right", 
         use_fast=False
     )
@@ -352,7 +352,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                     print(f"  已提取并重命名 Projector 权重: {key} -> {new_key}")
                 
 
-                elif key.startswith(lm_weight_prefixes):
+                if key.startswith(lm_weight_prefixes):
                     if key.startswith("model.embed_tokens."):
                         embed_weights_num = tensor.shape[0]
                     explicit_weights_to_load[key] = tensor
@@ -361,8 +361,8 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                     new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
                     explicit_weights_to_load[new_key] = tensor
 
-                elif key.startswith("model.audio_encoder."):
-                    new_key = key.replace("model.audio_encoder.", "audio_encoder.")
+                elif key.startswith("model.audio_encoder.model."):
+                    new_key = key.replace("model.audio_encoder.model.", "audio_encoder.")
                     explicit_weights_to_load[new_key] = tensor
                 
                 elif key.startswith("model.audio_projector."):
@@ -370,7 +370,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                     explicit_weights_to_load[new_key] = tensor
 
     special_tokens_dict_map = {
-        "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN]
+        "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN]
     }
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict_map)
     audio_token_id = tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_PAD_TOKEN)
@@ -396,18 +396,37 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                 
                 ckpt_vocab_size = ckpt_tensor.shape[0]
                 model_vocab_size = base_tensor.shape[0]
-                
-                if ckpt_vocab_size != model_vocab_size:
-                    print(f"正在对齐 {key}: 以训练权重({ckpt_vocab_size})为准，Copy 至当前模型({model_vocab_size})")
-                    
-                    base_tensor[:ckpt_vocab_size, :] = ckpt_tensor
-             
-                    explicit_weights_to_load[key] = base_tensor
 
-    # 3. 正常执行加载
+                if ckpt_vocab_size != model_vocab_size:
+                    max_vocab_size = max(ckpt_vocab_size, model_vocab_size)
+                    hidden_size = base_tensor.shape[1]
+                    print(f"正在对齐 {key}: ckpt({ckpt_vocab_size}) vs model({model_vocab_size})，以较大值({max_vocab_size})为准")
+
+                    # 以较大的 vocab size 为准，创建新 tensor
+                    import torch
+                    new_tensor = torch.zeros(max_vocab_size, hidden_size, dtype=base_tensor.dtype, device=base_tensor.device)
+                    # 先填入当前模型权重作为底板
+                    new_tensor[:model_vocab_size, :] = base_tensor
+                    # 再用训练权重覆盖对应部分
+                    new_tensor[:ckpt_vocab_size, :] = ckpt_tensor
+
+                    explicit_weights_to_load[key] = new_tensor
+
+    # 3. 确保模型 embedding 尺寸与要加载的权重一致
+    if explicit_weights_to_load:
+        for key in ["model.embed_tokens.weight", "lm_head.weight"]:
+            if key in explicit_weights_to_load:
+                target_vocab_size = explicit_weights_to_load[key].shape[0]
+                current_vocab_size = model.model.embed_tokens.weight.shape[0]
+                if target_vocab_size != current_vocab_size:
+                    print(f"Resize model embeddings: {current_vocab_size} -> {target_vocab_size}")
+                    model.resize_token_embeddings(target_vocab_size)
+                break  # embed_tokens 和 lm_head vocab size 一致，resize 一次即可
+
+    # 4. 正常执行加载
     if explicit_weights_to_load:
         print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
-        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
+        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=True)
         print("语言模型主干及 mm_projector 权重显式加载成功！")
    
     
@@ -431,10 +450,62 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
 
 
 
-if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/qwen25_vl_encoder"
-    vlm_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260324_beebee_memory_14B/checkpoint-436"
-    save_directory =  "/mnt/afs/share/20260324_beebee_memory_14B"
-    merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
+def load_audio_encoder(model_path, encoder_path, save_path=None):
+    """
+    从 encoder_path 的 safetensors 中提取 model.audio_encoder.model.* 权重，
+    将前缀替换为 audio_encoder.，加载进模型的 audio_encoder，然后重新保存。
+    """
+    from veomni.models.custom.llava_qwen2.modeling_llava_qwen2 import LlavaQwen2ForCausalLM
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    model = LlavaQwen2ForCausalLM.from_pretrained(model_path, torch_dtype="auto").to(dtype=torch.bfloat16, device=torch.device("cuda"))
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+    # 从 encoder_path 提取 audio encoder 权重
+    audio_weights = {}
+    weight_files = sorted(glob.glob(os.path.join(encoder_path, "*.safetensors")))
+    if not weight_files:
+        raise FileNotFoundError(f"No safetensors files found in {encoder_path}")
+
+    for w_file in weight_files:
+        state_dict = load_file(w_file)
+        for key, tensor in state_dict.items():
+            if key.startswith("model.audio_encoder.model."):
+                new_key = key.replace("model.audio_encoder.model.", "audio_encoder.")
+                audio_weights[new_key] = tensor
+                print(f"  提取: {key} -> {new_key}")
+
+    if not audio_weights:
+        raise ValueError(f"No weights with prefix 'model.audio_encoder.model.' found in {encoder_path}")
+
+    print(f"共提取到 {len(audio_weights)} 个 audio encoder 权重张量")
+
+    # 加载到模型的 audio_encoder
+    missing_keys, unexpected_keys = model.audio_encoder.load_state_dict(
+        {k.replace("audio_encoder.", ""): v for k, v in audio_weights.items()},
+        strict=False,
+    )
+    if missing_keys:
+        print(f"Missing keys: {missing_keys}")
+    if unexpected_keys:
+        print(f"Unexpected keys: {unexpected_keys}")
+    print("Audio encoder 权重加载成功！")
+
+    # 重新保存
+    if save_path is None:
+        save_path = model_path
+    print(f"正在保存模型至: {save_path} ...")
+    model.save_pretrained(save_path, safe_serialization=True, max_shard_size="8GB")
+    tokenizer.save_pretrained(save_path)
+    print("保存完成！")
+
+
+
+
+if __name__ == "__main__":
+    # vision_path = "/mnt/afs/share/qwen25_vl_encoder"
+    # vlm_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260615_stage6_14B"
+    # save_directory =  "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/20260615_stage6_14B_veomni"
+    # merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
+
+    load_audio_encoder(model_path="/mnt/afs/share/20260627_beebee_32B_veomni", 
+                       encoder_path="/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260504_stage6_32B", 
+                       save_path=None)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              

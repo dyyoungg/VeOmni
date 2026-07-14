@@ -348,7 +348,20 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
     
         if sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(inputs_embeds, head_dim=2, seq_dim=1, group=sp_group)
-           
+
+        # Build modality_ids for modality-aware routing (0=text, 1=vision, 2=audio)
+        if getattr(self.omni_config, "modality_aware_routing", False):
+            modality_ids = torch.zeros_like(input_ids)  # (batch, seq), default text=0
+            modality_ids[input_ids == self.omni_config.image_token_id] = 1
+            modality_ids[input_ids == self.omni_config.video_token_id] = 1
+            modality_ids[input_ids == self.omni_config.audio_token_id] = 2
+            # SP: scatter back to local seq chunk
+            if sp_enabled:
+                sp_rank = dist.get_rank(sp_group)
+                chunk_size = modality_ids.shape[1] // parallel_state.sp_size
+                modality_ids = modality_ids[:, sp_rank * chunk_size : (sp_rank + 1) * chunk_size]
+            kwargs["modality_ids"] = modality_ids
+
         with step_timer.measure("llm") if step_timer else contextlib.nullcontext():
             outputs = self.model(
                 input_ids=None,
@@ -395,12 +408,41 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
 
         aux_loss = None
         if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
+            mm_balance_coef = getattr(self.omni_config, "mm_balance_coef", 0.0)
+
+            if mm_balance_coef > 0.0:
+                # Split text vs multimodal, apply different balancing strength
+                text_mask = (
+                    (input_ids != self.omni_config.image_token_id) &
+                    (input_ids != self.omni_config.video_token_id) &
+                    (input_ids != self.omni_config.audio_token_id)
+                ).long()
+
+                text_aux = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    text_mask,
+                )
+
+               
+                mm_mask = 1 - text_mask
+                mm_aux = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    mm_mask,
+                )
+                aux_loss = text_aux + mm_balance_coef * mm_aux
+         
+            else:
+                aux_loss = load_balancing_loss_func(
+                    outputs.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    attention_mask,
+                )
+
             if labels is not None and loss is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
