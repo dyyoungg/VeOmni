@@ -181,6 +181,8 @@ class VLMMModelArguments(ModelArguments):
 
     vision_tower: Optional[List[str]] = field(default=None)
     mm_downsample_ratio: int = field(default=16)
+    dynamic_downsample: bool = field(default=False, metadata={"help": "Enable dynamic downsample ratio during training"})
+    dynamic_downsample_ratios: List[int] = field(default_factory=lambda: [4, 8, 12], metadata={"help": "Candidate downsample ratios for dynamic selection"})
     audio_downsample_ratio: int = field(default=10)
     audio_frame_length: int = field(default=320)
     num_mel_bins: Optional[int] = field(default=128)

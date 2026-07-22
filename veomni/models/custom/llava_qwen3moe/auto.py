@@ -314,7 +314,7 @@ def merge_component_models(vision_model_path, save_directory):
         },
         init_device="cuda",
         torch_dtype="bfloat16",
-        image_downsample_size=16,
+        image_downsample_size=4,
         image_projector_type= "dynamic_avgpool",
         audio_downsample_size = 10,
         audio_projector_type="conv_channel_upscale",
@@ -385,7 +385,7 @@ def merge_component_models(vision_model_path, save_directory):
 
 
 if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/qwen25_vl_encoder"
-    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen25encoder_veomni-down16"
+    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
+    save_directory =  "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down4-gametext"
     merge_component_models(vision_path, save_directory)
     

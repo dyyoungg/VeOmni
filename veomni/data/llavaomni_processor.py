@@ -62,17 +62,21 @@ class OmniSample:
     input_ids: torch.Tensor
     labels: torch.Tensor
     caption_len: int
- 
+
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
- 
+
     pixel_values_video: Optional[torch.Tensor] = None
     video_grid_thw: Optional[torch.Tensor] = None
- 
+
     audio_features: Optional[torch.Tensor] = None
     audio_features_lens: Optional[torch.Tensor] = None
     actual_audio_feature_len: List[int] = field(default_factory=list)
- 
+
+    # Per-grid downsample ratios for dynamic compression
+    image_downsample_ratios: Optional[torch.Tensor] = None
+    video_downsample_ratios: Optional[torch.Tensor] = None
+
     attention_mask_len: List[int] = field(default_factory=list)
     token_counts: Dict[str, int] = field(
         default_factory=lambda: {"image": 0, "video": 0, "audio": 0}
@@ -235,7 +239,7 @@ class OmniSampleProcessor:
                 return f.read()
             
     def get_image_list_from_paths(
-        self, image_paths: List[str]
+        self, image_paths: List[str], selected_downsample_ratio:int
     ) -> List[torch.Tensor]:
         images_list = []
         for image_path in image_paths:
@@ -246,7 +250,7 @@ class OmniSampleProcessor:
             with Image.open(buf) as img:
                 image = img.convert("RGB")
             images_list.extend(
-                self.preprocess_image(image, image_merge_size=self.image_merge_size)
+                self.preprocess_image(image, selected_downsample_ratio, image_merge_size=self.image_merge_size)
             )
         return images_list
     
@@ -295,7 +299,7 @@ class OmniSampleProcessor:
     # ------------------------------------------------------------------
  
     def preprocess_image(
-        self, image: Image.Image, image_merge_size: Optional[int] = None, fix_sample_fps:bool=False
+        self, image: Image.Image, selected_downsample_ratio:int, image_merge_size: Optional[int] = None, fix_sample_fps:bool=False
     ) -> List[Image.Image]:
         if image_merge_size is None:
             image_merge_size = self.image_merge_size
@@ -305,14 +309,14 @@ class OmniSampleProcessor:
         fix_size = (
             self.model_args.mm_image_size if self.training_args.fix_image_size else None
         )
-        min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
+        min_side = math.ceil(math.sqrt(selected_downsample_ratio)) * self.image_factor
         if fix_sample_fps:
             w, h = min_side * 5, min_side * 3
             fix_size = (w, h)
 
         return qwen25vl_image_preprocess(
             image,
-            mm_downsample_ratio=getattr(self.model_args, "mm_downsample_ratio", 4),
+            mm_downsample_ratio=selected_downsample_ratio,
             size_factor=self.image_factor,
             executor=self._threadpool,
             min_side=min_side,
@@ -382,12 +386,12 @@ class OmniSampleProcessor:
 
 
     def calculate_video_each_frame_token(
-        self, height: int, width: int, merge_size: int = 2, fix_sample_fps:bool=False
+        self, height: int, width: int, selected_downsample_ratio, merge_size: int = 2, fix_sample_fps:bool=False
     ) -> Tuple[int, Tuple[int, int]]:
         if self.training_args.fix_image_size:
             rw, rh = self.model_args.mm_image_size
         else:
-            min_side = math.ceil(math.sqrt(getattr(self.model_args, "mm_downsample_ratio", 4))) * self.image_factor
+            min_side = math.ceil(math.sqrt(selected_downsample_ratio)) * self.image_factor
             if fix_sample_fps:
                 rh, rw = min_side* 3, min_side * 5
 
@@ -404,7 +408,7 @@ class OmniSampleProcessor:
         proj = self.model_args.image_projector_type
 
         if "avgpool" in proj or "dual_conv" in proj:
-            scale = self.model_args.mm_downsample_ratio
+            scale = selected_downsample_ratio
             M = resolution[0] / self.image_patch_size / merge_size
             N = resolution[1] / self.image_patch_size / merge_size
             m, n = get_adaptive_pool_size(M, N, float(scale))
@@ -474,6 +478,7 @@ class OmniSampleProcessor:
         video_file: str,
         system_token: List[int],
         vformat: str,
+        selected_downsample_ratio:int,
         extra_reserved_tokens: int = 0,
     ) -> Optional[Tuple]:
         """
@@ -499,6 +504,7 @@ class OmniSampleProcessor:
             imgs, _, total_tokens, _ = self.get_video_frames(
                 video_file, 
                 res_token_num,
+                selected_downsample_ratio,
                 sample_data.get("start",None), 
                 sample_data.get("end",None),
                 method=self.training_args.video_decode_method,
@@ -523,6 +529,7 @@ class OmniSampleProcessor:
         self,
         video_file,
         max_image_tokens: int,
+        selected_downsample_ratio: int,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         method: str = "decord",
@@ -601,7 +608,8 @@ class OmniSampleProcessor:
                 valid_frame_count = end_frame - start_frame
 
             each_token, resized_res = self.calculate_video_each_frame_token(
-                height=resolution[1], width=resolution[0], merge_size=merge_size, fix_sample_fps=fix_sample_fps
+                height=resolution[1], width=resolution[0], selected_downsample_ratio=selected_downsample_ratio, 
+                merge_size=merge_size, fix_sample_fps=fix_sample_fps
             )
             
             max_frames = int(max_image_tokens / each_token)
@@ -677,6 +685,7 @@ class OmniSampleProcessor:
         self,
         video_file,
         max_image_tokens: int,
+        selected_downsample_ratio: int,
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         method: str = "decord",
@@ -687,14 +696,15 @@ class OmniSampleProcessor:
         if self.training_args.dataloader_debug:
             fake = [Image.new("RGB", (644, 364), (200, 200, 200))] * 30
             return (
-                self.preprocess_image(fake, image_merge_size=self.image_merge_size),
+                self.preprocess_image(fake, selected_downsample_ratio=selected_downsample_ratio,
+                                      image_merge_size=self.image_merge_size),
                 20,
                 560,
                 (644, 364),
             )
 
         results = self.extract_imagelist_from_videobytes(
-            video_file, max_image_tokens, start_time, end_time,
+            video_file, max_image_tokens, selected_downsample_ratio, start_time, end_time,
             method=method, format=format, merge_size=merge_size,
             fix_sample_fps=fix_sample_fps,
         )
@@ -702,7 +712,8 @@ class OmniSampleProcessor:
             return [], 0, 0, (0, 0)
 
         raw_imgs, frame_count, each_token, resolution = results
-        raw_imgs = self.preprocess_image(raw_imgs, image_merge_size=self.image_merge_size, fix_sample_fps=fix_sample_fps)
+        raw_imgs = self.preprocess_image(raw_imgs, selected_downsample_ratio=selected_downsample_ratio,
+                                         image_merge_size=self.image_merge_size, fix_sample_fps=fix_sample_fps)
         # Qwen25VL requires an even number of frames
         if len(raw_imgs) % 2 == 1 and raw_imgs:
             raw_imgs.pop()
@@ -800,7 +811,7 @@ class OmniSampleProcessor:
         resources["image_pixels"] = None
         resources["image_thw"] = None
 
-    def _dispatch_modality(self, sample_data: Dict, sample_index) -> Optional[Tuple]:
+    def _dispatch_modality(self, sample_data: Dict, sample_index, selected_downsample_ratio) -> Optional[Tuple]:
         """Route sample to the right modality processor."""
         has_video = "video" in sample_data
         has_audio = "audio" in sample_data
@@ -817,28 +828,27 @@ class OmniSampleProcessor:
         vformat = "gif" if sample_data.get("video", "").endswith(".gif") else ""
         system_token = self._build_system_token(sample_data, sample_index)
         result = None
-
-
+    
         if has_video and not has_audio and has_conv:
-            result = self.video_data_process(sample_data, video_file, system_token, vformat)
+            result = self.video_data_process(sample_data, video_file, system_token, vformat, selected_downsample_ratio)
             self._swap_image_to_video_keys(result)
            
         elif has_option and not has_conv:
-            result = self.video_option_data_process(sample_data, video_file, system_token, vformat)
+            result = self.video_option_data_process(sample_data, video_file, system_token, vformat, selected_downsample_ratio)
             self._swap_image_to_video_keys(result)
 
         elif has_image and not has_audio:
-            result = self.image_data_process(sample_data)
+            result = self.image_data_process(sample_data, selected_downsample_ratio)
         
         elif has_audio and not has_video and not has_image:
             result = self.audio_asr_process(sample_data)
 
         elif has_audio and has_video:
-            result = self.video_audio_process(sample_data, video_file, system_token, vformat)
+            result = self.video_audio_process(sample_data, video_file, system_token, vformat, selected_downsample_ratio)
             self._swap_image_to_video_keys(result)
 
         elif has_audio and has_image:
-            result = self.image_audio_process(sample_data)
+            result = self.image_audio_process(sample_data, selected_downsample_ratio)
 
         else:
             subtitle_tokens, label_tokens, _ = self.process_conversations(sample_data)
@@ -857,9 +867,11 @@ class OmniSampleProcessor:
         video_file: str,
         system_token: List[int],
         vformat: str,
+        selected_downsample_ratio:int,
     ) -> Optional[Tuple]:
+    
         subtitle_tokens, label_tokens, _ = self.process_conversations(sample_data)
-        res = self._load_video_inputs(sample_data, video_file, system_token, vformat,
+        res = self._load_video_inputs(sample_data, video_file, system_token, vformat, selected_downsample_ratio,
                                       extra_reserved_tokens=len(subtitle_tokens))
         if res is None:
             return None
@@ -883,6 +895,7 @@ class OmniSampleProcessor:
         video_file: str,
         system_token: List[int],
         vformat: str,
+        selected_downsample_ratio:int,
     ) -> Optional[Tuple]:
         answer = sample_data["answer"]
         question = sample_data["question"]
@@ -905,7 +918,7 @@ class OmniSampleProcessor:
         label_tokens += [IGNORE_INDEX] * no_loss_len + answer_tokens[no_loss_len:]
         assert len(label_tokens) == len(subtitle_tokens)
 
-        res = self._load_video_inputs(sample_data, video_file, system_token, vformat,
+        res = self._load_video_inputs(sample_data, video_file, system_token, vformat, selected_downsample_ratio,
                                       extra_reserved_tokens=len(subtitle_tokens))
         if res is None:
             return None
@@ -923,13 +936,13 @@ class OmniSampleProcessor:
             resources,
         )
 
-    def image_data_process(self, sample_data: Dict) -> Optional[Tuple]:
+    def image_data_process(self, sample_data: Dict, selected_downsample_ratio:int) -> Optional[Tuple]:
         subtitle_tokens, label_tokens, _ = self.process_conversations(sample_data)
         try:
             paths = sample_data["image"]
             if isinstance(paths, str):
                 paths = [paths]
-            images_list = self.get_image_list_from_paths(paths)
+            images_list = self.get_image_list_from_paths(paths, selected_downsample_ratio)
         except Exception as e:
             print(f"get image {sample_data['image']} error: {e!r}")
             return None
@@ -950,7 +963,7 @@ class OmniSampleProcessor:
         for t, ms in zip(thw, merge_size):
             _, h, w = t
             m, n = get_adaptive_pool_size(
-                (h / ms).item(), (w / ms).item(), self.model_args.mm_downsample_ratio
+                (h / ms).item(), (w / ms).item(), selected_downsample_ratio
             )
             cap_len += m * n + 2
 
@@ -996,7 +1009,7 @@ class OmniSampleProcessor:
         return torch.tensor([default] * n)
 
     def video_audio_process(
-        self, sample_data: Dict, video_file: str, system_token: List[int], vformat: str
+        self, sample_data: Dict, video_file: str, system_token: List[int], vformat: str, selected_downsample_ratio:int
     ) -> Optional[Tuple]:
         audio_data_list = self.get_audio_data_list(sample_data)
         if not audio_data_list:
@@ -1007,7 +1020,7 @@ class OmniSampleProcessor:
             return None
         audio_cap = self.calculate_audio_tokens(audio_data_list)
         res = self._load_video_inputs(
-            sample_data, video_file, system_token, vformat,
+            sample_data, video_file, system_token, vformat, selected_downsample_ratio,
             extra_reserved_tokens=len(subtitle_tokens) + audio_cap,
         )
         if res is None:
@@ -1026,7 +1039,7 @@ class OmniSampleProcessor:
             resources,
         )
 
-    def image_audio_process(self, sample_data: Dict) -> Optional[Tuple]:
+    def image_audio_process(self, sample_data: Dict, selected_downsample_ratio:int) -> Optional[Tuple]:
         audio_data_list = self.get_audio_data_list(sample_data)
         if not audio_data_list:
             return None
@@ -1038,7 +1051,7 @@ class OmniSampleProcessor:
             paths = sample_data["image"]
             if isinstance(paths, str):
                 paths = [paths]
-            images_list = self.get_image_list_from_paths(paths)
+            images_list = self.get_image_list_from_paths(paths, selected_downsample_ratio)
         except Exception as e:
             print(f"get image {sample_data['image']} error: {e!r}")
             return None
@@ -1059,7 +1072,7 @@ class OmniSampleProcessor:
         for t, ms in zip(thw, merge_size):
             _, h, w = t
             m, n = get_adaptive_pool_size(
-                (h / ms).item(), (w / ms).item(), self.model_args.mm_downsample_ratio
+                (h / ms).item(), (w / ms).item(), selected_downsample_ratio
             )
             cap_len += m * n + 2
 
@@ -1196,19 +1209,27 @@ class OmniSampleProcessor:
     def _expand_multimodal_tokens(
         self, input_ids: List[int], labels: List[int],
         image_thw=None, video_thw=None, audio_feature_len: List[int]=None,
-        audio_chunk_counts: List[int]=None
+        audio_chunk_counts: List[int]=None,
+        downsample_ratio=None,
     ) -> Tuple[List[int], List[int]]:
-        """Qwen2.5-VL 核心的占位符展开逻辑"""
+        """Qwen2.5-VL 核心的占位符展开逻辑
+
+        Args:
+            downsample_ratio: If provided, use this ratio instead of self.model_args.mm_downsample_ratio
+                             for calculating token counts from thw.
+        """
         new_ids, new_labels = [], []
         i_idx, v_idx, a_idx = 0, 0, 0
         # a_chunk_offset 指向 audio_feature_len 中当前音频首个 chunk 的位置
         a_chunk_offset = 0
         total_image_token, total_video_token, total_audio_token = 0, 0, 0
 
+        effective_ratio = downsample_ratio if downsample_ratio is not None else self.model_args.mm_downsample_ratio
+
         for i, token_id in enumerate(input_ids):
             if token_id == IMAGE_TOKEN_INDEX and image_thw is not None:
                 t, h, w = image_thw[i_idx]
-                m_h, m_w = get_adaptive_pool_size(h//2, w//2, self.model_args.mm_downsample_ratio)
+                m_h, m_w = get_adaptive_pool_size(h//2, w//2, effective_ratio)
                 num = (t * m_h * m_w).item()
                 new_ids.extend([self.image_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
@@ -1217,7 +1238,7 @@ class OmniSampleProcessor:
 
             elif token_id == VIDEO_TOKEN_INDEX and video_thw is not None:
                 t, h, w = video_thw[v_idx]
-                m_h, m_w = get_adaptive_pool_size(h//2, w//2, self.model_args.mm_downsample_ratio)
+                m_h, m_w = get_adaptive_pool_size(h//2, w//2, effective_ratio)
                 num = (t * m_h * m_w).item()
                 new_ids.extend([self.video_token_id] * num)
                 new_labels.extend([IGNORE_INDEX] * num)
@@ -1283,9 +1304,21 @@ class OmniSampleProcessor:
         return prefix_ids + subtitle_tokens, prefix_labels + label_tokens
 
 
+    def _get_dynamic_downsample_ratio(self, sample_data) -> Optional[int]:
+        """
+        TODO:根据sample data实现动态下采样率
+        """
+        if getattr(self.model_args, "dynamic_downsample", False):
+            candidates = getattr(self.model_args, "dynamic_downsample_ratios", [4, 8, 12, 16])
+            return random.choice(candidates)
+        else:
+            return self.model_args.mm_downsample_ratio
+
     def process(self, sample_data: Dict, sample_idx: int) -> Optional[OmniSample]:
-       
-        result = self._dispatch_modality(sample_data, sample_idx)
+
+        selected_downsample_ratio = self._get_dynamic_downsample_ratio(sample_data)
+
+        result = self._dispatch_modality(sample_data, sample_idx, selected_downsample_ratio)
         if result is None:
             return
         cur_input_ids, cur_labels, cur_caption_len, multimodal_resources = result
@@ -1299,7 +1332,8 @@ class OmniSampleProcessor:
 
         cur_input_ids, cur_labels, token_counts = self._expand_multimodal_tokens(
             cur_input_ids, cur_labels, image_thw, video_thw, actual_audio_lens,
-            audio_chunk_counts=audio_chunk_counts
+            audio_chunk_counts=audio_chunk_counts,
+            downsample_ratio=selected_downsample_ratio,
         )
 
         system_token = self._build_system_token(sample_data, sample_idx)
@@ -1307,6 +1341,15 @@ class OmniSampleProcessor:
             system_token, cur_input_ids, cur_labels
         )
         cur_caption_len = len(cur_input_ids)
+
+        # Build per-grid downsample ratio tensors
+        image_downsample_ratios = None
+        video_downsample_ratios = None
+        if selected_downsample_ratio is not None:
+            if image_thw is not None:
+                image_downsample_ratios = torch.full((image_thw.shape[0],), selected_downsample_ratio, dtype=torch.float32)
+            if video_thw is not None:
+                video_downsample_ratios = torch.full((video_thw.shape[0],), selected_downsample_ratio, dtype=torch.float32)
 
         return OmniSample(
             input_ids=cur_input_ids,
@@ -1319,6 +1362,8 @@ class OmniSampleProcessor:
             audio_features=multimodal_resources.get("audio_features"),
             audio_features_lens=multimodal_resources.get("audio_features_lens"),
             actual_audio_feature_len=multimodal_resources.get("actual_audio_feature_len", []),
+            image_downsample_ratios=image_downsample_ratios,
+            video_downsample_ratios=video_downsample_ratios,
             attention_mask_len=[cur_caption_len],
             token_counts=token_counts,
         )

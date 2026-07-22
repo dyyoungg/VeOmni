@@ -197,6 +197,8 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        image_downsample_ratios: Optional[torch.Tensor] = None,
+        video_downsample_ratios: Optional[torch.Tensor] = None,
         # audio
         audio_features: Optional[torch.Tensor] = None,
         audio_features_lens: Optional[torch.LongTensor] = None,
@@ -304,8 +306,24 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
 
             cat_pixels = torch.cat(cat_pixels, dim=0)
             cat_thw = torch.cat(cat_thw, dim=0)
+            # Concatenate downsample ratios for image + video grids
+            cat_downsample_ratios = None
+            if image_downsample_ratios is not None or video_downsample_ratios is not None:
+                ratio_parts = []
+                if pixel_values is not None and image_grid_thw is not None:
+                    if image_downsample_ratios is not None:
+                        ratio_parts.append(image_downsample_ratios)
+                    else:
+                        ratio_parts.append(torch.full((image_grid_thw.shape[0],), self.image_encoder.mm_projector.mm_downsample_ratio, device=cat_thw.device))
+                if pixel_values_videos is not None and video_grid_thw is not None:
+                    if video_downsample_ratios is not None:
+                        ratio_parts.append(video_downsample_ratios)
+                    else:
+                        ratio_parts.append(torch.full((video_grid_thw.shape[0],), self.image_encoder.mm_projector.mm_downsample_ratio, device=cat_thw.device))
+                if ratio_parts:
+                    cat_downsample_ratios = torch.cat(ratio_parts, dim=0)
             with step_timer.measure("vit") if step_timer else contextlib.nullcontext():
-                vision_features, _ = self.image_encoder.lm_encode(features=cat_pixels, grid_thw=cat_thw)
+                vision_features, _ = self.image_encoder.lm_encode(features=cat_pixels, grid_thw=cat_thw, downsample_ratios=cat_downsample_ratios)
             vision_features = vision_features.to(inputs_embeds.device, inputs_embeds.dtype)
             # print("vision feature", vision_features.shape)
             image_features = vision_features[:effective_n_image_tokens]

@@ -88,12 +88,15 @@ class DynamicAvgPoolProjector(nn.Module):
             nn.Linear(in_hidden, out_hidden),
         )
 
-    def forward(self, images_feature, images_thw, merge_size=None):
+    def forward(self, images_feature, images_thw, merge_size=None, downsample_ratios=None):
         """
         Args:
-            images: Tensor of shape [N, hidden_size]
+            images_feature: Tensor of shape [N, hidden_size]
             images_thw: Tensor of shape [m, 3], each row is [t, h, w]
                        There are m sequences; each sequence corresponds to t*h*w vectors in `images`.
+            merge_size: Optional tensor of shape [m], per-grid merge size.
+            downsample_ratios: Optional tensor/list of shape [m], per-grid downsample ratio.
+                              If None, uses self.mm_downsample_ratio for all grids.
         Returns:
             Tensor of shape [m, out_hidden]
         """
@@ -101,22 +104,23 @@ class DynamicAvgPoolProjector(nn.Module):
         start = 0
         seq_len = []
         hidden_size = images_feature.shape[-1]
-        
+
         if merge_size is None:
             merge_size = torch.tensor([self.merge_size]*images_thw.shape[0])
-        
-       
-        for thw, each_merge_size in zip(images_thw, merge_size):
+
+
+        for i, (thw, each_merge_size) in enumerate(zip(images_thw, merge_size)):
             t, h, w = thw.cpu().tolist()
             h, w = int(h / each_merge_size.item()), int(w / each_merge_size.item())
             length = int(t * h * w)
             img_seq = images_feature[start:start + length]  # [t*h*w, hidden]
             start += length
-           
+
             # reshape to [t, h, w, hidden] -> permute to [hidden, t, h, w]
             img_feat = img_seq.view(t, h, w, -1).permute(3, 0, 1, 2)  # [hidden, t, h, w]
 
-            Mh, Nw = get_adaptive_pool_size(h, w, scale=self.mm_downsample_ratio)
+            scale = downsample_ratios[i].item() if downsample_ratios is not None else self.mm_downsample_ratio
+            Mh, Nw = get_adaptive_pool_size(h, w, scale=scale)
             pool = nn.AdaptiveAvgPool2d((Mh, Nw))  # pool on H, W
          
 

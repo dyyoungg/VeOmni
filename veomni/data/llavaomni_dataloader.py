@@ -117,9 +117,10 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
     )[:, :tokenizer.model_max_length]
 
     multimodal_keys = [
-        "pixel_values", "image_grid_thw", 
-        "pixel_values_video", "video_grid_thw", 
-        "audio_features", "audio_features_lens"
+        "pixel_values", "image_grid_thw",
+        "pixel_values_video", "video_grid_thw",
+        "audio_features", "audio_features_lens",
+        "image_downsample_ratios", "video_downsample_ratios"
     ]
     collected_tensors = {k: [] for k in multimodal_keys}
     
@@ -168,6 +169,8 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
         "video_grid_thw": safe_cat(collected_tensors["video_grid_thw"]),
         "audio_features": safe_cat(collected_tensors["audio_features"]),
         "audio_features_lens": safe_cat(collected_tensors["audio_features_lens"]),
+        "image_downsample_ratios": safe_cat(collected_tensors["image_downsample_ratios"]),
+        "video_downsample_ratios": safe_cat(collected_tensors["video_downsample_ratios"]),
     }
 
     # packing
@@ -570,6 +573,8 @@ class OmniDataloader(BaseDataLoader):
             "video_pixels":         _safe_cat(self.new_video_list),
             "audio_features_lens":  _safe_cat(self.audio_feature_len_list),
             "audio_features":       _safe_cat(self.audio_feature_list),
+            "image_downsample_ratios": _safe_cat(self.new_image_downsample_ratios),
+            "video_downsample_ratios": _safe_cat(self.new_video_downsample_ratios),
         }
         self._enqueue_packed_result(
             packed_ids, packed_labels,
@@ -587,6 +592,8 @@ class OmniDataloader(BaseDataLoader):
             "video_grid_thw":       resources.get("video_thw"),
             "audio_features":       resources.get("audio_features"),
             "audio_features_lens":  resources.get("audio_features_lens"),
+            "image_downsample_ratios": resources.get("image_downsample_ratios"),
+            "video_downsample_ratios": resources.get("video_downsample_ratios"),
             "attention_mask_len":   attn_mask_len,
         })
 
@@ -600,12 +607,16 @@ class OmniDataloader(BaseDataLoader):
             self.new_images_list.append(resources["image_pixels"])
             self.new_images_thw.append(resources["image_thw"])
             self.new_image_tokens.append(token_counts["image"])
+            if resources.get("image_downsample_ratios") is not None:
+                self.new_image_downsample_ratios.append(resources["image_downsample_ratios"])
 
         if resources.get("video_pixels") is not None and resources.get("video_thw") is not None:
             self.new_video_list.append(resources["video_pixels"])
             self.new_video_thw.append(resources["video_thw"])
             self.new_video_tokens.append(token_counts["video"])
-            
+            if resources.get("video_downsample_ratios") is not None:
+                self.new_video_downsample_ratios.append(resources["video_downsample_ratios"])
+
         if resources.get("audio_features") is not None and resources.get("audio_features_lens") is not None:
             self.audio_feature_list.append(resources["audio_features"])
             self.audio_feature_len_list.append(resources["audio_features_lens"])
@@ -620,6 +631,8 @@ class OmniDataloader(BaseDataLoader):
         self.new_video_list, self.new_video_thw = [], []
         self.audio_feature_list, self.audio_feature_len_list = [], []
         self.new_image_tokens, self.new_video_tokens, self.new_audio_tokens = [], [], []
+        self.new_image_downsample_ratios = []
+        self.new_video_downsample_ratios = []
 
     
     # ------------------------------------------------------------------
@@ -665,6 +678,8 @@ class OmniDataloader(BaseDataLoader):
                 "audio_features": sample.audio_features,
                 "audio_features_lens": sample.audio_features_lens,
                 "actual_audio_feature_len": sample.actual_audio_feature_len,
+                "image_downsample_ratios": sample.image_downsample_ratios,
+                "video_downsample_ratios": sample.video_downsample_ratios,
             },
             token_counts=sample.token_counts,
         )
@@ -978,7 +993,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         """统一视频与图像的特征加载流，复用基类方法"""
         video_path = sample_data.get("path")
         image_path = sample_data.get("image_path")
-        
+        selected_downsample_ratio = self.model_args.mm_downsample_ratio
         if video_path:
             video_file = self.processor.get_video_path({"video": video_path})
             if not video_file: 
@@ -989,9 +1004,9 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             
             # 复用 OmniDataloader 的 get_video_frames
             if start is not None and end is not None:
-                imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, start, end)
+                imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, selected_downsample_ratio, start, end)
             else:
-                imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, format=vformat)
+                imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, selected_downsample_ratio, format=vformat)
                 
             if not imgs:
                 print("eval data extrace video failed!!!!!!!!check video process!!") 
@@ -1007,7 +1022,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 if not isinstance(image_path, list):
                     print(f"image path is not list, check data:{sample_data}")
                     return None, None, "none"
-                imgs = self.processor.get_image_list_from_paths(image_path)
+                imgs = self.processor.get_image_list_from_paths(image_path, selected_downsample_ratio)
                 if not imgs:
                     print("eval data extrace image failed!!!!!!!!check video process!!") 
                     return None, None, "error"

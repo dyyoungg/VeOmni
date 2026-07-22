@@ -286,8 +286,8 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
         else:
             self.merger.requires_grad_(True)
     
-    def lm_encode(self, features: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
-        
+    def lm_encode(self, features: torch.Tensor, grid_thw: torch.Tensor, downsample_ratios=None, **kwargs) -> torch.Tensor:
+
         use_balance = (
             self._encoder_data_balance is not None
             and self.training
@@ -320,9 +320,9 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
 
         if self.freeze_image_projector:
             with torch.no_grad():
-                features, seq_len = self.mm_projector(features, grid_thw)
+                features, seq_len = self.mm_projector(features, grid_thw, downsample_ratios=downsample_ratios)
         else:
-            features, seq_len = self.mm_projector(features, grid_thw)
+            features, seq_len = self.mm_projector(features, grid_thw, downsample_ratios=downsample_ratios)
         return features, seq_len
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
