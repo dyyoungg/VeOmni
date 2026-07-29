@@ -926,24 +926,37 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         cur_input_ids = system_token + subtitle_tokens
         cur_labels = [IGNORE_INDEX] * len(system_token) + label_tokens
 
+        downsample_ratio = self.model_args.mm_downsample_ratio
         input_ids, labels, _  = self.processor._expand_multimodal_tokens(
             cur_input_ids, cur_labels,
             image_thw=thw if visual_mode == "image" else None,
             video_thw=thw if visual_mode == "video" else None,
             audio_feature_len=actual_audio_len,
-            audio_chunk_counts=audio_chunk_counts
+            audio_chunk_counts=audio_chunk_counts,
+            downsample_ratio=downsample_ratio,
         )
-       
+
+        # Build per-grid downsample ratio tensors (same as training path)
+        image_downsample_ratios = None
+        video_downsample_ratios = None
+        if thw is not None:
+            if visual_mode == "image":
+                image_downsample_ratios = torch.full((thw.shape[0],), downsample_ratio, dtype=torch.float32)
+            elif visual_mode == "video":
+                video_downsample_ratios = torch.full((thw.shape[0],), downsample_ratio, dtype=torch.float32)
+
         return self._build_return_dict(
-            input_ids=input_ids, 
-            labels=labels, 
+            input_ids=input_ids,
+            labels=labels,
             category=category,
             pixel_values=pixels if visual_mode == "image" else None,
             image_grid_thw=thw if visual_mode == "image" else None,
             pixel_values_video=pixels if visual_mode == "video" else None,
             video_grid_thw=thw if visual_mode == "video" else None,
-            audio_features=audio_mel, 
+            audio_features=audio_mel,
             audio_features_lens=raw_audio_len,
+            image_downsample_ratios=image_downsample_ratios,
+            video_downsample_ratios=video_downsample_ratios,
             options_num=len(sample_data.get("candidates", [])),
             raw_data=sample_data
         )
@@ -1009,7 +1022,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 imgs, _, _, _ = self.processor.get_video_frames(video_file, max_tokens, selected_downsample_ratio, format=vformat)
                 
             if not imgs:
-                print("eval data extrace video failed!!!!!!!!check video process!!") 
+                print(f"eval data extract video failed!!!!!!!!check video process!!：{video_path}") 
                 return None, None, "error"
             
             inputs = self.processor.process_image_videos(video=imgs, merge_size=self.video_merge_size)
@@ -1024,7 +1037,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                     return None, None, "none"
                 imgs = self.processor.get_image_list_from_paths(image_path, selected_downsample_ratio)
                 if not imgs:
-                    print("eval data extrace image failed!!!!!!!!check video process!!") 
+                    print("eval data extract image failed!!!!!!!!check video process!!") 
                     return None, None, "error"
             
                 inputs = self.processor.process_image_videos(images=imgs, merge_size=self.image_merge_size) 
@@ -1131,8 +1144,8 @@ if __name__ == "__main__":
     training_args.model_max_length = 4096
     training_args.num_train_epochs = 1
     model_args.model_path = "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
-    model_args.vision_tower = "/mnt/afs/share/qwen25_vl_encoder"
-    data_args.eval_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_audio_text_ocr_eval.json"
+    model_args.vision_tower = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
+    data_args.eval_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/videommmu_mme_lvbench.json"
     
     training_args.dataloader_num_workers = 0
     model_args.mm_downsample_ratio = 16
@@ -1140,7 +1153,7 @@ if __name__ == "__main__":
     training_args.per_device_train_batch_size = 1
     
     # subtitle
-    data_args.sample_fps = 1
+    data_args.sample_fps = 2
     data_args.compress_fps = True
     data_args.high_resolution_interval = 4
     data_args.max_subtitle_token_num = 2048
@@ -1160,37 +1173,61 @@ if __name__ == "__main__":
     
     
 
-    dataloader = get_train_dataloader(
+    dataloader = get_eval_dataloader(
         tokenizer=tokenizer,
         data_args=data_args,
         training_args=training_args,
         model_args=model_args,
      
     )
+    eval_data = Qwen25VLEvaluationDataset(tokenizer, 
+                                                data_args,
+                                                training_args,
+                                                model_args)
+    eval_data.init_image_processor()
+    with open(data_args.eval_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
-    if rank == 0:
-        pbar = tqdm(total=len(dataloader), desc="Processing", unit="batch")
-    dataloader.launch()
-    print("launched the dataloader!!!")
-    t1 = time.time()
-    for i, data in enumerate(dataloader):
-        print("rank", rank)
-        # print(i, len(data["input_ids"][0]), data["cu_seq_lens_q"][-1] )
-        # assert len(data["input_ids"][0]) == data["cu_seq_lens_q"][-1]
-        # print("#############")
+    new_data = []
+
+    for line in data:
+        if line["category"] == "videommmu":
+            new_data.append(line)
+
+    data = new_data
+    def check_single_item(line):
+        try:
+            eval_data._load_visual_features(line, max_tokens=4096)
+            return True, line, None
+        except Exception as e:
+           
+            video_identifier = line.get("video") or line.get("id") or str(line)
+            return False, video_identifier, str(e)
+
+    failed_items = []
+    num_workers = 16  
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    print(f"开始多线程校验，共 {len(data)} 条数据...")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+       
+        futures = [executor.submit(check_single_item, line) for line in data]
         
-        # if rank == 0:
-        #     pbar.set_postfix({"time": f"{time.time() - t1:.2f}s"})
-        #     pbar.update(1)
-        # t1 = time.time()
+        for future in tqdm(as_completed(futures), total=len(data), desc="Validating Videos"):
+            success, video_id, err_msg = future.result()
+            if not success:
+                failed_items.append({"video": video_id, "error": err_msg})
+
+
+    print(f"\n校验完成！共计 {len(failed_items)} / {len(data)} 个视频无法正常加载。")
+
+    if failed_items:
+        print("\n[失败列表示例]:")
+        for item in failed_items[:10]:  # 仅展示前10个
+            print(f"路径/标识: {item['video']} | 错误原因: {item['error']}")
         
-        input_ids = data["input_ids"]
-        print("input_ids", input_ids)
-        input_ids[input_ids == 151656] = 15
-        # input_ids[input_ids == -300] = 15
-        
-        print("#"*20)
-        print(tokenizer.decode(input_ids.cpu().view(-1).tolist()))
-        print("#"*20)
-        
+        # 将失败的视频列表保存到本地 json
+        output_fail_log = "failed_videos_log.json"
+        with open(output_fail_log, "w", encoding="utf-8") as f:
+            json.dump(failed_items, f, ensure_ascii=False, indent=2)
+        print(f"\n所有失败视频的完整日志已保存至: {output_fail_log}")
