@@ -372,6 +372,12 @@ class EvaluateCallback(Callback):
                         data[k]   = v.to(device=device, dtype=tgt_dtype)
  
                 category: str = data.pop("category")[0]
+                # Skip dummy batches produced by the collator when all samples
+                # in a batch are None (e.g. failed to load).  We still need to
+                # run model() so that FSDP all-gathers stay in sync across ranks.
+                if category == "dummy_skip":
+                    output = model(**data)
+                    continue
                 pred_record = raw_data.copy()
                 # ── dispatch to eval mode ─────────────────────────────────
                 if category in ASR_CATEGORIES:

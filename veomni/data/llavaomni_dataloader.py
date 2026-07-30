@@ -102,7 +102,27 @@ def create_packed_causal_mask_4D(
 def Qwen25VLcollatorFunc(batch_data, tokenizer):
     batch_data = [x for x in batch_data if x is not None]
     if len(batch_data) == 0:
-        raise ValueError("batch data is all None!")
+        # Return a dummy batch with a single padding token instead of raising.
+        # This keeps all ranks in sync during distributed eval – if one rank's
+        # sample fails while others succeed, a raise here causes that rank's
+        # DataLoader worker to die, leading to NCCL timeout / CUDA errors.
+        dummy_id = torch.tensor([[tokenizer.pad_token_id]], dtype=torch.long)
+        return {
+            "input_ids": dummy_id,
+            "labels": torch.tensor([[IGNORE_INDEX]], dtype=torch.long),
+            "attention_mask": torch.ones(1, 1, dtype=torch.long),
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "pixel_values_videos": None,
+            "video_grid_thw": None,
+            "audio_features": None,
+            "audio_features_lens": None,
+            "image_downsample_ratios": None,
+            "video_downsample_ratios": None,
+            "category": ["dummy_skip"],
+            "raw_data": [{}],
+            "options_num": torch.tensor([0], dtype=torch.long),
+        }
 
     # 1. 基础文本 Token 与 Label 的 Padding 和截断
     input_ids = [instance["input_ids"] for instance in batch_data]
@@ -936,6 +956,21 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             downsample_ratio=downsample_ratio,
         )
 
+        # Skip samples that exceed model_max_length after token expansion,
+        # otherwise the collator truncates input_ids causing image/video token
+        # count to mismatch projector output (CUDA OOB) and answer labels to
+        # be cut off (target_id becomes IGNORE_INDEX=-100).
+        if len(input_ids) > self.tokenizer.model_max_length:
+            n_images = len(thw) if thw is not None and visual_mode == "image" else 0
+            n_video_frames = thw[0][0].item() if thw is not None and visual_mode == "video" else 0
+            print(f"[Eval Warning] Sample exceeds model_max_length after expansion "
+                  f"({len(input_ids)} > {self.tokenizer.model_max_length}), skipping. "
+                  f"category={category}, visual_mode={visual_mode}, n_images={n_images}, "
+                  f"n_video_frames={n_video_frames}, "
+                  f"image_path={sample_data.get('image_path', 'N/A')}, "
+                  f"video_path={sample_data.get('path', 'N/A')}")
+            return None
+
         # Build per-grid downsample ratio tensors (same as training path)
         image_downsample_ratios = None
         video_downsample_ratios = None
@@ -1037,10 +1072,35 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                     return None, None, "none"
                 imgs = self.processor.get_image_list_from_paths(image_path, selected_downsample_ratio)
                 if not imgs:
-                    print("eval data extract image failed!!!!!!!!check video process!!") 
+                    print("eval data extract image failed!!!!!!!!check video process!!")
                     return None, None, "error"
-            
-                inputs = self.processor.process_image_videos(images=imgs, merge_size=self.image_merge_size) 
+
+                # Limit total image tokens to max_tokens (analogous to the video branch).
+                # Each image's token count after projector pooling:
+                #   h_patches = img.height / image_factor,  w_patches = img.width / image_factor
+                #   merged: h = h_patches / merge_size,  w = w_patches / merge_size
+                #   after adaptive pool: Mh, Nw = get_adaptive_pool_size(h, w, scale)
+                #   tokens = Mh * Nw
+                from veomni.data.multimodal.image_utils import get_adaptive_pool_size
+                merge = self.image_merge_size
+                factor = self.processor.image_patch_size
+                kept_imgs = []
+                total_tokens = 0
+                for img in imgs:
+                    h = img.height // factor // merge
+                    w = img.width  // factor // merge
+                    mh, mw = get_adaptive_pool_size(h, w, scale=selected_downsample_ratio)
+                    n_tokens = mh * mw
+                    if total_tokens + n_tokens > max_tokens and kept_imgs:
+                        break
+                    kept_imgs.append(img)
+                    total_tokens += n_tokens
+                if len(kept_imgs) < len(imgs):
+                    print(f"[Eval Info] Truncated images from {len(imgs)} to {len(kept_imgs)} "
+                          f"to fit max_tokens ({total_tokens}/{max_tokens})")
+                imgs = kept_imgs
+
+                inputs = self.processor.process_image_videos(images=imgs, merge_size=self.image_merge_size)
                 return inputs["pixel_values"], inputs['image_grid_thw'], "image"
             except Exception as e:
                 print(f"[Visual Load Error] {e}")
