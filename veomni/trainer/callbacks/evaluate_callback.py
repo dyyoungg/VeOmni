@@ -357,7 +357,7 @@ class EvaluateCallback(Callback):
         local_predictions: list = []
  
         model.eval()
- 
+
         with torch.no_grad():
             for idx, data in enumerate(eval_dl):
                 if rank==0 and idx % 2 == 0:

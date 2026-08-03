@@ -481,7 +481,16 @@ class VLMTrainer:
             dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
         if args.train.remote_dataloader:
             self.init_data_size = len(self.train_dataloader.data_list)
+        elif hasattr(self.train_dataloader, "num_train_epochs"):
+            # Ulysses PrefetchingPackedLoader: data_list is single-epoch per DP rank.
+            # Total samples across all epochs = per_rank * dp_world_size * num_epochs.
+            self.init_data_size = (
+                len(self.train_dataloader.data_list)
+                * dp_world_size
+                * self.train_dataloader.num_train_epochs
+            )
         else:
+            # OmniDataloader: data_list already contains num_epochs copies
             self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
        
         self.start_step = 0
@@ -677,31 +686,46 @@ class VLMTrainer:
             
         else:
             if hasattr(self.train_dataloader, "samples_consumed"):
-                remain_data = len(self.train_dataloader.data_list) - self.train_dataloader.samples_consumed
+                # Ulysses PrefetchingPackedLoader path: samples_consumed is
+                # the cumulative count of raw samples consumed on this DP rank.
+                # All-reduce (sum) across DP ranks to get the global total.
+                # Use dp_group to avoid double-counting SP ranks within the same DP group.
+                consumed_per_rank = self.train_dataloader.samples_consumed
+                consumed_tensor = torch.tensor(consumed_per_rank, dtype=torch.long, device=self.device)
+                if dist.is_initialized():
+                    ps = get_parallel_state()
+                    dp_group = ps.dp_group if ps is not None else None
+                    dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
+                self.video_trained_num = int(consumed_tensor.item())
+                self.state.video_trained_num = self.video_trained_num
+                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+
             elif hasattr(self.train_dataloader, "data_queue"):
                 remain_data = self.train_dataloader.data_queue.qsize()
+
+                data_tensor_in = torch.tensor(remain_data, dtype=torch.long, device=self.device)
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                self._data_tensor_out = torch.zeros(world_size, dtype=torch.long, device=self.device)
+                if dist.is_initialized():
+                    dist.all_gather_into_tensor(self._data_tensor_out, data_tensor_in)
+                else:
+                    self._data_tensor_out[0] = data_tensor_in
+
+                if get_parallel_state() is not None:
+                    self._data_tensor_out = self._data_tensor_out // get_parallel_state().sp_size
+
+                self.video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
+                self.state.video_trained_num = self.video_trained_num
+                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+
             else:
                 remain_data = len(self.train_dataloader.data_list)
                 logger.warning(
                     "dataloader has no attr data_queue or samples_consumed, defaulting to len(data_list)"
                 )
- 
-            data_tensor_in = torch.tensor(remain_data, dtype=torch.long, device=self.device)
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            self._data_tensor_out = torch.zeros(world_size, dtype=torch.long, device=self.device)
-            if dist.is_initialized():
-                dist.all_gather_into_tensor(self._data_tensor_out, data_tensor_in)
-            else:
-                self._data_tensor_out[0] = data_tensor_in
- 
-            if get_parallel_state() is not None:
-                self._data_tensor_out = self._data_tensor_out // get_parallel_state().sp_size
- 
-            self.video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
-            self.state.video_trained_num = self.video_trained_num
- 
-            # Update fractional epoch for callbacks / logging
-            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                self.video_trained_num = self.init_data_size - remain_data
+                self.state.video_trained_num = self.video_trained_num
+                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
  
     
 

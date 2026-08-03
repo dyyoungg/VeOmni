@@ -246,8 +246,8 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
-    # Ulysses patch
-    ulysses_enabled = get_parallel_state().ulysses_enabled
+    # Ulysses patch – only during training; eval runs without SP
+    ulysses_enabled = get_parallel_state().ulysses_enabled and module.training
     if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
         # Sanity Check & Repeat Key & Value

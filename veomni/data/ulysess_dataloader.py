@@ -1,5 +1,6 @@
 
 import os
+import json
 import time
 import random
 from typing import Optional, List, Dict, Any, Callable, Tuple, Iterator
@@ -158,35 +159,61 @@ class UlyssesStreamingDataset(IterableDataset):
         self.data_args = data_args
         self.model_args = model_args
         self.training_args = training_args
- 
+
         self.epoch = 0
         self.skip_samples_count = 0
         self.offline_split = getattr(data_args, "offline_dataset_split", False)
- 
+
+        # offset-based lazy reading mode
+        offset_path = getattr(data_args, "offset_file_path", "")
+        mapping_path = getattr(data_args, "file_maping_path", "")
+        self.use_offset = bool(offset_path and mapping_path
+                               and os.path.exists(offset_path)
+                               and os.path.exists(mapping_path))
+        self._all_offsets = None      # np.ndarray [N, 2] (mmap)
+        self.file_mapping = None      # List[str]
+
         self.dp_rank, self.dp_world_size = self._detect_distribution_mode()
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-      
-        self.data_list: List[Dict] = self._load_data_list(data_args.train_path)
-       
+
+        self.data_list = self._load_data_list(data_args.train_path)
+
         try:
             ps = get_parallel_state()
             self._sp_rank = ps.ulysses_rank if (ps is not None and ps.sp_size > 1) else 0
         except Exception:
             self._sp_rank = 0
             logger.info("get sp rank failed. set sp_rank=0 by default.")
-        logger.info(f"[DP Rank {self.dp_rank} SP Rank {self._sp_rank}] Loaded {len(self.data_list)} samples.")
+        logger.info(f"[DP Rank {self.dp_rank} SP Rank {self._sp_rank}] "
+                     f"Loaded {len(self.data_list)} samples (offset_mode={self.use_offset}).")
         # Processor is lazily initialized inside each DataLoader worker
         self._processor: Optional[UlysessOmniProcessor] = None
  
     # ── Data loading ─────────────────────────────────────────────────────────
  
-    def _load_data_list(self, data_path: str) -> List[Dict]:
-      
+    def _load_data_list(self, data_path: str):
+        # ── Offset-based lazy reading mode ────────────────────────────────
+        if self.use_offset:
+            offset_path = self.data_args.offset_file_path
+            mapping_path = self.data_args.file_maping_path
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                self.file_mapping = json.load(f)
+            self._all_offsets = np.load(offset_path, mmap_mode='r')  # [N, 2], uint64
+            # 按 dp_rank 确定性分片 → 同一 DP group 内所有 SP rank 拿到相同子集
+            total = len(self._all_offsets)
+            indices = list(range(self.dp_rank, total, self.dp_world_size))
+            logger.info(
+                f"[DP Rank {self.dp_rank}] Offset mode: {total} total samples, "
+                f"{len(indices)} assigned to this DP rank."
+            )
+            return indices  # data_list 存的是 offset 数组的 global index
+
+        # ── Original full-load mode ───────────────────────────────────────
         if not self.offline_split:
             assert isinstance(data_path, str), "offline spilt is False, data path must in json or jsonl format!"
             full = read_data(data_path)
             return full[self.dp_rank :: self.dp_world_size]
- 
+
         assert os.path.isdir(data_path), (
             f"offline_dataset_split=True requires data_path to be a directory, got: {data_path}"
         )
@@ -242,11 +269,34 @@ class UlyssesStreamingDataset(IterableDataset):
  
     # ── Iteration helpers ─────────────────────────────────────────────────────
  
-    def _get_shuffled_data(self) -> List[Dict]:
+    def _get_shuffled_data(self) -> List:
         g = torch.Generator()
         g.manual_seed(self.epoch + 42)
         perm = torch.randperm(len(self.data_list), generator=g).tolist()
         return [self.data_list[i] for i in perm]
+
+    # ── Offset-based lazy reading helpers ─────────────────────────────────
+
+    def _get_file_handle(self, file_path: str):
+        """Per-worker file handle cache to avoid repeated open/close."""
+        if not hasattr(self, '_file_cache'):
+            self._file_cache = {}
+        if file_path not in self._file_cache:
+            if len(self._file_cache) >= 100:
+                oldest = next(iter(self._file_cache))
+                self._file_cache[oldest].close()
+                del self._file_cache[oldest]
+            self._file_cache[file_path] = open(file_path, "r", encoding="utf-8")
+        return self._file_cache[file_path]
+
+    def _read_sample_by_offset(self, offset_idx: int) -> Dict:
+        """Seek to byte offset in the source JSONL and read one sample."""
+        file_id, byte_offset = self._all_offsets[offset_idx]
+        file_path = self.file_mapping[int(file_id)]
+        fh = self._get_file_handle(file_path)
+        fh.seek(int(byte_offset))
+        line = fh.readline()
+        return json.loads(line)
  
     @staticmethod
     def _iterate_with_lookahead(iterable):
@@ -280,17 +330,19 @@ class UlyssesStreamingDataset(IterableDataset):
         local_counter = self.skip_samples_count
         self.skip_samples_count = 0  # reset so next epoch starts fresh
  
-        for i, sample_data in enumerate(data):
+        for i, item in enumerate(data):
             try:
                 if global_idx % total_shards == current_shard:
- 
+
                     try:
+                        # offset 模式：item 是 offset 数组的 global index，按需读取
+                        sample_data = self._read_sample_by_offset(item) if self.use_offset else item
                         result = self._processor(sample_data, sample_idx=local_counter)
                         if result is not None:
                             if isinstance(result, (list, types.GeneratorType)):
                                 sub_idx = 0
-                                for item, is_last in self._iterate_with_lookahead(result):
-                                    yield (global_idx, sub_idx, is_last, item)
+                                for sub_item, is_last in self._iterate_with_lookahead(result):
+                                    yield (global_idx, sub_idx, is_last, sub_item)
                                     sub_idx += 1
                                 result = None
                             else:
@@ -612,6 +664,7 @@ class PrefetchingPackedLoader:
         collate_fn: Optional[Callable] = None,
         prefetch_batches: int = 2,
         start_epoch: int = 0,
+        num_train_epochs: int = 1,
     ):
         self.dataset        = dataset
         self.tokenizer      = tokenizer
@@ -621,6 +674,7 @@ class PrefetchingPackedLoader:
         self.collate_fn     = collate_fn
         self.prefetch_batches = prefetch_batches
         self.epoch          = start_epoch
+        self.num_train_epochs = num_train_epochs
         self.samples_consumed = 0
  
         self.is_launched    = False
@@ -825,6 +879,14 @@ class PrefetchingPackedLoader:
  
         try:
             while not self.stop_event.is_set():
+                # Check epoch limit
+                if self.epoch >= self.num_train_epochs:
+                    logger.info(
+                        f"[Rank {self.rank}] All {self.num_train_epochs} epoch(s) finished. "
+                        f"Producer stopping."
+                    )
+                    break
+
                 self._propagate(self.dataset, "set_epoch", self.epoch)
  
                 raw_iter    = iter(self.dataset)
@@ -849,8 +911,8 @@ class PrefetchingPackedLoader:
                     batch_buf.clear()
  
                 logger.info(
-                    f"[Rank {self.rank}] Epoch {self.epoch} finished. "
-                    f"Starting epoch {self.epoch + 1}…"
+                    f"[Rank {self.rank}] Epoch {self.epoch} finished "
+                    f"({self.epoch + 1}/{self.num_train_epochs})."
                 )
                 self.epoch += 1
  
@@ -859,8 +921,8 @@ class PrefetchingPackedLoader:
                 logger.error(f"[Rank {self.rank}] Producer error: {e}\n{traceback.format_exc()}")
                 self.queue.put(e)
         finally:
-            if self.stop_event.is_set():
-                self.queue.put(None)
+            # Signal consumer to stop, whether we finished all epochs or were stopped
+            self.queue.put(None)
  
     def _emit(self, batch_buf: List):
         """Collate and enqueue a batch; propagate exceptions to consumer."""
@@ -938,7 +1000,8 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         tokenizer       : pre-built tokenizer (already configured)
  
     Returns:
-        PrefetchingPackedLoader – infinite iterator yielding collated batches
+        PrefetchingPackedLoader – finite iterator yielding collated batches
+                                  for num_train_epochs epochs
     """
    
     # ── Dataset ───────────────────────────────────────────────────────────────
@@ -973,6 +1036,7 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         batch_size=training_args.per_device_train_batch_size,
         collate_fn=collator,
         prefetch_batches=getattr(training_args, "dataloader_prefetch_batches", 2),
+        num_train_epochs=int(getattr(training_args, "num_train_epochs", 1)),
     )
  
     return train_loader
@@ -1025,28 +1089,47 @@ def test_ulysess():
     args = parse_args(VeOmniVLMArguments)
     model_args, data_args, training_args = args.model, args.data, args.train
 
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_path,  
+    # Must set CUDA device and init dist BEFORE init_parallel_state
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_path,
                                               model_max_length=training_args.model_max_length)
     init_parallel_state(ulysses_size=2)
 
     rank = dist.get_rank()
     dp_rank = get_parallel_state().dp_rank
     print(f"RANK: {rank}, dp rank: {dp_rank}")
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device("cuda", local_rank)
 
-    train_loader = make_ulysses_train_dataloader(model_args, data_args, training_args, tokenizer)
+    train_loader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
 
     for i, data in enumerate(train_loader):
-        sp_group =  get_parallel_state().ulysses_group
+        sp_group = get_parallel_state().ulysses_group
         sp_rank = get_parallel_state().sp_rank
-        input_ids = data["input_ids"].to(device) 
-      
-        id_consist = check_sp_consistency(input_ids, sp_group, "Input IDs",  step=i)
-   
-        msg = f"RANK: {rank} DP_Rank {dp_rank} | Shape: {input_ids.shape} | Consumed: {train_loader.samples_consumed}"
+        device_data = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+
+        # Check seq_lens (NOT sp-sliced) for data consistency across SP ranks
+        seq_lens = device_data["seq_lens"]
+        seq_consist = check_sp_consistency(seq_lens, sp_group, "seq_lens", step=i)
+
+        # Check full input_ids by all_gather-ing the SP chunks back together
+        input_ids = device_data["input_ids"].squeeze(0)  # [T_pad // sp_size]
+        sp_size = get_parallel_state().sp_size
+        gathered = [torch.zeros_like(input_ids) for _ in range(sp_size)]
+        dist.all_gather(gathered, input_ids, group=sp_group)
+        full_ids = torch.cat(gathered, dim=0)
+        id_consist = check_sp_consistency(full_ids, sp_group, "full_input_ids", step=i)
+
+        status = "✅" if (seq_consist and id_consist) else "❌"
+        msg = (f"{status} RANK: {rank} DP_Rank {dp_rank} SP_Rank {sp_rank} | "
+               f"Shape: {device_data['input_ids'].shape} | "
+               f"seq_lens: {seq_lens.tolist()} | "
+               f"Consumed: {train_loader.samples_consumed}")
         print(msg)
-        del input_ids
+        del device_data, full_ids, gathered
 
 
 
