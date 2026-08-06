@@ -446,9 +446,21 @@ class OmniSampleProcessor:
         start_frame: int,
         end_frame: int,
         framerate: float,
-        fix_sample_fps: bool=False
+        fix_sample_fps: bool = False,
+        random_sample: bool = False,
     ) -> List[int]:
-        if self.data_args.use_finetune_fps and fix_sample_fps:
+        if random_sample:
+            available_frames = list(range(start_frame, end_frame))
+            # 无放回随机抽样
+            if len(available_frames) >= desired_num_frames:
+                seq = random.sample(available_frames, desired_num_frames)
+            # 有放回抽样（允许重复帧）
+            else:
+                seq = random.choices(available_frames, k=desired_num_frames)
+            
+            # 排序以保证时间顺序是从前到后的
+            seq.sort()
+        elif self.data_args.use_finetune_fps and fix_sample_fps:
             sample_fps = 4
             step = max(1, int(framerate / sample_fps))
             seq = list(range(start_frame, end_frame, step))
@@ -498,6 +510,12 @@ class OmniSampleProcessor:
         fix_sample_fps = False
         if isinstance(sample_data, dict):
             fix_sample_fps = sample_data.get("sample_fps", False)
+        
+        random_sample = False
+        if isinstance(sample_data, dict):
+            random_sample = sample_data.get("random_sample", False)
+            if random_sample:
+                if random.random() < 0.1: print('use random_sample')
 
         try:
            
@@ -509,7 +527,8 @@ class OmniSampleProcessor:
                 sample_data.get("end",None),
                 method=self.training_args.video_decode_method,
                 format=vformat,
-                fix_sample_fps=fix_sample_fps
+                fix_sample_fps=fix_sample_fps,
+                random_sample=random_sample,
             )
             
             if not imgs:
@@ -535,7 +554,8 @@ class OmniSampleProcessor:
         method: str = "decord",
         format: str = "",
         merge_size: int = 2,
-        fix_sample_fps: bool=False
+        fix_sample_fps: bool = False,
+        random_sample: bool = False,
     ) -> Optional[Tuple[List[Image.Image], int, int, Tuple[int, int]]]:
         
         raw_img_list: List[Image.Image] = []
@@ -623,7 +643,7 @@ class OmniSampleProcessor:
                 desired = max(max_frames, 200)
             
             frame_seq = self.get_seq_frames(
-                valid_frame_count, desired, start_frame, end_frame, framerate, fix_sample_fps=fix_sample_fps
+                valid_frame_count, desired, start_frame, end_frame, framerate, fix_sample_fps=fix_sample_fps, random_sample=random_sample,
             )
 
             if not frame_seq:
@@ -691,7 +711,8 @@ class OmniSampleProcessor:
         method: str = "decord",
         format: str = "",
         merge_size: int = 2,
-        fix_sample_fps:bool=False
+        fix_sample_fps: bool = False,
+        random_sample: bool = False,
     ) -> Tuple[List, int, int, Tuple[int, int]]:
         if self.training_args.dataloader_debug:
             fake = [Image.new("RGB", (644, 364), (200, 200, 200))] * 30
@@ -706,7 +727,7 @@ class OmniSampleProcessor:
         results = self.extract_imagelist_from_videobytes(
             video_file, max_image_tokens, selected_downsample_ratio, start_time, end_time,
             method=method, format=format, merge_size=merge_size,
-            fix_sample_fps=fix_sample_fps,
+            fix_sample_fps=fix_sample_fps, random_sample=random_sample,
         )
         if results is None:
             return [], 0, 0, (0, 0)
