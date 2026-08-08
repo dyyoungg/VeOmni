@@ -746,6 +746,8 @@ class OmniSampleProcessor:
 
         for audio in audio_list:
             n_samples = len(audio)
+            if n_samples == 0:
+                continue
             n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
             audio_chunk_counts.append(n_chunks)
             for i in range(n_chunks):
@@ -762,6 +764,8 @@ class OmniSampleProcessor:
                 chunk_mel = log_mel_spectrogram(chunk_padded, n_mels=self.mel_bins)  # [1, mel_bins, 3000]
                 all_chunks.append(chunk_mel)
 
+        if not all_chunks:
+            return None, [], None, []
         audio_mel = torch.cat(all_chunks, dim=0)  # [total_chunks, mel_bins, 3000]
         raw_len = torch.tensor(chunk_frame_lens)
         actual_len = [(l + compress_ratio - 1) // compress_ratio for l in raw_len]
