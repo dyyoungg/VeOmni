@@ -112,6 +112,15 @@ class OmniSampleProcessor:
         self.mel_bins = model_args.num_mel_bins
         self.jpeg_degrade_qualities = list(range(75, 101))
         self.preprocess_workers = preprocess_workers
+
+        # Audio volume augmentation config
+        self.audio_volume_gain_range: Tuple[float, float] = (
+            getattr(training_args, "audio_volume_gain_min_db", -15.0),
+            getattr(training_args, "audio_volume_gain_max_db", 15.0),
+        )
+        self.audio_volume_augmentation_prob: float = getattr(
+            training_args, "audio_volume_augmentation_prob", 0.5
+        )
  
         self.video_id_generator = SnowflakeGenerator(instance=rank)
  
@@ -257,7 +266,13 @@ class OmniSampleProcessor:
    # ------------------------------------------------------------------
     # I/O：音频
     # ------------------------------------------------------------------
- 
+
+    @staticmethod
+    def _augment_audio_volume(y: np.ndarray, gain_db: float) -> np.ndarray:
+        """Apply volume gain (dB) to raw waveform, clip to [-1, 1]."""
+        gain_linear = 10.0 ** (gain_db / 20.0)
+        return np.clip(y * gain_linear, -1.0, 1.0)
+
     def get_audio_from_local_or_remote(
         self, audio_path: str
     ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
@@ -280,6 +295,13 @@ class OmniSampleProcessor:
         max_len = self.model_args.audio_max_duration * sr if self.model_args.audio_max_duration else None
         if max_len and len(y) > max_len:
             y = y[-max_len:]
+
+        # Audio volume augmentation
+        if getattr(self.training_args, "audio_volume_augmentation", False):
+            if random.random() < self.audio_volume_augmentation_prob:
+                gain_db = random.uniform(*self.audio_volume_gain_range)
+                y = self._augment_audio_volume(y, gain_db)
+
         return torch.from_numpy(y), sr
     
     def get_audio_data_list(self, data_dict: Dict) -> List[torch.Tensor]:
@@ -1263,6 +1285,9 @@ class OmniSampleProcessor:
                 a_idx += 1
                 a_chunk_offset += n_chunks
                 total_audio_token += num
+            elif token_id == AUDIO_TOKEN_INDEX and not audio_feature_len:
+                # 音频特征缺失，跳过该占位符，不让 -300 泄漏到 input_ids
+                continue
             else:
                 new_ids.append(token_id)
                 new_labels.append(labels[i])
@@ -1333,6 +1358,13 @@ class OmniSampleProcessor:
         video_thw = multimodal_resources.get("video_thw")
         actual_audio_lens = multimodal_resources.get("actual_audio_feature_len", [])
         audio_chunk_counts = multimodal_resources.get("audio_chunk_counts", [])
+
+        # 如果 input_ids 中有 AUDIO_TOKEN_INDEX 但音频特征为空，跳过该样本，
+        # 否则 AUDIO_TOKEN_INDEX(-300) 会泄漏到最终 input_ids 导致 embedding OOB。
+        has_audio_placeholder = (cur_input_ids == AUDIO_TOKEN_INDEX).any().item()
+        if has_audio_placeholder and not actual_audio_lens:
+            print(f"[WARNING] sample {sample_idx}: audio placeholder found but audio features empty, skipping")
+            return None
 
         cur_input_ids, cur_labels, token_counts = self._expand_multimodal_tokens(
             cur_input_ids, cur_labels, image_thw, video_thw, actual_audio_lens,

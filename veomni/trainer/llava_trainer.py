@@ -115,6 +115,22 @@ class VLMTrainingArguments(TrainingArguments):
     dataloader_debug: bool = field(default=False)
     fix_image_size: bool = field(default=False)
     jpeg_image_augmentation: bool = field(default=False)
+    audio_volume_augmentation: bool = field(
+        default=True,
+        metadata={"help": "Randomly adjust audio volume during training to improve robustness to quiet/loud audio."},
+    )
+    audio_volume_gain_min_db: float = field(
+        default=-10.0,
+        metadata={"help": "Min volume gain in dB for audio augmentation (negative = attenuate)."},
+    )
+    audio_volume_gain_max_db: float = field(
+        default=10.0,
+        metadata={"help": "Max volume gain in dB for audio augmentation (positive = amplify)."},
+    )
+    audio_volume_augmentation_prob: float = field(
+        default=0.3,
+        metadata={"help": "Probability of applying audio volume augmentation per sample."},
+    )
     video_decode_method: str = field(default="decord")
     remote_dataloader: bool = field(default=False)
     target_image_num: int = field(default=999)
