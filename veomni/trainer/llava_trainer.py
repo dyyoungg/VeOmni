@@ -133,6 +133,15 @@ class VLMTrainingArguments(TrainingArguments):
     )
     video_decode_method: str = field(default="decord")
     remote_dataloader: bool = field(default=False)
+    use_fake_data: bool = field(
+        default=False,
+        metadata={"help": "Use randomly generated fake multimodal data for training speed benchmarking. "
+                  "No real data files are needed when this is enabled."},
+    )
+    fake_data_num_samples: int = field(
+        default=10000,
+        metadata={"help": "Number of fake samples to generate when use_fake_data=True."},
+    )
     target_image_num: int = field(default=999)
     min_lr_rate: float = field(default=0.0)
     router_aux_loss_coef: float = field(default=0.001)
@@ -417,7 +426,10 @@ class VLMTrainer:
             self.train_dataloader = get_train_dataloader(data_args, training_args, model_args, tokenizer)
         dist.barrier()
         
-        self.eval_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
+        if getattr(training_args, "use_fake_data", False):
+            self.eval_dataloader = None
+        else:
+            self.eval_dataloader = get_eval_dataloader(tokenizer, data_args, training_args, model_args)
     
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.args
@@ -508,6 +520,16 @@ class VLMTrainer:
         else:
             # OmniDataloader: data_list already contains num_epochs copies
             self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
+
+        # Fake data mode: use max_steps to control training loop length.
+        # Workers generate data infinitely; the loop terminates by step count.
+        if getattr(args.train, "use_fake_data", False):
+            max_steps = getattr(args.train, "max_steps", None)
+            if max_steps is not None:
+                self.init_data_size = max_steps
+            else:
+                # Fallback: fake_data_num_samples controls loop length
+                self.init_data_size = getattr(args.train, "fake_data_num_samples", 10000)
        
         self.start_step = 0
         self.video_trained_num = 0  
@@ -676,10 +698,18 @@ class VLMTrainer:
 
     def _sync_video_trained_num(self) -> bool:
         """Sync consumed/remaining data count across ranks and update video_trained_num.
- 
+
         Returns True if training should stop (data exhausted on any rank).
         """
         args = self.args
+
+        # Fake data mode: workers produce infinitely, no data_queue to track.
+        # Use global_step directly as the progress counter.
+        if getattr(args.train, "use_fake_data", False):
+            self.video_trained_num = self.state.global_step
+            self.state.video_trained_num = self.video_trained_num
+            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+            return
 
         if args.train.remote_dataloader:
             if dist.is_initialized():
