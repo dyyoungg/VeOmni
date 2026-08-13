@@ -958,6 +958,7 @@ class OmniSampleProcessor:
         )
 
     def image_data_process(self, sample_data: Dict, selected_downsample_ratio:int) -> Optional[Tuple]:
+        interleaved = sample_data.get("interleaved", False)
         subtitle_tokens, label_tokens, _ = self.process_conversations(sample_data)
         try:
             paths = sample_data["image"]
@@ -977,9 +978,11 @@ class OmniSampleProcessor:
         image_num = thw.shape[0]
         merge_size = self._get_merge_size_from_inputs(inputs, n=image_num)
 
-        subtitle_tokens, label_tokens = self.make_image_subtitle_label_tokens(
-            image_num, subtitle_tokens, label_tokens, mode="image"
-        )
+        # 交错模式下，不需要通过 make_image_subtitle_label_tokens 集中追加图像 token
+        if not interleaved:
+            subtitle_tokens, label_tokens = self.make_image_subtitle_label_tokens(
+                image_num, subtitle_tokens, label_tokens, mode="image"
+            )
         cap_len = len(subtitle_tokens)
         for t, ms in zip(thw, merge_size):
             _, h, w = t
@@ -1141,6 +1144,7 @@ class OmniSampleProcessor:
         has_audio = "audio" in sample_data
         has_image = "image" in sample_data
         has_video = "video" in sample_data
+        interleaved = sample_data.get("interleaved", False)
 
         for turn_idx, c in enumerate(sample_data["conversations"]):
             # Determine speaker
@@ -1165,39 +1169,131 @@ class OmniSampleProcessor:
                 is_human = (turn_idx % 2 == 0)
 
             value = c.get("value", c.get("content", ""))
+            if interleaved:
+                # ---------------- 图文交错模式 ----------------
+                try:
+                    audio_token_str = DEFAULT_AUDIO_TOKEN
+                except NameError:
+                    audio_token_str = "<audio>" # 兼容未定义的情况
+                    
+                if not is_human:
+                    if has_video and "chatgpt-videos" in sample_data.get("video", ""):
+                        value = value.split("\n")[0]
+                
+                cur_text = user_fmt.format(content=value) if is_human else asst_fmt.format(content=value)
+                
+                split_pattern = f"(<image>|{re.escape(audio_token_str)})"
+                parts = re.split(split_pattern, cur_text)
+                
+                cur_turn_tokens = []
+                cur_turn_labels = []
+                
+                for part in parts:
+                    if not part:
+                        continue
+                    
+                    if part == "<image>":
+                        img_tokens = []
+                        start_img_token = self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_START_TOKEN)
+                        end_img_token = self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_END_TOKEN)
+                        img_tokens.extend([start_img_token, IMAGE_TOKEN_INDEX, end_img_token])
+                        cur_turn_tokens.extend(img_tokens)
+                        cur_turn_labels.extend([IGNORE_INDEX] * len(img_tokens))
+                        
+                    elif part == audio_token_str:
+                        audio_count += 1
+                        aud_tokens = []
+                        if getattr(self.model_args, "use_audio_start_end_token", False):
+                            start_audio_token = self.tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_START_TOKEN)
+                            end_audio_token = self.tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_END_TOKEN)
+                            aud_tokens.extend([start_audio_token, AUDIO_TOKEN_INDEX, end_audio_token])
+                        else:
+                            aud_tokens.append(AUDIO_TOKEN_INDEX)
+                            
+                        cur_turn_tokens.extend(aud_tokens)
+                        cur_turn_labels.extend([IGNORE_INDEX] * len(aud_tokens))
+                        
+                    else:
+                        if is_human:
+                            part_tokens = self.tokenizer(part)["input_ids"]
+                            cur_turn_tokens.extend(part_tokens)
+                            cur_turn_labels.extend([IGNORE_INDEX] * len(part_tokens))
+                        else:
+                            # Assistant 文本
+                            if "ignore_bracket" in sample_data:
+                                bracket_pattern = re.compile(r"([\(\（][^\)\）]*[\)\）])")
+                                b_parts = bracket_pattern.split(part)
+                                for bp in b_parts:
+                                    if not bp:
+                                        continue
+                                    bp_tokens = self.tokenizer(bp)["input_ids"]
+                                    cur_turn_tokens.extend(bp_tokens)
+                                    if bp.startswith(("(", "（")) and bp.endswith((")", "）")):
+                                        cur_turn_labels.extend([IGNORE_INDEX] * len(bp_tokens))
+                                    else:
+                                        cur_turn_labels.extend(bp_tokens)
+                            else:
+                                part_tokens = self.tokenizer(part)["input_ids"]
+                                cur_turn_tokens.extend(part_tokens)
+                                cur_turn_labels.extend(part_tokens)
+                
+                # Assistant 轮次级别的特殊修改（infer, first_token）
+                if not is_human:
+                    if c.get("infer"):
+                        cur_turn_labels = [IGNORE_INDEX] * len(cur_turn_tokens)
+                    elif c.get("first_token"):
+                        new_labels = [IGNORE_INDEX] * len(cur_turn_tokens)
+                        new_labels[:2] = cur_turn_tokens[:2]
+                        cur_turn_labels = new_labels
+                
+                text_tokens += cur_turn_tokens
+                label_tokens += cur_turn_labels
 
-            if is_human:
-                if has_image or has_video:
-                    value = re.sub(img_pat, "", value)
-                    value = re.sub(vid_pat, "", value)
-                cur_text = user_fmt.format(content=value)
-                audio_count += cur_text.count(DEFAULT_AUDIO_TOKEN)
-
-                if has_audio:
-                    cur_tokens = self._tokenize_with_audio_placeholders(cur_text)
-                else:
-                    cur_tokens = self.tokenizer(cur_text)["input_ids"]
-
-                text_tokens += cur_tokens
-                label_tokens += [IGNORE_INDEX] * len(cur_tokens)
             else:
-                # assistant
-                if has_video and "chatgpt-videos" in sample_data.get("video", ""):
-                    value = value.split("\n")[0]
-                if has_image:
-                    value = re.sub(img_pat, "", value)
-                cur_text = asst_fmt.format(content=value)
-                cur_tokens = self.tokenizer(cur_text)["input_ids"]
-                text_tokens += cur_tokens
+                # ---------------- 非交错模式 ----------------
+                if is_human:
+                    if has_image or has_video:
+                        value = re.sub(img_pat, "", value)
+                        value = re.sub(vid_pat, "", value)
+                    cur_text = user_fmt.format(content=value)
+                    audio_count += cur_text.count(DEFAULT_AUDIO_TOKEN)
 
-                if c.get("infer"):
+                    if has_audio:
+                        cur_tokens = self._tokenize_with_audio_placeholders(cur_text)
+                    else:
+                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
+
+                    text_tokens += cur_tokens
                     label_tokens += [IGNORE_INDEX] * len(cur_tokens)
-                elif c.get("first_token"):
-                    new_labels = [IGNORE_INDEX] * len(cur_tokens)
-                    new_labels[:2] = cur_tokens[:2]
-                    label_tokens += new_labels
                 else:
-                    label_tokens += cur_tokens
+                    # assistant
+                    if has_video and "chatgpt-videos" in sample_data.get("video", ""):
+                        value = value.split("\n")[0]
+                    if has_image:
+                        value = re.sub(img_pat, "", value)
+                    cur_text = asst_fmt.format(content=value)
+                    cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                    text_tokens += cur_tokens
+
+                    if c.get("infer"):
+                        label_tokens += [IGNORE_INDEX] * len(cur_tokens)
+                    elif c.get("first_token"):
+                        new_labels = [IGNORE_INDEX] * len(cur_tokens)
+                        new_labels[:2] = cur_tokens[:2]
+                        label_tokens += new_labels
+                    elif "ignore_bracket" in sample_data:
+                        bracket_pattern = re.compile(r"([\(\（][^\)\）]*[\)\）])")
+                        b_parts = bracket_pattern.split(cur_text)
+                        for part in b_parts:
+                            if not part:
+                                continue
+                            part_tokens = self.tokenizer(part)["input_ids"]
+                            if part.startswith(("(", "（")) and part.endswith((")", "）")):
+                                label_tokens += [IGNORE_INDEX] * len(part_tokens)
+                            else:
+                                label_tokens += part_tokens
+                    else:
+                        label_tokens += cur_tokens
 
         assert len(label_tokens) == len(text_tokens), (
             f"label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"
