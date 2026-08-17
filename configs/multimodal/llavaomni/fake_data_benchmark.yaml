@@ -25,7 +25,7 @@ train:
   num_train_epochs: 1
   seed: 42
 
-  model_max_length: 8192
+  model_max_length: 4096
   pack_seq: true            
   init_device: meta
 
