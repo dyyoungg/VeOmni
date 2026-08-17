@@ -216,7 +216,8 @@ class VLMMModelArguments(ModelArguments):
     mm_image_size: List[int] = field(default_factory=lambda: [644, 364])  # 固定的图片尺寸: [width, height]
     image_projector_type: Optional[str] = field(default="avgpool")
     audio_projector_type: Optional[str] = field(default="conv_channel_upscale") # avgpool, channel_upscale
-
+    audio_encoder_type: Optional[str] = field(default="whisper")
+    qwen3_audio_n_window: Optional[int] = field(default=50)
 
 @dataclass
 class VeOmniVLMArguments(VeOmniArguments):

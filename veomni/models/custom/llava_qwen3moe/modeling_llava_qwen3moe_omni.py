@@ -15,6 +15,7 @@ from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen
 from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModel
 from veomni.models.custom.vision_encoder.modeling_qwen35_vision_encoder import BeeBeeVLQwen35MoeVisionModel
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeVLAudioModel
+from veomni.models.custom.llava_qwen3moe.modeling_qwen3_audio_encoder import BeeBeeVLQwen3AudioModel
 from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
     Qwen3MoeForCausalLM,
     load_balancing_loss_func,
@@ -118,9 +119,14 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
                                                            dtype=torch_dtype)
 
             if getattr(encoder_cfg, "audio_config", None) is not None:
-                self.audio_encoder = BeeBeeVLAudioModel._from_config(encoder_cfg.audio_config, 
-                                                          attn_implementation=encoder_cfg.audio_config._attn_implementation, 
-                                                          dtype=torch_dtype)
+                if "qwen3_audio" in getattr(encoder_cfg.audio_config, "model_type", ""):
+                    self.audio_encoder = BeeBeeVLQwen3AudioModel._from_config(encoder_cfg.audio_config,
+                                                              attn_implementation=encoder_cfg.audio_config._attn_implementation,
+                                                              dtype=torch_dtype)
+                else:
+                    self.audio_encoder = BeeBeeVLAudioModel._from_config(encoder_cfg.audio_config,
+                                                              attn_implementation=encoder_cfg.audio_config._attn_implementation,
+                                                              dtype=torch_dtype)
     # Convenience accessors
     def get_text_config(self):
         return self.omni_config.get_text_config()
@@ -343,11 +349,15 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         # Audio
         if n_audio_tokens > 0 and audio_features is not None:
             with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():
-                audio_features, _ = self.audio_encoder.lm_encode(
+                audio_features, audio_num_tokens = self.audio_encoder.lm_encode(
                     features=audio_features, feature_lengths=audio_features_lens
                 )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            
+            actual_audio_tokens = audio_features.shape[0]
+            if actual_audio_tokens != n_audio_tokens:
+                print(f"[AUDIO TOKEN MISMATCH] placeholder={n_audio_tokens}, projector_output={actual_audio_tokens}, "
+                      f"per_sample={audio_num_tokens}, feature_lens={audio_features_lens.tolist()}, "
+                      f"mel_shape={list(audio_features.shape)}")
             audio_features = audio_features[:n_audio_tokens]
             inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
 

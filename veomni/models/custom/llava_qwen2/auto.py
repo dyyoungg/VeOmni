@@ -106,10 +106,22 @@ def _compose_audio_config(
     audio_downsample_size: int = 10,
     audio_projector_type: str = "channel_upscale",
     train_audio_projector: bool = True,
+    audio_encoder_type: str = "whisper",
 ) -> BeeBeeAudioModelConfig:
     base_audio_cfg = AutoConfig.from_pretrained(audio_config_path, trust_remote_code=True)
     audio_dict = base_audio_cfg.to_dict()
     audio_dict.pop("model_type", None)
+
+    if audio_encoder_type == "qwen3_audio":
+        from veomni.models.custom.llava_qwen3moe.modeling_qwen3_audio_encoder import BeeBeeQwen3AudioModelConfig
+        return BeeBeeQwen3AudioModelConfig(
+            **audio_dict,
+            output_size=output_size,
+            audio_downsample_size=audio_downsample_size,
+            audio_projector_type=audio_projector_type,
+            return_hidden_states=False,
+            train_audio_projector=train_audio_projector,
+        )
 
     return BeeBeeAudioModelConfig(
         **audio_dict,
@@ -201,6 +213,7 @@ def build_qwen25_omni_from_components(
     image_projector_type: str = "dynamic_avgpool",
     audio_downsample_size: int = 10,
     audio_projector_type: str = "channel_upscale",
+    audio_encoder_type: str = "whisper",
 ) -> LlavaQwen2ForCausalLM:
     """
     Build the omni wrapper and load weights *separately*:
@@ -246,6 +259,7 @@ def build_qwen25_omni_from_components(
             audio_downsample_size=audio_downsample_size,
             audio_projector_type=audio_projector_type,
             train_audio_projector=True,
+            audio_encoder_type=audio_encoder_type,
         )
         _set_attn_implementation_in_config(audio_cfg, attn_implementation)
 
@@ -304,7 +318,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
         torch_dtype="bfloat16",
         image_downsample_size= 16,
         image_projector_type= "dynamic_avgpool",
-        audio_downsample_size = 10,
+        audio_downsample_size = 8,
         audio_projector_type="conv_channel_upscale",
     )
 
@@ -357,17 +371,17 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                         embed_weights_num = tensor.shape[0]
                     explicit_weights_to_load[key] = tensor
 
-                elif key.startswith(vision_prefix):
+                elif key.startswith(vision_prefix) or key.startswith("image_encoder."):
                     new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
                     explicit_weights_to_load[new_key] = tensor
 
-                elif key.startswith("model.audio_encoder.model."):
+                elif key.startswith("model.audio_encoder.model.") or (key.startswith("audio_encoder.") and "audio_projector" not in key):
                     new_key = key.replace("model.audio_encoder.model.", "audio_encoder.")
                     explicit_weights_to_load[new_key] = tensor
                 
-                elif key.startswith("model.audio_projector."):
-                    new_key = key.replace("model.audio_projector.", "audio_encoder.audio_projector.")
-                    explicit_weights_to_load[new_key] = tensor
+                # elif key.startswith("model.audio_projector."):
+                #     new_key = key.replace("model.audio_projector.", "audio_encoder.audio_projector.")
+                #     explicit_weights_to_load[new_key] = tensor
 
     special_tokens_dict_map = {
         "additional_special_tokens": [DEFAULT_AUDIO_PAD_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN]
@@ -426,7 +440,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
     # 4. 正常执行加载
     if explicit_weights_to_load:
         print(f"共提取到 {len(explicit_weights_to_load)} 个核心权重张量，开始注入模型...")
-        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=True)
+        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
         print("语言模型主干及 mm_projector 权重显式加载成功！")
    
     
@@ -501,11 +515,11 @@ def load_audio_encoder(model_path, encoder_path, save_path=None):
 
 
 if __name__ == "__main__":
-    # vision_path = "/mnt/afs/share/qwen25_vl_encoder"
-    # vlm_path = "/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260615_stage6_14B"
-    # save_directory =  "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/20260615_stage6_14B_veomni"
-    # merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
+    vision_path = "/mnt/afs/share/qwen25_vl_encoder"
+    vlm_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/checkpoints/omni_models/0723_llava_omni_qwen25vl_14B_16x_4k_st2_kimiwhisper_wo_audioprojector"
+    save_directory =  "/mnt/afs/share/llava_qwen2_14B-qwen25encoder-st2-veomni-down16-audiodown8"
+    merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
 
-    load_audio_encoder(model_path="/mnt/afs/share/20260627_beebee_32B_veomni", 
-                       encoder_path="/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260504_stage6_32B", 
-                       save_path=None)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+    # load_audio_encoder(model_path="/mnt/afs/share/20260627_beebee_32B_veomni", 
+    #                    encoder_path="/mnt/afs/jiayi/code/LLaVA_hub/ckpt/20260504_stage6_32B", 
+    #                    save_path=None)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              

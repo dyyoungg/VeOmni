@@ -74,6 +74,124 @@ class AudioConvUpScaleProjector(nn.Module):
         x = torch.cat(valid_outputs, dim=0)
         return x, num_tokens
 
+class AudioMLPChannelProjector(nn.Module):
+    """纯MLP通道下采样：reshape拼相邻帧到通道维度 + MLP映射，无卷积"""
+    def __init__(self, encoder_hidden, out_hidden, downsample_ratio):
+        super().__init__()
+        self.hidden_size = out_hidden
+        self.audio_hidden_size = encoder_hidden
+        self.audio_downsample_ratio = downsample_ratio
+        self.linear1 = nn.Linear(encoder_hidden * downsample_ratio, out_hidden, bias=True)
+        self.gelu = nn.GELU()
+        self.linear2 = nn.Linear(out_hidden, out_hidden, bias=True)
+
+    def forward(self, x, feature_length):
+        # x: [B, T, D]
+        bs, seq_len, audio_hidden_size = x.size()
+        ratio = self.audio_downsample_ratio
+
+        # pad到ratio的整数倍
+        target_seq_len = math.ceil(seq_len / ratio) * ratio
+        pad_len = target_seq_len - seq_len
+        if pad_len > 0:
+            x = torch.cat([x, torch.zeros(bs, pad_len, audio_hidden_size, device=x.device, dtype=x.dtype)], dim=1)
+
+        # reshape: [B, T, D] -> [B, T//ratio, D*ratio]
+        new_seq_len = target_seq_len // ratio
+        x = x.reshape(bs, new_seq_len, audio_hidden_size * ratio)
+
+        sp_enabled = self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled
+        if sp_enabled:
+            sp_world_size = get_parallel_state().sp_size
+            remainder = x.shape[1] % sp_world_size
+            if remainder > 0:
+                sp_pad = sp_world_size - remainder
+                x = pad_tensor(x, dim=1, padding_size=sp_pad)
+            x = slice_input_tensor(x, dim=1, group=get_parallel_state().ulysses_group, padding=False)
+
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = self.linear2(x)
+
+        if sp_enabled:
+            x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            if remainder > 0:
+                x = unpad_tensor(x, dim=1, padding_size=sp_pad)
+
+        num_tokens = [(l + ratio - 1) // ratio for l in feature_length]
+        valid_outputs = []
+        for i in range(bs):
+            valid_outputs.append(x[i, :num_tokens[i], :])
+        x = torch.cat(valid_outputs, dim=0)
+        return x, num_tokens
+
+
+class AudioMultiConvProjector(nn.Module):
+    """多层Conv1d逐步下采样 + MLP纯维度映射"""
+    def __init__(self, encoder_hidden, out_hidden, downsample_ratio):
+        super().__init__()
+        self.audio_hidden_size = encoder_hidden
+        self.hidden_size = out_hidden
+        self.audio_downsample_ratio = downsample_ratio
+        n_conv_layers = int(math.log2(downsample_ratio))
+        assert 2 ** n_conv_layers == downsample_ratio, \
+            f"downsample_ratio must be power of 2, got {downsample_ratio}"
+
+        convs = []
+        for _ in range(n_conv_layers):
+            convs.append(nn.Conv1d(encoder_hidden, encoder_hidden, kernel_size=3, stride=2, padding=1))
+            convs.append(nn.GELU())
+        self.convs = nn.Sequential(*convs)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(encoder_hidden, out_hidden, bias=True),
+            nn.GELU(),
+            nn.Linear(out_hidden, out_hidden, bias=True),
+        )
+
+    @staticmethod
+    def _conv1d_out_length(length, n_layers):
+        """计算经过n层 (k=3, s=2, p=1) Conv1d后的输出长度"""
+        for _ in range(n_layers):
+            length = (length + 2 * 1 - 3) // 2 + 1  # (L + 2p - k) // s + 1
+        return length
+
+    def forward(self, x, feature_length):
+        # x: [B, T, D]
+        bs, seq_len, _ = x.size()
+        n_conv_layers = len(self.convs) // 2  # 每层conv + gelu为一组
+
+        # Conv1d expects [B, D, T]
+        x = self.convs(x.transpose(1, 2)).transpose(1, 2)  # [B, T', D]
+
+        # 计算每个样本的有效token数 (逐层ceil(L/2)等价于ceil(L/ratio))
+        num_tokens = [(int(l) + self.audio_downsample_ratio - 1) // self.audio_downsample_ratio for l in feature_length]
+
+        sp_enabled = self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled
+        if sp_enabled:
+            sp_world_size = get_parallel_state().sp_size
+            remainder = x.shape[1] % sp_world_size
+            if remainder > 0:
+                pad_len = sp_world_size - remainder
+                x = pad_tensor(x, dim=1, padding_size=pad_len)
+            x = slice_input_tensor(x, dim=1, group=get_parallel_state().ulysses_group, padding=False)
+
+        x = self.mlp(x)
+
+        if sp_enabled:
+            x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            if remainder > 0:
+                x = unpad_tensor(x, dim=1, padding_size=pad_len)
+
+        # 裁出有效token并pack
+        valid_outputs = []
+        for i in range(bs):
+            valid_outputs.append(x[i, :num_tokens[i], :])
+        x = torch.cat(valid_outputs, dim=0)
+
+        return x, num_tokens
+
+
 class DynamicAvgPoolProjector(nn.Module):
     def __init__(self, encoder_hidden, out_hidden, downsample_ratio):
         super().__init__()
@@ -175,7 +293,10 @@ def build_audio_projector(projector_type, encoder_hidden, out_hidden, downsample
     # print("audio encoder", encoder_hidden, out_hidden, downsample_ratio)
     if projector_type == "conv_channel_upscale":
         return AudioConvUpScaleProjector(encoder_hidden, out_hidden, downsample_ratio)
-
+    elif projector_type == "multi_conv":
+        return AudioMultiConvProjector(encoder_hidden, out_hidden, downsample_ratio)
+    elif projector_type == "mlp_channel":
+        return AudioMLPChannelProjector(encoder_hidden, out_hidden, downsample_ratio)
     else:
         raise NotImplementedError
 
