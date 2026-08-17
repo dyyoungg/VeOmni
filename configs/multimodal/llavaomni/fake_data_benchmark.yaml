@@ -33,11 +33,11 @@ train:
   use_fake_data: true         # 启用 fake data
   fake_data_num_samples: 500000 # 生成的 fake 样本数量
 
-  freeze_vit: true
+  freeze_vit: false
   freeze_vit_projector: false
   freeze_audio_tower: true
   freeze_audio_projector: false
-  freeze_llm: true
+  freeze_llm: false
   output_router_logits: false
   freeze_router: true
 
