@@ -23,6 +23,7 @@ import contextlib
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from transformers import (
     AutoConfig,
@@ -74,6 +75,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.comm import get_data_parallel_world_size
 from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
 from veomni.utils.constants import get_image_video_audio_placeholder
+from veomni.utils.constants import IGNORE_INDEX
 
 
 logger = helper.create_logger(__name__)
@@ -162,6 +164,9 @@ class VLMTrainingArguments(TrainingArguments):
     logging_steps: int = field(default=10, metadata={"help": "Log every N steps"})
     eval_first: bool = field(default=True)
     save_predictions: bool = field(default=True)
+    channel_loss_enable: bool = field(default=False, metadata={"help": "Enable per-channel loss logging."})
+    channel_loss_interval: int = field(default=2, metadata={"help": "Compute channel loss every N steps."})
+    channel_loss_mapping: str = field(default="", metadata={"help": "Path to JSON file mapping dataset_type -> channel name."})
 
 @dataclass
 class VLMMDataArguments(DataArguments):
@@ -435,7 +440,14 @@ class VLMTrainer:
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.args
         self.processor = AutoProcessor.from_pretrained(args.model.vision_tower)
-        self.model_assets = [self.processor, self.tokenizer]
+        self.model_assets = [self.model_config, self.processor, self.tokenizer]
+        # generation_config.json
+        try:
+            from transformers import GenerationConfig
+            generation_config = GenerationConfig.from_pretrained(args.model.config_path)
+            self.model_assets.append(generation_config)
+        except Exception:
+            pass
         
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
@@ -556,6 +568,116 @@ class VLMTrainer:
             self.args.train.accelerator.offload_config.activation_gpu_limit,
         )
 
+    # ------------------------------------------------------------------
+    # Channel Loss
+    # ------------------------------------------------------------------
+    def _init_channel_loss(self):
+        """Initialize per-channel loss tracking."""
+        self._channel_mapping: Dict[str, str] = {}
+        self._channel_loss_hs = None
+        self._channel_loss_lm_weight = None
+
+        if not self.args.train.channel_loss_enable:
+            return
+
+        # Load mapping file
+        mapping_path = self.args.train.channel_loss_mapping
+        if mapping_path and os.path.isfile(mapping_path):
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                self._channel_mapping = json.load(f)
+            logger.info(f"[ChannelLoss] Loaded mapping with {len(self._channel_mapping)} entries from {mapping_path}")
+        elif mapping_path:
+            logger.warning(f"[ChannelLoss] Mapping file not found: {mapping_path}, all samples map to 'other'")
+
+        # Wrap model.loss_function to capture hidden_states and lm_head.weight
+        # from within the forward pass, where FSDP2 has already all-gathered params.
+        # Same approach as main branch ChannelLossCallback._wrapped_loss_fn.
+        inner = self.model
+        while hasattr(inner, 'module'):
+            inner = inner.module
+        if not hasattr(inner, 'loss_function') and hasattr(inner, 'thinker'):
+            inner = inner.thinker
+
+        if hasattr(inner, 'loss_function'):
+            original_loss_fn = inner.loss_function
+
+            def _wrapped_loss_fn(*args, **kwargs):
+                result = original_loss_fn(*args, **kwargs)
+                # Only capture on interval steps
+                if self.state.global_step % self.args.train.channel_loss_interval == 0:
+                    hs = kwargs.get('hidden_states')
+                    w = kwargs.get('weights')
+                    if hs is None and len(args) > 3:
+                        hs = args[3]  # positional fallback
+                    if w is None and len(args) > 4:
+                        w = args[4]
+                    if hs is not None and w is not None:
+                        self._channel_loss_hs = hs.detach().clone()
+                        self._channel_loss_lm_weight = w.detach().clone()
+                return result
+
+            inner.loss_function = _wrapped_loss_fn
+            logger.info(f"[ChannelLoss] Wrapped {type(inner).__name__}.loss_function")
+        else:
+            logger.warning("[ChannelLoss] Cannot find loss_function, channel loss disabled")
+
+        logger.info(f"[ChannelLoss] Enabled, interval={self.args.train.channel_loss_interval}")
+
+        # Pass mapping to dataloader so worker processes can tag samples
+        if hasattr(self, 'train_dataloader') and hasattr(self.train_dataloader, 'channel_mapping'):
+            self.train_dataloader.channel_mapping = self._channel_mapping
+
+    @torch.no_grad()
+    def _compute_channel_loss(
+        self,
+        hidden_states: torch.Tensor,
+        lm_weight: torch.Tensor,
+        labels: torch.Tensor,
+        channel_ids: List[str],
+        seq_lens: List[int],
+    ) -> Dict[str, float]:
+        """Compute detached per-channel CE loss from hidden_states + lm_head weight.
+
+        Both tensors are captured during lm_head forward (FSDP2 all-gathered),
+        so no DTensor / full_tensor() needed here.
+        """
+        hs = hidden_states.reshape(-1, hidden_states.size(-1))  # [L, D]
+        labs = labels.reshape(-1)  # [L]
+
+        shifted_hs = hs[:-1]      # [L-1, D]
+        shifted_labs = labs[1:]    # [L-1]
+
+        channel_sums: Dict[str, float] = defaultdict(float)
+        channel_counts: Dict[str, int] = defaultdict(int)
+
+        CHUNK = 1024
+        offset = 0
+        for i, seg_len in enumerate(seq_lens):
+            ch = channel_ids[i] if i < len(channel_ids) else "other"
+            seg_end = min(offset + seg_len, len(shifted_hs))
+
+            for j in range(offset, seg_end, CHUNK):
+                end = min(j + CHUNK, seg_end)
+                chunk_logits = F.linear(shifted_hs[j:end].float(), lm_weight.float())
+                chunk_loss = F.cross_entropy(
+                    chunk_logits,
+                    shifted_labs[j:end].to(chunk_logits.device),
+                    ignore_index=IGNORE_INDEX,
+                    reduction='none',
+                )
+                valid = shifted_labs[j:end] != IGNORE_INDEX
+                channel_sums[ch] += chunk_loss[valid].sum().item()
+                channel_counts[ch] += valid.sum().item()
+                del chunk_logits, chunk_loss
+
+            offset += seg_len
+
+        result: Dict[str, float] = {}
+        for ch in sorted(channel_sums):
+            result[f"channel_loss_sum/{ch}"] = channel_sums[ch]
+            result[f"channel_token_count/{ch}"] = float(channel_counts[ch])
+        return result
+
     def _init_callbacks(self):
         """Initialize callbacks."""
         self.environ_meter_callback = EnvironMeterCallback(self)
@@ -569,6 +691,7 @@ class VLMTrainer:
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.state = TrainerState()
+        self._init_channel_loss()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
@@ -656,7 +779,40 @@ class VLMTrainer:
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         if getattr(outputs, "aux_loss", None) is not None:
-            loss_dict["aux_loss"] = outputs.aux_loss 
+            loss_dict["aux_loss"] = outputs.aux_loss
+
+        # Per-channel loss (detached, no impact on training)
+        if (
+            self.args.train.channel_loss_enable
+            and self.state.global_step % self.args.train.channel_loss_interval == 0
+            and self._channel_loss_hs is not None
+            and self._channel_loss_lm_weight is not None
+        ):
+            channel_ids = micro_batch.get("channel_ids", [])
+            seq_lens_tensor = micro_batch.get("seq_lens")
+            attn_mask_len = micro_batch.get("attention_mask_len")
+            if seq_lens_tensor is not None:
+                seq_lens = seq_lens_tensor.tolist() if isinstance(seq_lens_tensor, torch.Tensor) else seq_lens_tensor
+            elif attn_mask_len is not None:
+                seq_lens = attn_mask_len if isinstance(attn_mask_len, list) else attn_mask_len.tolist()
+            else:
+                seq_lens = [micro_batch["labels"].numel()]
+
+            if channel_ids:
+                import time as _time
+                _t0 = _time.monotonic()
+                channel_metrics = self._compute_channel_loss(
+                    hidden_states=self._channel_loss_hs,
+                    lm_weight=self._channel_loss_lm_weight,
+                    labels=micro_batch["labels"],
+                    channel_ids=channel_ids,
+                    seq_lens=seq_lens,
+                )
+                channel_metrics["channel_loss/time"] = _time.monotonic() - _t0
+                loss_dict.update(channel_metrics)
+
+            self._channel_loss_hs = None
+            self._channel_loss_lm_weight = None
 
         return loss, loss_dict
 
@@ -664,12 +820,18 @@ class VLMTrainer:
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
+        # Pop non-tensor metadata that the model doesn't accept
+        _channel_ids = micro_batch.pop("channel_ids", None)
         step_timer = None
         dist.barrier()
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             step_timer = getattr(self, "_current_step_timer", None)
             with step_timer.measure("forward") if step_timer else contextlib.nullcontext():
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False, step_timer=step_timer)
+
+        # Restore channel_ids for postforward channel loss computation
+        if _channel_ids is not None:
+            micro_batch["channel_ids"] = _channel_ids
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
@@ -808,7 +970,7 @@ class VLMTrainer:
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item()
+                total_loss_dict[k] += v.item() if isinstance(v, torch.Tensor) else v
 
         # Gradient clipping
         grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)

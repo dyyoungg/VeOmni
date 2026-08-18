@@ -53,8 +53,8 @@ class EvaluateCallback(Callback):
     """
     def on_epoch_end(self, state: TrainerState, **kwargs):
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.eval_epochs and (state.epoch + 1) % args.train.eval_epochs == 0:
-            self._evaluate(state)
+        # if args.train.eval_epochs and (state.epoch + 1) % args.train.eval_epochs == 0:
+        self._evaluate(state)
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args

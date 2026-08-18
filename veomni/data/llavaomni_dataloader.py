@@ -213,13 +213,18 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
     metadata_configs = [
         ("audio_ground_truth_text", ("", "zh")),
         ("category", None),
-        ("raw_data", {})
+        ("raw_data", {}),
+        ("channel_ids", []),
     ]
     
     for key, default in metadata_configs:
-       
-        if any(key in d for d in batch_data): 
+
+        if any(key in d for d in batch_data):
             batch_inputs[key] = [d.get(key, default) for d in batch_data]
+
+    # Flatten channel_ids for bs=1 packing: [[ch1,ch2,...]] -> [ch1,ch2,...]
+    if "channel_ids" in batch_inputs and len(batch_inputs["channel_ids"]) == 1:
+        batch_inputs["channel_ids"] = batch_inputs["channel_ids"][0]
 
     if any("options_num" in d for d in batch_data):
         options = [d["options_num"] for d in batch_data if "options_num" in d]
@@ -248,6 +253,13 @@ class OmniDataloader(BaseDataLoader):
         self.processor: Optional[OmniSampleProcessor] = None
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
         self._trained_index = 0
+
+        # Channel loss: load mapping from config
+        self.channel_mapping: Dict[str, str] = {}
+        mapping_path = getattr(training_args, "channel_loss_mapping", "")
+        if mapping_path and os.path.isfile(mapping_path):
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                self.channel_mapping = json.load(f)
 
     def init_image_processor(self) -> None:
 
@@ -744,10 +756,11 @@ class OmniDataloader(BaseDataLoader):
         return img_ok and vid_ok and aud_ok
     
     def _pack_and_enqueue(
-        self, cur_input_ids: torch.Tensor, cur_labels: torch.Tensor, 
-        cur_caption_len: int, resources: Dict, token_counts: Dict
+        self, cur_input_ids: torch.Tensor, cur_labels: torch.Tensor,
+        cur_caption_len: int, resources: Dict, token_counts: Dict,
+        channel_id: str = "other",
     ) -> None:
-        
+
         max_len = self.tokenizer.model_max_length
         # 首先检查长度截断
         if len(cur_input_ids) >= max_len:
@@ -757,21 +770,23 @@ class OmniDataloader(BaseDataLoader):
                 print(f"WARNING: Skipping sample. Truncation to {max_len} cut off multimodal tokens.")
                 return
             cur_caption_len = max_len
-      
+
         if not self.training_args.pack_seq:
-            self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources)
+            self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources,
+                                        channel_ids=[channel_id])
             return
         image_num = 0
         if len(self.new_images_thw):
             image_num = torch.cat(self.new_images_thw)[:,0].sum().item()
-        
+
         if (self.new_caption_len + cur_caption_len > max_len and len(self.new_input_ids) > 0) or image_num > self.training_args.target_image_num:
             # 缓冲区溢出，把当前的缓存打包发出
             self._flush_pack_buffer()
             self._clear_pack_buffer()
 
 
-        self._append_to_pack_buffer(cur_input_ids, cur_labels, cur_caption_len, resources, token_counts)
+        self._append_to_pack_buffer(cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
+                                    channel_id=channel_id)
 
 
     def _flush_pack_buffer(self) -> None:
@@ -803,9 +818,11 @@ class OmniDataloader(BaseDataLoader):
             packed_ids, packed_labels,
             list(self.attention_mask_len),
             packed_resources,
+            channel_ids=list(self.channel_id_list),
         )
 
-    def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources) -> None:
+    def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources,
+                               channel_ids=None) -> None:
         self.result_queue.put({
             "input_ids":            input_ids,
             "labels":               labels,
@@ -818,13 +835,16 @@ class OmniDataloader(BaseDataLoader):
             "image_downsample_ratios": resources.get("image_downsample_ratios"),
             "video_downsample_ratios": resources.get("video_downsample_ratios"),
             "attention_mask_len":   attn_mask_len,
+            "channel_ids":          channel_ids or [],
         })
 
-    def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts):
+    def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
+                               channel_id: str = "other"):
         self.new_caption_len += cur_caption_len
         self.new_input_ids.append(cur_input_ids)
         self.new_labels.append(cur_labels)
         self.attention_mask_len.append(cur_caption_len)
+        self.channel_id_list.append(channel_id)
 
         if resources.get("image_pixels") is not None and resources.get("image_thw") is not None:
             self.new_images_list.append(resources["image_pixels"])
@@ -856,6 +876,7 @@ class OmniDataloader(BaseDataLoader):
         self.new_image_tokens, self.new_video_tokens, self.new_audio_tokens = [], [], []
         self.new_image_downsample_ratios = []
         self.new_video_downsample_ratios = []
+        self.channel_id_list = []
 
     
     # ------------------------------------------------------------------
@@ -882,6 +903,13 @@ class OmniDataloader(BaseDataLoader):
         else:
             self._process_single_sample(sample_data, samples, processor)
 
+    def _resolve_channel_id(self, sample_data: Dict) -> str:
+        """Map sample's dataset_type to a channel name via self.channel_mapping."""
+        dataset_type = sample_data.get("dataset_type", "")
+        if not dataset_type:
+            return "other"
+        return self.channel_mapping.get(dataset_type, dataset_type)
+
     def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any) -> None:
         if getattr(self.data_args, "save_token_counted_data", False):
             system_token = processor._build_system_token(sample_data, 0)
@@ -889,6 +917,7 @@ class OmniDataloader(BaseDataLoader):
                 sample_data, system_token, sample.token_counts, sample.caption_len
             )
 
+        channel_id = self._resolve_channel_id(sample_data)
         self._pack_and_enqueue(
             cur_input_ids=sample.input_ids,
             cur_labels=sample.labels,
@@ -905,6 +934,7 @@ class OmniDataloader(BaseDataLoader):
                 "video_downsample_ratios": sample.video_downsample_ratios,
             },
             token_counts=sample.token_counts,
+            channel_id=channel_id,
         )
        
         
