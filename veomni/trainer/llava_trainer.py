@@ -360,6 +360,8 @@ class VLMTrainer:
             self.model.omni_config.modality_aware_routing = self.args.train.modality_aware_routing
         self.model_config.freeze_vit = self.args.train.freeze_vit
         self.model_config.freeze_audio = self.args.train.freeze_audio_tower
+        self.model_config.freeze_llm = self.args.train.freeze_llm
+        self.model_config.gradient_checkpointing = self.args.train.gradient_checkpointing.enable
         self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
         self.model.config.encoder_data_balance_sorting_algo = self.args.model.encoder_data_balance_sorting_algo
 

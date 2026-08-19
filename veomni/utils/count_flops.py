@@ -417,6 +417,8 @@ class VeomniFlopsCounter:
         llm_config = getattr(self.config, "foundation_config", self.config)
         freeze_vit = kwargs.get("freeze_vit", True)
         freeze_audio = kwargs.get("freeze_audio", True)
+        gradient_checkpointing = kwargs.get("gradient_checkpointing", False)
+        freeze_llm = kwargs.get("freeze_llm", False)
         hidden_size = llm_config.hidden_size
         vocab_size = llm_config.vocab_size
         num_hidden_layers = llm_config.num_hidden_layers
@@ -429,32 +431,43 @@ class VeomniFlopsCounter:
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
 
-        # non-attn per layer parm
+        # per layer params
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
         emd_and_lm_head_N = vocab_size * hidden_size * 2
+
+        # FLOPs系数
+        if gradient_checkpointing:
+            linear_factor = 6 if freeze_llm else 8
+            attn_dot_factor = 16
+        else:
+            linear_factor = 4 if freeze_llm else 6
+            attn_dot_factor = 12
+
         # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers
+        dense_N_flops = linear_factor * dense_N * tokens_sum
+        # embedding & lm_head (不在GC范围内)
+        emb_factor = 2 if freeze_llm else 6
+        emb_flops = emb_factor * emd_and_lm_head_N * tokens_sum
+        dense_N_flops += emb_flops
 
         # attn all_layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
         for seqlen in batch_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        attn_qkv_flops = attn_dot_factor * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # vit flops
         images_seqlens = kwargs.get("images_seqlens", None)
         if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             image_config = getattr(self.config.encoder_config, "image_config", None)
             if image_config is not None:
-                if "qwen35moe" in image_config.model_type:
-                    vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, image_config)
-                else:
-                    vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
-                vit_flops = vit_flops * (2.0 / 6.0) if freeze_vit else vit_flops
-                
+                freeze_projector = kwargs.get("freeze_projector", False)
+                vit_flops = self._estimate_beebee_vit_flop(
+                    images_seqlens, image_config,
+                    freeze_vit=freeze_vit, freeze_projector=freeze_projector
+                )
             else:
                 vit_flops = 0
         else:
@@ -477,10 +490,104 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
         return flops_achieved
     
+    def _estimate_beebee_vit_flop(self, images_seqlens, config, freeze_vit=False, freeze_projector=False):
+        """
+        Estimate ViT FLOPs for BeeBeeVL vision encoder (both Qwen2.5 and Qwen3.5 MoE variants).
+
+        Architecture:
+            PatchEmbed (Conv3d) -> ViT Blocks -> Merger (norm + reshape only, no linear)
+            -> DynamicAvgPoolProjector (AdaptiveAvgPool2d + MLP)
+
+        The merger has NO linear layer — just normalization + spatial token grouping.
+        The projector MLP processes tokens AFTER pooling, so token count is greatly reduced.
+
+        freeze_vit: ViT backbone is frozen (forward only, factor 2); projector still trains.
+        freeze_projector: projector is also frozen (forward only, factor 2).
+        """
+
+        if config is None:
+            return 0
+        tokens_sum = sum(images_seqlens)
+
+        num_heads = config.num_heads
+        depth = config.depth
+        dim = config.hidden_size
+        spatial_merge_size = config.spatial_merge_size
+        head_dim = dim // num_heads
+
+        # Determine if Qwen3.5 MoE ViT (GELU, factor 2) or Qwen2.5 ViT (SiLU/GLU, factor 3)
+        is_qwen3_vit = "qwen3" in getattr(config, "model_type", "")
+        mlp_hidden_dim = config.intermediate_size
+        mlp_factor = 2 if is_qwen3_vit else 3
+
+        # --- Patch embedding (Conv3d) ---
+        in_channels = getattr(config, "in_channels", 3)
+        temporal_patch_size = getattr(config, "temporal_patch_size", 2)
+        patch_size = getattr(config, "patch_size", 14)
+        patch_embed_N = dim * in_channels * temporal_patch_size * patch_size * patch_size
+
+        # --- ViT blocks (process tokens_sum tokens) ---
+        mlp_N = dim * mlp_hidden_dim * mlp_factor
+        attn_linear_N = dim * (4 * dim)  # qkv (3*dim) + output proj (dim)
+        vit_blocks_N = (mlp_N + attn_linear_N) * depth
+
+        # --- Projector MLP (processes tokens AFTER merge + pool) ---
+        # DynamicAvgPoolProjector: Linear(D, D) + GELU + Linear(D, output_size)
+        # where D = dim * spatial_merge_size^2
+        D = dim * (spatial_merge_size ** 2)
+        output_size = getattr(config, "output_size", getattr(config, "out_hidden_size", D))
+        projector_N = D * D + D * output_size  # = D * (D + output_size)
+
+        # Token count after merge + pool:
+        # After merge: tokens_sum / merge^2
+        # After DynamicAvgPool with scale=image_downsample_size: further reduce by ~scale
+        # get_adaptive_pool_size: r = 1/sqrt(scale), output ≈ input * r^2 = input / scale
+        downsample_ratio = getattr(config, "image_downsample_size", 8)
+        tokens_after_pool = tokens_sum / (spatial_merge_size ** 2 * downsample_ratio)
+
+        # --- FLOPs factor: frozen = forward only (2x), trainable = fwd+bwd (6x) ---
+        backbone_factor = 2 if freeze_vit else 6
+        projector_factor = 2 if freeze_projector else 6
+
+        # --- Dense FLOPs ---
+        # ViT blocks + patch embed: process all tokens_sum
+        backbone_flops = backbone_factor * (patch_embed_N + vit_blocks_N) * tokens_sum
+        # Projector MLP: processes only post-pool tokens
+        projector_flops = projector_factor * projector_N * tokens_after_pool
+
+        # --- Attention QKV FLOPs ---
+        # Determine full attention vs window attention layers
+        if is_qwen3_vit:
+            # Qwen3.5 MoE ViT uses full attention in all layers
+            full_attn_layers = depth
+            window_attn_layers = 0
+        else:
+            # Qwen2.5 ViT may use window attention in some layers
+            fullatt_block_indexes = getattr(config, "fullatt_block_indexes", None)
+            if fullatt_block_indexes is not None:
+                full_attn_layers = len(fullatt_block_indexes)
+            else:
+                full_attn_layers = depth
+            window_attn_layers = depth - full_attn_layers
+
+        # attn compute: fwd = 4x, fwd+bwd = 12x
+        attn_factor = 4 if freeze_vit else 12
+        seqlen_square_sum = sum(s * s for s in images_seqlens)
+        attn_qkv_flops = attn_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layers
+
+        if window_attn_layers > 0:
+            window_size = getattr(config, "window_size", 112)
+            window_attn_flops = attn_factor * tokens_sum * (window_size ** 2) * head_dim * num_heads
+            attn_qkv_flops += window_attn_flops * window_attn_layers
+
+        total_vit_flops = backbone_flops + projector_flops + attn_qkv_flops
+        return total_vit_flops
+
     def _estimate_llavaqwen3moeOmni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         llm_config = getattr(self.config, "foundation_config", self.config)
         freeze_vit = kwargs.get("freeze_vit", True)
         freeze_audio = kwargs.get("freeze_audio", True)
+        gradient_checkpointing = kwargs.get("gradient_checkpointing", False)
         hidden_size = llm_config.hidden_size
         vocab_size = llm_config.vocab_size
         num_hidden_layers = llm_config.num_hidden_layers
@@ -488,14 +595,12 @@ class VeomniFlopsCounter:
         num_attention_heads = llm_config.num_attention_heads
         moe_intermediate_size = llm_config.moe_intermediate_size
         # MoE 相关
-        num_experts = getattr(llm_config, "num_experts", 1)
         num_experts_per_tok = getattr(llm_config, "num_experts_per_tok", 1)
         # Qwen3MoE 有 shared expert
         shared_expert_intermediate_size = getattr(llm_config, "shared_expert_intermediate_size", 0)
-        # 是否每层都是 MoE，还是部分层是 dense
-        num_experts_per_layer = getattr(llm_config, "decoder_sparse_step", 1)  # 每隔几层是 MoE
 
-        head_dim = hidden_size // num_attention_heads
+        # head_dim: Qwen3 MoE may have head_dim != hidden_size // num_attention_heads
+        head_dim = getattr(llm_config, "head_dim", hidden_size // num_attention_heads)
         q_size = num_attention_heads * head_dim
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
@@ -512,34 +617,43 @@ class VeomniFlopsCounter:
         # embedding + lm_head
         emb_and_lm_head_N = vocab_size * hidden_size * 2
 
-        # 非 attention 的总 flops（fwd + bwd = 6x）
+        # FLOPs系数:
+        # - linear部分: frozen+GC = 6x (2fwd + 2recomp + 2act_grad), trainable+GC = 8x, trainable无GC = 6x
+        # - attention dot: 有GC = 16x (4fwd + 4recomp + 8act_grad), 无GC = 12x (4fwd + 8bwd)
+        freeze_llm = kwargs.get("freeze_llm", False)
+        if gradient_checkpointing:
+            linear_factor = 6 if freeze_llm else 8  # frozen无weight_grad省2x, GC加2x, 恰好=6
+            attn_dot_factor = 16  # attention dot无权重, GC recomp始终增加4x
+        else:
+            linear_factor = 4 if freeze_llm else 6  # frozen: 2fwd+2act_grad=4
+            attn_dot_factor = 12
+
         # attn linear
-        attn_linear_flops = 6 * attn_linear_N * num_hidden_layers * tokens_sum
+        attn_linear_flops = linear_factor * attn_linear_N * num_hidden_layers * tokens_sum
         # moe ffn（按激活参数量算，不是总参数量）
-        moe_ffn_flops = 6 * (moe_ffn_N_per_token + shared_ffn_N) * num_hidden_layers * tokens_sum
-        # embedding & lm_head
-        emb_flops = 6 * emb_and_lm_head_N * tokens_sum
+        moe_ffn_flops = linear_factor * (moe_ffn_N_per_token + shared_ffn_N) * num_hidden_layers * tokens_sum
+        # embedding & lm_head (不在GC范围内，frozen时只有forward=2x)
+        emb_factor = 2 if freeze_llm else 6
+        emb_flops = emb_factor * emb_and_lm_head_N * tokens_sum
 
         dense_flops = attn_linear_flops + moe_ffn_flops + emb_flops
 
         # attention qkv flops（与序列长度平方相关）
         seqlen_square_sum = sum(s * s for s in batch_seqlens)
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        attn_qkv_flops = attn_dot_factor * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # image encoder flops
         images_seqlens = kwargs.get("images_seqlens", None)
         if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             image_config = getattr(self.config.encoder_config, "image_config", None)
             if image_config is not None:
-                if "qwen35moe" in image_config.model_type:
-                    vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, image_config)
-                else:
-                    vit_flops = self._estimate_qwen_vit_flop(images_seqlens, image_config)
+                freeze_projector = kwargs.get("freeze_projector", False)
+                vit_flops = self._estimate_beebee_vit_flop(
+                    images_seqlens, image_config,
+                    freeze_vit=freeze_vit, freeze_projector=freeze_projector
+                )
             else:
                 vit_flops = 0
-            
-            vit_flops = vit_flops * (2.0 / 6.0) if freeze_vit else vit_flops
-
         else:
             vit_flops = 0
 

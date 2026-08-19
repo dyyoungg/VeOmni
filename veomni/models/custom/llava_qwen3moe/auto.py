@@ -86,7 +86,7 @@ def _compose_vision_config(
             train_vision_projector=train_vision_projector,
             freeze_vision_merger=freeze_vision_merger,
         )
-    elif vision_type == "qwen3_5_moe":
+    elif vision_type in ["qwen3_5_moe", "qwen3_omni_moe", "qwen3_8_vision"]:
         vision_cfg = BeeBeeVLQwen35MoeVisionModelConfig(
             **vision_dict,
             output_size=output_size,
@@ -96,6 +96,8 @@ def _compose_vision_config(
             train_vision_projector=train_vision_projector,
             freeze_vision_merger=freeze_vision_merger,
         )
+    else:
+        raise NotImplementedError(f"vision_type: {vision_type} is not supported yet!")
 
     print(
         f"BeeBeeVLVisionModelConfig hidden_size={vision_cfg.hidden_size} "
@@ -309,12 +311,52 @@ def build_qwen3moe_omni_from_components(
     return model
 
 
-def merge_component_models(vision_model_path, save_directory, vlm_path=None, load_mm_weight=True):
+def merge_component_models(
+    vision_model_path,
+    save_directory,
+    vlm_path=None,
+    load_vlm_components=("language", "vision"),
+    language_model_path="/mnt/afs/share/Qwen3-30B-A3B-Instruct-2507-veomni-merge",
+    audio_encoder_path="/mnt/afs/share/Qwen3-Omni-AudioTransformer",
+    image_downsample_size=4,
+    image_projector_type="dynamic_avgpool",
+    audio_downsample_size=2,
+    audio_projector_type="mlp_channel",
+    audio_encoder_type="qwen3_audio",
+):
+    """Merge component models into a single omni checkpoint.
+
+    Args:
+        vision_model_path: Path to vision encoder config/weights and processor.
+        save_directory: Output directory for the merged checkpoint.
+        vlm_path: Optional path to a trained VLM checkpoint to load weights from.
+        load_vlm_components: Which components to load from ``vlm_path``.
+            A tuple/list/set containing any of:
+              - ``"language"``: LM backbone (model.layers, embed_tokens, norm, lm_head)
+              - ``"vision"``:   Vision encoder + projector weights
+              - ``"audio"``:    Audio encoder + projector weights
+            Defaults to ``("language", "vision")``.
+            Set to ``()`` or ``None`` to skip vlm_path loading entirely.
+        language_model_path: Path to the base language model.
+        audio_encoder_path: Path to the audio encoder.
+        image_downsample_size: Downsample ratio for image projector.
+        image_projector_type: Type of image projector.
+        audio_downsample_size: Downsample ratio for audio projector.
+        audio_projector_type: Type of audio projector.
+        audio_encoder_type: Type of audio encoder ("whisper" or "qwen3_audio").
+    """
     from transformers import AutoTokenizer, AutoProcessor
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
 
-    language_model_path = "/mnt/afs/share/Qwen3-30B-A3B-Instruct-2507-veomni-merge"
-    audio_encoder_path = "/mnt/afs/share/Qwen3-ASR-1.7B"
+    # Normalize load_vlm_components
+    if load_vlm_components is None:
+        load_vlm_components = set()
+    else:
+        load_vlm_components = set(load_vlm_components)
+    valid_components = {"language", "vision", "audio"}
+    invalid = load_vlm_components - valid_components
+    if invalid:
+        raise ValueError(f"Invalid load_vlm_components: {invalid}. Valid values: {valid_components}")
 
     processor = AutoProcessor.from_pretrained(vision_model_path)
 
@@ -325,8 +367,8 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
         use_fast=True
     )
 
-    # ---- Step 1: 构建模型结构，加载 audio encoder 权重（不加载 LM/vision） ----
-    print("正在构建 Omni 模型结构，加载 Qwen3-ASR audio encoder 权重...")
+    # ---- Step 1: 构建模型结构，加载各 component 权重 ----
+    print("正在构建 Omni 模型结构...")
     model = build_qwen3moe_omni_from_components(
         foundation_config_path=language_model_path,
         foundation_weights_path=language_model_path,
@@ -342,22 +384,22 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
         },
         init_device="cuda",
         torch_dtype="bfloat16",
-        image_downsample_size=4,
-        image_projector_type="dynamic_avgpool",
-        audio_downsample_size=2,
-        audio_projector_type="conv_channel_upscale",
-        audio_encoder_type="qwen3_audio",
+        image_downsample_size=image_downsample_size,
+        image_projector_type=image_projector_type,
+        audio_downsample_size=audio_downsample_size,
+        audio_projector_type=audio_projector_type,
+        audio_encoder_type=audio_encoder_type,
     )
 
     print(f"Built omni model: {type(model)}")
     print(f"image_encoder: {type(model.image_encoder) if model.image_encoder is not None else None}")
     print(f"audio_encoder: {type(model.audio_encoder) if model.audio_encoder is not None else None}")
 
-    # ---- Step 2: 从已训练的 VLM checkpoint 加载 LM + image encoder 权重 ----
+    # ---- Step 2: 从已训练的 VLM checkpoint 按需加载权重 ----
     explicit_weights_to_load = {}
 
-    if load_mm_weight and vlm_path:
-        print(f"正在从已训练 VLM 迁移 LM + image encoder 权重: {vlm_path}")
+    if vlm_path and load_vlm_components:
+        print(f"正在从 VLM checkpoint 加载 {load_vlm_components}: {vlm_path}")
 
         lm_weight_prefixes = (
             "model.layers.",
@@ -372,6 +414,7 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
             "model.mm_projector.mlp.2.bias": "image_encoder.mm_projector.mlp.2.bias",
             "model.mm_projector.mlp.2.weight": "image_encoder.mm_projector.mlp.2.weight",
         }
+        audio_prefixes = ("audio_encoder.",)
 
         weight_files = glob.glob(os.path.join(vlm_path, "*.safetensors"))
         if not weight_files:
@@ -384,20 +427,27 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                 state_dict = torch.load(w_file, map_location="cpu")
 
             for key, tensor in state_dict.items():
-                # Image projector key remapping
-                if key in projector_key_mapping:
-                    new_key = projector_key_mapping[key]
-                    explicit_weights_to_load[new_key] = tensor
-                    print(f"  Projector: {key} -> {new_key}")
+                # Vision: projector key remapping + vision encoder weights
+                if "vision" in load_vlm_components:
+                    if key in projector_key_mapping:
+                        new_key = projector_key_mapping[key]
+                        explicit_weights_to_load[new_key] = tensor
+                        print(f"  Projector: {key} -> {new_key}")
+                    elif key.startswith(vision_prefix) or key.startswith("image_encoder."):
+                        new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
+                        explicit_weights_to_load[new_key] = tensor
 
-                # LM weights
-                if key.startswith(lm_weight_prefixes):
-                    explicit_weights_to_load[key] = tensor
+                # Language: LM backbone weights
+                if "language" in load_vlm_components:
+                    if key.startswith(lm_weight_prefixes):
+                        explicit_weights_to_load[key] = tensor
 
-                # Vision encoder weights
-                elif key.startswith(vision_prefix) or key.startswith("image_encoder."):
-                    new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
-                    explicit_weights_to_load[new_key] = tensor
+                # Audio: audio encoder weights
+                if "audio" in load_vlm_components:
+                    if key.startswith(audio_prefixes):
+                        explicit_weights_to_load[key] = tensor
+
+        print(f"从 VLM 加载了 {len(explicit_weights_to_load)} 个权重 (components: {load_vlm_components})")
 
     # ---- Step 3: 添加 special tokens，resize embeddings ----
     special_tokens_dict = [DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_PAD_TOKEN]
@@ -438,11 +488,21 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
 
         print(f"共 {len(explicit_weights_to_load)} 个权重张量，注入模型...")
         missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
-        # missing 应该只有 audio_encoder 和 audio_projector 相关的（已通过 build_from_components 加载）
-        audio_missing = [k for k in missing_keys if "audio" not in k]
-        if audio_missing:
-            print(f"[WARNING] 非 audio 的 missing keys: {audio_missing[:20]}")
-        print("LM + image encoder 权重注入完成！")
+        # Filter missing keys: only warn about components that were supposed to be loaded
+        expected_missing_prefixes = []
+        if "vision" not in load_vlm_components:
+            expected_missing_prefixes.append("image_encoder.")
+        if "audio" not in load_vlm_components:
+            expected_missing_prefixes.append("audio_encoder.")
+        if "language" not in load_vlm_components:
+            expected_missing_prefixes.extend(["model.", "lm_head."])
+        unexpected_missing = [
+            k for k in missing_keys
+            if not any(k.startswith(p) for p in expected_missing_prefixes)
+        ]
+        if unexpected_missing:
+            print(f"[WARNING] unexpected missing keys: {unexpected_missing[:20]}")
+        print("权重注入完成！")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -458,10 +518,27 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
 
 
 if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
-    
-    vlm_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0804_llavaomni_30A3B_qwen35encoder_dynamic_downsample_st2_addvideoxl_unfreeze_router_aux001/hf_ckpt"
-    save_directory =  "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0815_llavaomni_30A3B_qwen35encoder_qwen3asr_down2"
-    merge_component_models(vision_path, save_directory, vlm_path=vlm_path, load_mm_weight=True)
-    
+    vision_path = "/mnt/afs/share/Qwen38_27B_vision_encoder"
+
+    vlm_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4/checkpoints/hf_ckpt"
+    save_directory = "/mnt/afs/share/llava_qwen30A3B_qwen38encoder_qwen3audio_gametext"
+
+    # load_vlm_components 控制从 vlm_path 加载哪些部分:
+    #   ("language", "vision")       - 只加载 LM + vision (默认)
+    #   ("language",)                - 只加载 LM
+    #   ("language", "vision", "audio") - 全部从 vlm_path 加载
+    #   ()                           - 不从 vlm_path 加载任何权重
+    merge_component_models(
+        vision_path,
+        save_directory,
+        vlm_path=vlm_path,
+        load_vlm_components=("language",),
+        language_model_path="/mnt/afs/share/Qwen3-30B-A3B-Instruct-2507-veomni-merge",
+        audio_encoder_path="/mnt/afs/share/Qwen3-Omni-AudioTransformer",
+        image_downsample_size=4,
+        image_projector_type="dynamic_avgpool",
+        audio_downsample_size=2,
+        audio_projector_type="mlp_channel",
+        audio_encoder_type="qwen3_audio",
+    )
     
