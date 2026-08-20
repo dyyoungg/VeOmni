@@ -156,6 +156,7 @@ class VLMTrainingArguments(TrainingArguments):
         default=10000,
         metadata={"help": "Number of fake samples to generate when use_fake_data=True."},
     )
+    proactive: bool = field(default=False)
     target_image_num: int = field(default=999)
     min_lr_rate: float = field(default=0.0)
     router_aux_loss_coef: float = field(default=0.001)
@@ -205,6 +206,7 @@ class VLMMDataArguments(DataArguments):
     sub_native_resolution: bool = field(default=False)
     compress_fps: bool = field(default=False)
     minimum_image_token_num: int = field(default=10)
+    keep_last_n_image_turns: int = field(default=0)
 
 
 @dataclass
