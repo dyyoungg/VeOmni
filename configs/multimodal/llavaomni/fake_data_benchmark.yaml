@@ -1,0 +1,99 @@
+# Fake data speed benchmark config
+# 用于测试训练吞吐量，不需要任何真实数据文件
+# Usage: torchrun --nproc_per_node 8 tasks/train_llavaomni.py configs/multimodal/llavaomni/fake_data_benchmark.yaml
+
+model:
+  model_path: /mnt/afs/share/llava_qwen2_14B-qwen25encoder-st2-veomni-down16-audiodown8    # 替换为实际模型路径
+  config_path: /mnt/afs/share/llava_qwen2_14B-qwen25encoder-st2-veomni-down16-audiodown8
+  model_arc: qwen2
+  vision_tower: /mnt/afs/share/qwen25_vl_encoder   # 替换为实际 vision encoder 路径
+  mm_downsample_ratio: 16
+  image_projector_type: dynamic_avgpool
+  audio_projector_type: conv_channel_upscale
+  use_audio_start_end_token: true
+  audio_downsample_ratio: 8
+  encoder_data_balance: false
+
+data:
+  train_path: ""              # fake data 模式下不需要真实数据路径
+  eval_path: ""
+  sample_fps: 2
+  finetune_sample_frames: 64
+  preprocess_workers: 2
+
+train:
+  num_train_epochs: 1
+  seed: 42
+
+  model_max_length: 4096
+  pack_seq: true            
+  init_device: meta
+
+  # ===== Fake Data 开关 =====
+  use_fake_data: true         # 启用 fake data
+  fake_data_num_samples: 500000 # 生成的 fake 样本数量
+
+  freeze_vit: false
+  freeze_vit_projector: false
+  freeze_audio_tower: true
+  freeze_audio_projector: false
+  freeze_llm: false
+  output_router_logits: false
+  freeze_router: true
+
+  optimizer:
+    type: adamw
+    lr: 2.0e-4
+    lr_min: 5e-5
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    lr_warmup_ratio: 0.05
+    lr_start: 0.0
+
+  vit_lr: 2.0e-4
+  min_lr_rate: 0.5
+  enable_mixed_precision: false
+  gc_steps: 200
+  empty_cache_steps: 200
+  logging_steps: 2            # 每步都打印，方便观察吞吐
+  max_steps: 200              # 只跑 100 步，测速度
+  eval_steps: 0
+
+  gradient_checkpointing:
+    enable: true
+    debug: false
+    enable_reentrant: false
+
+  accelerator:
+    ulysses_size: 1
+    enable_async: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      offload: false
+      forward_prefetch: false
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.8
+
+  checkpoint:
+    output_dir: /tmp/fake_test
+    save_steps: 10000
+    save_epochs: 1
+    save_total_limit: 1
+    manager: dcp
+    save_hf_weights: false
+    save_async: true
+    hf_save_steps: 20
+
+  wandb:
+    enable: false
+
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  remote_dataloader: false
+  broadcast_model_weights_from_rank0: true

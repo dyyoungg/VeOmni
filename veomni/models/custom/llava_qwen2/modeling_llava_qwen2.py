@@ -96,7 +96,7 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
         
         if encoder_cfg is not None:
             if getattr(encoder_cfg, "image_config", None) is not None:
-                if "qwen35moe" in encoder_cfg.image_config.model_type:
+                if "qwen3" in encoder_cfg.image_config.model_type:
                     self.image_encoder = BeeBeeVLQwen35MoeVisionModel._from_config(config=encoder_cfg.image_config, 
                                                            attn_implementation=encoder_cfg.image_config._attn_implementation, 
                                                            dtype=torch_dtype)

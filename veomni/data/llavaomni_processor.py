@@ -52,6 +52,7 @@ from veomni.distributed.sequence_parallel import get_data_parallel_rank
 from veomni.data.multimodal.image_utils import get_adaptive_pool_size, jpeg_degrade, smart_resize
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils.logging import get_logger
+from veomni.models.custom.audio_encoder.modeling_qwen3_audio import _get_feat_extract_output_lengths
 from decord import VideoReader, cpu
 
 
@@ -773,8 +774,8 @@ class OmniSampleProcessor:
 
         Returns:
             audio_mel: [total_chunks, mel_bins, 3000]
-            actual_len: 每个 chunk 经过 projector downsample 后的 token 数
-            raw_len: 每个 chunk 的有效帧长（传给 whisper encoder）
+            actual_len: 每个 chunk 经过 encoder + projector downsample 后的 token 数
+            raw_len: 每个 chunk 的有效帧长（传给 encoder）
             audio_chunk_counts: 每条音频被分成的 chunk 数（用于 token 展开时分组）
         """
         if not audio_list:
@@ -783,6 +784,7 @@ class OmniSampleProcessor:
         CHUNK_SAMPLES = 480000  # 30s * 16kHz
         frame_len = self.model_args.audio_frame_length
         compress_ratio = self.model_args.audio_downsample_ratio
+        audio_encoder_type = getattr(self.model_args, 'audio_encoder_type', 'whisper')
 
         all_chunks = []
         chunk_frame_lens = []  # 每个 chunk 的有效帧长
@@ -799,7 +801,7 @@ class OmniSampleProcessor:
                 end = min((i + 1) * CHUNK_SAMPLES, n_samples)
                 chunk = audio[start:end]
 
-                # 该 chunk 的有效帧数
+                # Whisper: frame_len=320, Qwen3 audio: frame_len=160 (mel hop_length)
                 chunk_frames = math.ceil(len(chunk) / frame_len)
                 chunk_frame_lens.append(chunk_frames)
 
@@ -812,7 +814,15 @@ class OmniSampleProcessor:
             return None, [], None, []
         audio_mel = torch.cat(all_chunks, dim=0)  # [total_chunks, mel_bins, 3000]
         raw_len = torch.tensor(chunk_frame_lens)
-        actual_len = [(l + compress_ratio - 1) // compress_ratio for l in raw_len]
+
+        if audio_encoder_type == 'qwen3_audio':
+            # Qwen3 encoder 内部 conv+chunk 下采样，token 数需用专用函数计算
+            n_window = getattr(self.model_args, 'qwen3_audio_n_window', 50)
+            encoder_out_lens = _get_feat_extract_output_lengths(raw_len, n_window)
+            actual_len = [(l.item() + compress_ratio - 1) // compress_ratio for l in encoder_out_lens]
+        else:
+            actual_len = [(l + compress_ratio - 1) // compress_ratio for l in raw_len]
+
         return audio_mel, actual_len, raw_len, audio_chunk_counts
     
     def _process_audio_features(self, resources: Dict) -> Dict:
@@ -832,15 +842,29 @@ class OmniSampleProcessor:
         CHUNK_SAMPLES = 480000  # 30s * 16kHz
         frame_len = self.model_args.audio_frame_length
         ratio = self.model_args.audio_downsample_ratio
+        audio_encoder_type = getattr(self.model_args, 'audio_encoder_type', 'whisper')
 
         total = 0
-        for a in audio_data_list:
-            n_samples = len(a)
-            n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
-            for i in range(n_chunks):
-                chunk_samples = min(CHUNK_SAMPLES, n_samples - i * CHUNK_SAMPLES)
-                chunk_frames = math.ceil(chunk_samples / frame_len)
-                total += (chunk_frames + ratio - 1) // ratio
+        if audio_encoder_type == 'qwen3_audio':
+            n_window = getattr(self.model_args, 'qwen3_audio_n_window', 50)
+            for a in audio_data_list:
+                n_samples = len(a)
+                n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
+                for i in range(n_chunks):
+                    chunk_samples = min(CHUNK_SAMPLES, n_samples - i * CHUNK_SAMPLES)
+                    chunk_frames = math.ceil(chunk_samples / frame_len)
+                    encoder_tokens = _get_feat_extract_output_lengths(
+                        torch.tensor([chunk_frames]), n_window
+                    ).item()
+                    total += (encoder_tokens + ratio - 1) // ratio
+        else:
+            for a in audio_data_list:
+                n_samples = len(a)
+                n_chunks = math.ceil(n_samples / CHUNK_SAMPLES)
+                for i in range(n_chunks):
+                    chunk_samples = min(CHUNK_SAMPLES, n_samples - i * CHUNK_SAMPLES)
+                    chunk_frames = math.ceil(chunk_samples / frame_len)
+                    total += (chunk_frames + ratio - 1) // ratio
 
         if self.model_args.use_audio_start_end_token:
             total += 2 * len(audio_data_list)

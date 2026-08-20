@@ -222,13 +222,18 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
     metadata_configs = [
         ("audio_ground_truth_text", ("", "zh")),
         ("category", None),
-        ("raw_data", {})
+        ("raw_data", {}),
+        ("channel_ids", []),
     ]
     
     for key, default in metadata_configs:
-       
-        if any(key in d for d in batch_data): 
+
+        if any(key in d for d in batch_data):
             batch_inputs[key] = [d.get(key, default) for d in batch_data]
+
+    # Flatten channel_ids for bs=1 packing: [[ch1,ch2,...]] -> [ch1,ch2,...]
+    if "channel_ids" in batch_inputs and len(batch_inputs["channel_ids"]) == 1:
+        batch_inputs["channel_ids"] = batch_inputs["channel_ids"][0]
 
     if any("options_num" in d for d in batch_data):
         options = [d["options_num"] for d in batch_data if "options_num" in d]
@@ -257,6 +262,13 @@ class OmniDataloader(BaseDataLoader):
         self.processor: Optional[OmniSampleProcessor] = None
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
         self._trained_index = 0
+
+        # Channel loss: load mapping from config
+        self.channel_mapping: Dict[str, str] = {}
+        mapping_path = getattr(training_args, "channel_loss_mapping", "")
+        if mapping_path and os.path.isfile(mapping_path):
+            with open(mapping_path, "r", encoding="utf-8") as f:
+                self.channel_mapping = json.load(f)
 
     def init_image_processor(self) -> None:
 
@@ -395,7 +407,7 @@ class OmniDataloader(BaseDataLoader):
         self.data_lock = Lock()
         self.image_merge_sizes: List = []
         self._clear_pack_buffer()
-        self.worker_metrics_queue = torch.multiprocessing.Queue()  
+        self.worker_metrics_queue = torch.multiprocessing.Queue()
         if getattr(self.data_args, "save_token_counted_data", False):
             self.save_info_queue = torch.multiprocessing.Queue()
         super().launch()
@@ -423,10 +435,213 @@ class OmniDataloader(BaseDataLoader):
                 if item is None: 
                     break
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                f.flush() 
+                f.flush()
+
+
+    def _generate_fake_sample(self) -> Tuple:
+        """Generate a single fake multimodal sample with random modality combination.
+
+        Randomly selects which modalities to include (image/video/audio/text-only)
+        with random sizes, producing an OmniSample-like tuple that can be fed into
+        _pack_and_enqueue for realistic packing behavior.
+
+        Returns:
+            (input_ids, labels, caption_len, resources, token_counts)
+        """
+        import math
+        import random
+        from veomni.data.multimodal.image_utils import get_adaptive_pool_size
+
+        max_len = self.tokenizer.model_max_length
+        downsample_ratio = self.model_args.mm_downsample_ratio
+        merge_size = 2
+        vocab_size = len(self.tokenizer)
+
+        # Randomly pick modality combination
+        # Weights: text-only 10%, image 25%, video 25%, audio 10%,
+        #          image+audio 10%, video+audio 10%, all 10%
+        combo = random.choices(
+            ["text", "image", "video", "audio",
+             "image+audio", "video+audio", "all"],
+            weights=[10, 25, 25, 10, 10, 10, 10],
+            k=1,
+        )[0]
+
+        has_image = combo in ("image", "image+audio", "all")
+        has_video = combo in ("video", "video+audio", "all")
+        has_audio = combo in ("audio", "image+audio", "video+audio", "all")
+
+        pixel_values = None
+        image_grid_thw = None
+        image_downsample_ratios = None
+        num_image_tokens = 0
+
+        pixel_values_video = None
+        video_grid_thw = None
+        video_downsample_ratios = None
+        num_video_tokens = 0
+
+        audio_features = None
+        audio_features_lens = None
+        actual_audio_feature_len = []
+        num_audio_tokens = 0
+
+        # --- Image ---
+        if has_image:
+            num_images = random.randint(1, 4)
+            all_pixels, all_thw = [], []
+            for _ in range(num_images):
+                # Random spatial: h,w in {16,20,24,28,32} (multiples of 2 for merge)
+                img_h = random.choice([16, 20, 24, 28, 32, 48])
+                img_w = random.choice([16, 20, 24, 28, 32, 48])
+                img_t = 1
+                n_patches = img_t * img_h * img_w
+                all_pixels.append(torch.randn(n_patches, 1176, dtype=torch.float32))
+                all_thw.append([img_t, img_h, img_w])
+                m_h, m_w = get_adaptive_pool_size(img_h // merge_size, img_w // merge_size, downsample_ratio)
+                num_image_tokens += img_t * m_h * m_w
+
+            pixel_values = torch.cat(all_pixels, dim=0)
+            image_grid_thw = torch.tensor(all_thw, dtype=torch.int64)
+            image_downsample_ratios = torch.full((num_images,), downsample_ratio, dtype=torch.float32)
+
+        # --- Video ---
+        if has_video:
+            # Random temporal: 2~16 temporal patches; random spatial
+            vid_t = random.choice([8, 16, 32])
+            vid_h = random.choice([12, 16, 20, 24, 48, 96])
+            vid_w = random.choice([12, 16, 20, 24, 48, 96])
+            vid_num_patches = vid_t * vid_h * vid_w
+            pixel_values_video = torch.randn(vid_num_patches, 1176, dtype=torch.float32)
+            video_grid_thw = torch.tensor([[vid_t, vid_h, vid_w]], dtype=torch.int64)
+            video_downsample_ratios = torch.tensor([downsample_ratio], dtype=torch.float32)
+            v_m_h, v_m_w = get_adaptive_pool_size(vid_h // merge_size, vid_w // merge_size, downsample_ratio)
+            num_video_tokens = vid_t * v_m_h * v_m_w
+
+        # --- Audio ---
+        if has_audio:
+            audio_downsample_ratio = self.model_args.audio_downsample_ratio
+            audio_frame_length = getattr(self.model_args, "audio_frame_length", 320)
+            num_mel_bins = getattr(self.model_args, "num_mel_bins", 128)
+            max_chunk_samples = 480000  # 30s at 16kHz
+            # Random 1~3 audio chunks (simulating 1~90s audio)
+            num_chunks = random.randint(1, 3)
+            mel_list, len_list = [], []
+            for _ in range(num_chunks):
+                # Random duration per chunk: 1s~30s
+                dur_samples = random.randint(16000, max_chunk_samples)
+                chunk_frames = math.ceil(dur_samples / audio_frame_length)
+                mel_list.append(torch.randn(1, num_mel_bins, 3000, dtype=torch.float32))
+                len_list.append(chunk_frames)  # whisper CNN downsamples 3000 mel frames; effective len = chunk_frames
+                feat_len = math.ceil(chunk_frames / audio_downsample_ratio)
+                actual_audio_feature_len.append(feat_len)
+                num_audio_tokens += feat_len
+            audio_features = torch.cat(mel_list, dim=0)
+            audio_features_lens = torch.tensor(len_list, dtype=torch.int64)
+
+        # --- Guard: if total mm tokens too large for max_len, drop some modalities ---
+        total_mm_tokens = num_image_tokens + num_video_tokens + num_audio_tokens
+        min_text_tokens = 64
+        if total_mm_tokens + min_text_tokens > max_len:
+            # Too many mm tokens — fall back to text-only for this sample
+            has_image = has_video = has_audio = False
+            pixel_values = image_grid_thw = image_downsample_ratios = None
+            pixel_values_video = video_grid_thw = video_downsample_ratios = None
+            audio_features = audio_features_lens = None
+            actual_audio_feature_len = []
+            num_image_tokens = num_video_tokens = num_audio_tokens = 0
+            total_mm_tokens = 0
+
+        # --- Build input_ids ---
+        total_mm_tokens = num_image_tokens + num_video_tokens + num_audio_tokens
+        # Random text length: 64~1024, capped to fit max_len
+        text_budget = max(64, max_len - total_mm_tokens)
+        text_len = random.randint(64, min(1024, text_budget))
+        total_len = total_mm_tokens + text_len
+
+        input_ids = torch.randint(0, vocab_size, (total_len,), dtype=torch.long)
+        labels = torch.randint(0, vocab_size, (total_len,), dtype=torch.long)
+
+        # Fill multimodal pad token positions at the front
+        pos = 0
+        if has_image:
+            input_ids[pos:pos + num_image_tokens] = self.image_token_id
+            labels[pos:pos + num_image_tokens] = IGNORE_INDEX
+            pos += num_image_tokens
+        if has_video:
+            input_ids[pos:pos + num_video_tokens] = self.video_token_id
+            labels[pos:pos + num_video_tokens] = IGNORE_INDEX
+            pos += num_video_tokens
+        if has_audio:
+            input_ids[pos:pos + num_audio_tokens] = self.audio_token_id
+            labels[pos:pos + num_audio_tokens] = IGNORE_INDEX
+            pos += num_audio_tokens
+
+        resources = {
+            "image_pixels": pixel_values,
+            "image_thw": image_grid_thw,
+            "video_pixels": pixel_values_video,
+            "video_thw": video_grid_thw,
+            "audio_features": audio_features,
+            "audio_features_lens": audio_features_lens,
+            "actual_audio_feature_len": actual_audio_feature_len,
+            "image_downsample_ratios": image_downsample_ratios,
+            "video_downsample_ratios": video_downsample_ratios,
+        }
+        token_counts = {
+            "image": num_image_tokens,
+            "video": num_video_tokens,
+            "audio": num_audio_tokens,
+        }
+        return input_ids, labels, total_len, resources, token_counts
+
+    def _worker_loop_fake(self, status_event) -> None:
+        """Worker loop that produces fake multimodal data for speed benchmarking.
+
+        Each call to _generate_fake_sample produces a random modality combination
+        with random sizes. Samples go through _pack_and_enqueue for realistic
+        sequence packing behavior.
+
+        Workers run indefinitely until the trainer sets workers_done_event
+        (triggered by max_steps or num_train_epochs). The counter is for
+        logging only.
+        """
+        set_env_cpu_limit(cpu_num=1)
+        torch.set_num_threads(1)
+        self._clear_pack_buffer()
+
+        ppid = os.getppid()
+        local_count = 0
+
+        while os.getppid() == ppid and not self.workers_done_event.is_set():
+            # Back-pressure: wait for consumer to drain before producing more
+            if self.result_queue.qsize() > 4:
+                time.sleep(0.5)
+                continue
+
+            input_ids, labels, caption_len, resources, token_counts = self._generate_fake_sample()
+            self._pack_and_enqueue(input_ids, labels, caption_len, resources, token_counts)
+
+            local_count += 1
+            if local_count % 500 == 0 and self.rank == 0:
+                logger.info(f"[FakeData] worker generated {local_count} samples")
+
+        # Flush remaining packed buffer before exiting
+        if len(self.new_input_ids) > 0:
+            self._flush_pack_buffer()
+            self._clear_pack_buffer()
+
+        status_event.set()
+        if self.workers_done_event.is_set() or os.getppid() != ppid:
+            self.result_queue.cancel_join_thread()
 
 
     def worker_loop(self, status_event) -> None:
+        # --- Fake data fast path ---
+        if getattr(self.training_args, "use_fake_data", False):
+            self._worker_loop_fake(status_event)
+            return
+
         if self.processor is None:
             self.init_image_processor()
         import gc
@@ -600,10 +815,11 @@ class OmniDataloader(BaseDataLoader):
         return img_ok and vid_ok and aud_ok
     
     def _pack_and_enqueue(
-        self, cur_input_ids: torch.Tensor, cur_labels: torch.Tensor, 
-        cur_caption_len: int, resources: Dict, token_counts: Dict
+        self, cur_input_ids: torch.Tensor, cur_labels: torch.Tensor,
+        cur_caption_len: int, resources: Dict, token_counts: Dict,
+        channel_id: str = "other",
     ) -> None:
-        
+
         max_len = self.tokenizer.model_max_length
         # 首先检查长度截断
         if len(cur_input_ids) >= max_len:
@@ -613,21 +829,23 @@ class OmniDataloader(BaseDataLoader):
                 print(f"WARNING: Skipping sample. Truncation to {max_len} cut off multimodal tokens.")
                 return
             cur_caption_len = max_len
-      
+
         if not self.training_args.pack_seq:
-            self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources)
+            self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources,
+                                        channel_ids=[channel_id])
             return
         image_num = 0
         if len(self.new_images_thw):
             image_num = torch.cat(self.new_images_thw)[:,0].sum().item()
-        
+
         if (self.new_caption_len + cur_caption_len > max_len and len(self.new_input_ids) > 0) or image_num > self.training_args.target_image_num:
             # 缓冲区溢出，把当前的缓存打包发出
             self._flush_pack_buffer()
             self._clear_pack_buffer()
 
 
-        self._append_to_pack_buffer(cur_input_ids, cur_labels, cur_caption_len, resources, token_counts)
+        self._append_to_pack_buffer(cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
+                                    channel_id=channel_id)
 
 
     def _flush_pack_buffer(self) -> None:
@@ -659,9 +877,11 @@ class OmniDataloader(BaseDataLoader):
             packed_ids, packed_labels,
             list(self.attention_mask_len),
             packed_resources,
+            channel_ids=list(self.channel_id_list),
         )
 
-    def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources) -> None:
+    def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources,
+                               channel_ids=None) -> None:
         self.result_queue.put({
             "input_ids":            input_ids,
             "labels":               labels,
@@ -674,13 +894,16 @@ class OmniDataloader(BaseDataLoader):
             "image_downsample_ratios": resources.get("image_downsample_ratios"),
             "video_downsample_ratios": resources.get("video_downsample_ratios"),
             "attention_mask_len":   attn_mask_len,
+            "channel_ids":          channel_ids or [],
         })
 
-    def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts):
+    def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
+                               channel_id: str = "other"):
         self.new_caption_len += cur_caption_len
         self.new_input_ids.append(cur_input_ids)
         self.new_labels.append(cur_labels)
         self.attention_mask_len.append(cur_caption_len)
+        self.channel_id_list.append(channel_id)
 
         if resources.get("image_pixels") is not None and resources.get("image_thw") is not None:
             self.new_images_list.append(resources["image_pixels"])
@@ -712,6 +935,7 @@ class OmniDataloader(BaseDataLoader):
         self.new_image_tokens, self.new_video_tokens, self.new_audio_tokens = [], [], []
         self.new_image_downsample_ratios = []
         self.new_video_downsample_ratios = []
+        self.channel_id_list = []
 
     
     # ------------------------------------------------------------------
@@ -755,6 +979,13 @@ class OmniDataloader(BaseDataLoader):
         else:
             self._process_single_sample(sample_data, samples, processor)
 
+    def _resolve_channel_id(self, sample_data: Dict) -> str:
+        """Map sample's dataset_type to a channel name via self.channel_mapping."""
+        dataset_type = sample_data.get("dataset_type", "")
+        if not dataset_type:
+            return "other"
+        return self.channel_mapping.get(dataset_type, dataset_type)
+
     def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any) -> None:
         if getattr(self.data_args, "save_token_counted_data", False):
             system_token = processor._build_system_token(sample_data, 0)
@@ -762,6 +993,7 @@ class OmniDataloader(BaseDataLoader):
                 sample_data, system_token, sample.token_counts, sample.caption_len
             )
 
+        channel_id = self._resolve_channel_id(sample_data)
         self._pack_and_enqueue(
             cur_input_ids=sample.input_ids,
             cur_labels=sample.labels,
@@ -778,6 +1010,7 @@ class OmniDataloader(BaseDataLoader):
                 "video_downsample_ratios": sample.video_downsample_ratios,
             },
             token_counts=sample.token_counts,
+            channel_id=channel_id,
         )
        
         

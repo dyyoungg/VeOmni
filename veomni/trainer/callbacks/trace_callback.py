@@ -20,6 +20,7 @@ from tqdm import trange
 import tracemalloc
 import contextlib
 import torch
+import torch.distributed as dist
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
@@ -311,9 +312,16 @@ class EnvironMeterCallback(Callback):
 
         step_train_metrics = {
             "total_loss": loss,
-           
+
         }
-        step_train_metrics.update(loss_dict)
+        # Separate channel metrics from regular metrics
+        channel_raw = {k: v for k, v in loss_dict.items()
+                       if k.startswith("channel_loss_sum/") or k.startswith("channel_token_count/")}
+        channel_passthrough = {k: v for k, v in loss_dict.items()
+                               if k.startswith("channel_loss/") or k.startswith("channel_tokens/")}
+        regular_metrics = {k: v for k, v in loss_dict.items()
+                          if k not in channel_raw and k not in channel_passthrough}
+        step_train_metrics.update(regular_metrics)
         step_train_metrics["grad_norm"] = grad_norm
 
         # gather training_step_info from all ranks
@@ -321,6 +329,14 @@ class EnvironMeterCallback(Callback):
             f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
             for k, v in step_train_metrics.items()
         }
+
+        # Channel loss: all_gather keys, unify, then all_reduce fixed-length tensors
+        if channel_raw:
+            channel_metrics = self._reduce_channel_loss(channel_raw)
+            step_train_metrics.update(channel_metrics)
+        # Pass through channel_loss/time etc. without all_reduce or prefix
+        step_train_metrics.update(channel_passthrough)
+
         step_train_metrics["time_profiling/iter_time"] = delta_time
         current_loss = step_train_metrics["training/total_loss"]
         self._loss_window.append(current_loss)
@@ -369,7 +385,18 @@ class EnvironMeterCallback(Callback):
                 f"cpu_memory_usage(%): {step_env_metrics.get('memory/cpu_memory_usage(%)', 0):.2f} "
             )
             logger.info(env_info)
-        
+
+            # Channel loss
+            ch_losses = {
+                k: v
+                for k, v in step_train_metrics.items()
+                if k.startswith("channel_loss/")
+            }
+            if ch_losses:
+                ch_time = step_train_metrics.get("channel_loss/time", 0)
+                parts = [f"{k.split('/')[-1]}: {v:.4f}" for k, v in sorted(ch_losses.items()) if k != "channel_loss/time"]
+                logger.info(f"  channel_loss ({ch_time:.3f}s): {' | '.join(parts)}")
+
         if state.global_step == 50:
             tracemalloc.start(10)  # 10层调用栈
             self._tracemalloc_snapshot = tracemalloc.take_snapshot()
@@ -386,6 +413,54 @@ class EnvironMeterCallback(Callback):
                 logger.info(f"  {stat}")
            
             self._tracemalloc_snapshot = new_snapshot
+
+    def _reduce_channel_loss(self, channel_raw: Dict[str, float]) -> Dict[str, float]:
+        """All-gather channel keys across ranks, then all_reduce sum/count tensors.
+
+        Same approach as main branch ChannelLossCallback._reduce_step_totals:
+        1. all_gather_object to collect the union of channel names from every rank
+        2. Build fixed-length tensors (one slot per channel, ordered) — missing channels get 0
+        3. all_reduce(SUM) on the tensors — safe because every rank has the same length
+        4. Compute mean = total_sum / total_count per channel
+        """
+        fsdp_group = get_parallel_state().fsdp_group
+
+        # Extract local channel names from keys like "channel_loss_sum/<ch>"
+        local_channels = sorted({k.split("/", 1)[1] for k in channel_raw if k.startswith("channel_loss_sum/")})
+
+        # Gather channel names from all ranks
+        if dist.is_initialized():
+            gathered: list = [None] * dist.get_world_size(fsdp_group)
+            dist.all_gather_object(gathered, local_channels, group=fsdp_group)
+            all_channels = sorted({ch for rank_chs in gathered if rank_chs for ch in rank_chs})
+        else:
+            all_channels = local_channels
+
+        if not all_channels:
+            return {}
+
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        n = len(all_channels)
+        loss_sums = torch.zeros(n, dtype=torch.float64, device=device)
+        token_counts = torch.zeros(n, dtype=torch.float64, device=device)
+
+        ch_to_idx = {ch: i for i, ch in enumerate(all_channels)}
+        for ch in local_channels:
+            idx = ch_to_idx[ch]
+            loss_sums[idx] = channel_raw.get(f"channel_loss_sum/{ch}", 0.0)
+            token_counts[idx] = channel_raw.get(f"channel_token_count/{ch}", 0.0)
+
+        if dist.is_initialized():
+            dist.all_reduce(loss_sums, op=dist.ReduceOp.SUM, group=fsdp_group)
+            dist.all_reduce(token_counts, op=dist.ReduceOp.SUM, group=fsdp_group)
+
+        result: Dict[str, float] = {}
+        for i, ch in enumerate(all_channels):
+            tc = token_counts[i].item()
+            if tc > 0:
+                result[f"channel_loss/{ch}"] = loss_sums[i].item() / tc
+                result[f"channel_tokens/{ch}"] = tc
+        return result
 
 
 class TqdmCallback(Callback):

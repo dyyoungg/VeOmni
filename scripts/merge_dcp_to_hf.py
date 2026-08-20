@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Union
 import torch
 from safetensors.torch import save_file
 from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoConfig, AutoProcessor, GenerationConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
 from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan
@@ -23,6 +23,28 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+_CUSTOM_CONFIGS_REGISTERED = False
+
+
+def _register_custom_configs():
+    """Import all Python modules under veomni/models/custom/ to trigger AutoConfig.register() calls."""
+    global _CUSTOM_CONFIGS_REGISTERED
+    if _CUSTOM_CONFIGS_REGISTERED:
+        return
+
+    import importlib
+    import pkgutil
+
+    import veomni.models.custom as custom_pkg
+
+    for importer, modname, ispkg in pkgutil.walk_packages(custom_pkg.__path__, prefix=custom_pkg.__name__ + "."):
+        try:
+            importlib.import_module(modname)
+        except Exception:
+            pass
+
+    _CUSTOM_CONFIGS_REGISTERED = True
 
 
 def _process_and_save_shard(
@@ -246,6 +268,8 @@ def merge_to_hf_pt(
     num_workers: int = 1,
 ) -> None:
     """Main conversion function: load DCP from load_dir and save HF format to save_path."""
+    _register_custom_configs()
+
     model_assets = None
     if model_assets_dir is not None:
         logger.info(f"Loading model assets from {model_assets_dir}")
@@ -255,6 +279,12 @@ def merge_to_hf_pt(
             model_assets.append(config)
         except Exception as e:
             logger.warning(f"Failed to load AutoConfig: {e}")
+
+        try:
+            generation_config = GenerationConfig.from_pretrained(model_assets_dir)
+            model_assets.append(generation_config)
+        except Exception as e:
+            logger.warning(f"Failed to load GenerationConfig: {e}")
 
         try:
             processor = AutoProcessor.from_pretrained(model_assets_dir, trust_remote_code=True)

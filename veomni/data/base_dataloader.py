@@ -82,6 +82,11 @@ class BaseDataLoader:
     def load_data(self, data_path: str) -> None:
         if self.eval_mode:
             return
+        if getattr(self.training_args, "use_fake_data", False):
+            num_samples = getattr(self.training_args, "fake_data_num_samples", 10000)
+            self.data_list = list(range(num_samples))
+            logger.info(f"[FakeData] rank {self.rank}: use_fake_data=True, generated {num_samples} fake sample indices")
+            return
         if self.training_args.remote_dataloader:
             assert os.path.exists(getattr(self.data_args, "offset_file_path", "")), "remote dataloader need offset file. Please check the offset file path."
             assert os.path.exists(getattr(self.data_args, "file_maping_path", "")), "remote dataloader need filemaping file. Please check the file_maping file path."
@@ -178,7 +183,10 @@ class BaseDataLoader:
 
         # remote data-server (rank-0 only)
         self.remote_server_process = None
-        if self.training_args.remote_dataloader:
+        if getattr(self.training_args, "use_fake_data", False):
+            # fake data mode: worker_loop will generate data internally
+            pass
+        elif self.training_args.remote_dataloader:
             if self.rank == 0:
                 self.remote_server_process = torch.multiprocessing.Process(
                     target=self.remote_server_loop
