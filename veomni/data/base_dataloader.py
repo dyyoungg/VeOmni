@@ -89,11 +89,21 @@ class BaseDataLoader:
             mapping_path = getattr(self.data_args, "file_maping_path", "")
             offsets_path = getattr(self.data_args, "offset_file_path", "")
             
-            with open(mapping_path, "r", encoding="utf-8") as f:
-                self.file_mapping = json.load(f)
+            if mapping_path and mapping_path.endswith('.json'):
+                try:
+                    with open(mapping_path, 'r', encoding='utf-8') as f:
+                        self.file_mapping = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to load offset_file as JSON mapping: {e}")
+                    self.file_mapping = {}
+            else:
+                self.file_mapping = mapping_path
 
-            self.data_list = np.load(offsets_path, mmap_mode='r')
-            
+            if offsets_path.endswith('.npy'):
+                self.data_list = np.load(offsets_path, mmap_mode='r')
+            elif offsets_path.endswith('.json'):
+                with open(offsets_path, 'r') as f:
+                    self.data_list = json.load(f)
         else:
 
             if not self.data_args.offline_dataset_split:
@@ -295,6 +305,7 @@ class BaseDataLoader:
         while True:
             try:
                 data = self.batch_data_queue.get(timeout=1)
+                # print("data data data data data data", data)
                 yield data
             except queue.Empty:
                 if self.check_all_workers_done():

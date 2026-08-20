@@ -95,10 +95,17 @@ _CHAT_TEMPLATES = {
     "qwen2": dict(
         system="<|im_start|>system\n{}<|im_end|>",
         system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
+        system_in_middle_no_assistant="\n<|im_start|>system\n{}<|im_end|>",
         user="\n<|im_start|>user\n{}<|im_end|>",
         assistant="\n<|im_start|>assistant\n{}<|im_end|>",
         assistant_prefix="\n<|im_start|>assistant\n",
         query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        assistant_active="\n<|im_start|>assistant\n（主动）{}<|im_end|>",
+        assistant_active_prefix="\n<|im_start|>assistant\n（主动）",
+        thinking="\n<|im_start|>thinking\n{}<|im_end|>",
+        thinking_prefix="\n<|im_start|>thinking\n",
+        video="\n<VIDEO>{}<|im_end|>",
+        video_prefix="\n<VIDEO>",
     ),
 }
 

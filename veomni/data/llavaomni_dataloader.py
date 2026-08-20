@@ -30,15 +30,24 @@ except ImportError:
 from veomni.data.base_dataloader import BaseDataLoader
 from veomni.utils.constants import (
     IGNORE_INDEX,
+    IMAGE_TOKEN_INDEX,
+    IMAGE_PACTH_SIZE,
     AUDIO_TOKEN_INDEX,
+    VIDEO_TOKEN_INDEX,
     DEFAULT_AUDIO_TOKEN,
+    MIN_PIXELS_SEQ,
+    MAX_PIXELS_SEQ,
+    SYSTEM_PROMPTS,
+    DEFAULT_IMAGE_TOKEN,
     DEFAULT_AUDIO_START_TOKEN,
     DEFAULT_AUDIO_END_TOKEN,
+    DEFAULT_VISION_START_TOKEN,
+    DEFAULT_VISION_END_TOKEN,
     _CHAT_TEMPLATES,
     REMOTE_SERVER_PORT
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
-from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, LongVideoProcessor
+from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, LongVideoProcessor, ProactiveVideoProcessor
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils import helper
 
@@ -280,6 +289,23 @@ class OmniDataloader(BaseDataLoader):
         self.long_video_processor.image_processor = self.processor.image_processor
         self.long_video_processor.image_config = getattr(self.processor, "image_config", None)
         self.long_video_processor._threadpool = self.processor._threadpool
+        
+        # Initialize the proactive training processor
+        if getattr(self.training_args, "proactive", False):
+            self.proactive_processor = ProactiveVideoProcessor(
+                tokenizer=self.tokenizer,
+                model_args=self.model_args,
+                data_args=self.data_args,
+                training_args=self.training_args,
+                ceph_client=self.ceph_client,
+                bos_client=self.bos_client,
+                rank=self.rank,
+                build_inputs_token_fn=self.build_inputs_token,
+                preprocess_workers=getattr(self.data_args, "preprocess_workers", 2),
+            )
+            self.proactive_processor.image_processor = self.processor.image_processor
+            self.proactive_processor.image_config = getattr(self.processor, "image_config", None)
+            self.proactive_processor._threadpool = self.processor._threadpool
     
     def state_dict(self) -> Dict:
  
@@ -336,19 +362,33 @@ class OmniDataloader(BaseDataLoader):
         if templates is None:
             raise NotImplementedError(f"Unsupported model_arc: {arc!r}")
 
-        template = templates.get(input_type)
-        if template is None:
-            raise ValueError(
-                f"Unknown input_type {input_type!r}. "
-                f"Valid options: {list(templates.keys())}"
-            )
-
-        if input_type == "assistant_prefix":
-            text = template
+        # 1. 特殊分支：处理图文混合系统 Prompt 的动态拼接与占位符映射
+        if input_type == 'system_with_image':
+            try:
+                start_half = '<|im_start|>system\n{}{}'.format(input_str.split(DEFAULT_VISION_START_TOKEN)[0], DEFAULT_VISION_START_TOKEN)
+                end_half = '{}{}<|im_end|>'.format(DEFAULT_VISION_END_TOKEN, input_str.split(DEFAULT_VISION_END_TOKEN)[1])
+                image_count = input_str.count(DEFAULT_IMAGE_TOKEN)
+                tokens = self.tokenizer(start_half)["input_ids"] + [VIDEO_TOKEN_INDEX] + self.tokenizer(end_half)["input_ids"]
+            except Exception as e:
+                # 异常容错：当输入格式不匹配时退化为标准文本 token 化
+                tokens = self.tokenizer(input_str)["input_ids"]
+        
+        # 2. 标准分支：基于 _CHAT_TEMPLATES 模板进行安全解析
         else:
-            text = template.format(input_str)
+            template = templates.get(input_type)
+            if template is None:
+                raise ValueError(
+                    f"Unknown input_type {input_type!r}. "
+                    f"Valid options: {list(templates.keys())}"
+                )
 
-        tokens = self.tokenizer(text)["input_ids"]
+            # 如果模板为静态前缀（不包含可格式化的花括号），则无需进行 .format()
+            if "{}" not in template:
+                text = template
+            else:
+                text = template.format(input_str)
+
+            tokens = self.tokenizer(text)["input_ids"]
         return torch.tensor(tokens, dtype=torch.long) if return_tensor else tokens
 
     def launch(self) -> None:
@@ -416,7 +456,7 @@ class OmniDataloader(BaseDataLoader):
             return f.readline()
 
         while os.getppid() == ppid and not self.workers_done_event.is_set():
-            if self.result_queue.qsize() > 4:
+            if self.result_queue.qsize() > 8:
                 time.sleep(1)
                 gc.collect()
                 continue
@@ -449,8 +489,27 @@ class OmniDataloader(BaseDataLoader):
                     continue
                 file_path = None
                 try:
-                    file_id, offset = self.data_list[data_index]
-                    file_path = self.file_mapping[int(file_id)]
+                    data_item = self.data_list[data_index]
+                    is_multi_file = hasattr(data_item, "__len__") and not isinstance(data_item, (str, bytes))
+                    
+                    if is_multi_file and len(data_item) >= 2:
+                        file_id, offset = data_item[0], data_item[1]
+                        
+                        # 从 file_mapping 中检索路径
+                        if isinstance(self.file_mapping, dict):
+                            file_path = self.file_mapping.get(str(file_id)) or self.file_mapping.get(int(file_id))
+                        elif isinstance(self.file_mapping, list):
+                            file_path = self.file_mapping[int(file_id)]
+                        else:
+                            raise ValueError("file_mapping format is unrecognized or not loaded.")
+                    # file_path = self.file_mapping[int(file_id)]
+                    else:
+                        # 以前的单文件格式，data_item 是 int 类型的 offset
+                        offset = data_item
+                        file_path = self.file_mapping
+                    if file_path is None:
+                        raise ValueError(f"Could not resolve file path for index {data_index} with data_item: {data_item}")
+                    
                     line = get_file_line(file_path, int(offset))
                     sample_data = json.loads(line)
                     sample_index += 1
@@ -659,8 +718,25 @@ class OmniDataloader(BaseDataLoader):
     # Finetune worker: dispatch + batch packing
     # ------------------------------------------------------------------    
     def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False) -> None:        
-        # 根据标记选择处理器
-        processor = self.long_video_processor if is_long_video else self.processor
+        # Route processing through the proactive processor if enabled
+        # if getattr(self.training_args, "proactive", False):
+        #     processor = self.proactive_processor
+        if getattr(self.training_args, "proactive", False):
+            is_audio_deploy = "audio_deploy" in sample_data or sample_data.get("category") == "audio_deploy"
+            
+            # 判断是否为“普通微调数据”分支：
+            # 1. 纯文本/图片/音频ASR等无视频的数据（且非audio_deploy）
+            # 2. 含有视频，但明确指定为普通微调模式（带有 'finetune' 字段）
+            is_normal_finetune = ("video" not in sample_data and not is_audio_deploy) or ("video" in sample_data and "finetune" in sample_data)
+            
+            if is_normal_finetune:
+                # 走向正常微调数据（单图、单视频切片、ASR音频）处理流程
+                processor = self.processor
+            else:
+                # 走向主动式数据（主动式音频部署、主动式长视频字幕）处理流程
+                processor = self.proactive_processor
+        else:
+            processor = self.long_video_processor if is_long_video else self.processor
         
         samples = processor.process(sample_data, sample_idx)
         if samples is None:
@@ -1190,6 +1266,16 @@ def get_train_dataloader(data_args, training_args, model_args, tokenizer):
         )
     return train_dataloader
 
+def setup_debugpy():
+    import os
+    import debugpy
+
+    rank = int(os.environ.get("RANK", "0"))
+
+    if rank == 0:
+        debugpy.listen(("0.0.0.0", 5679))
+        print("[Rank 0] Waiting for debugger...", flush=True)
+        debugpy.wait_for_client()
 
 
 
@@ -1203,8 +1289,9 @@ if __name__ == "__main__":
     data_args.max_seq_len = 4096
     training_args.model_max_length = 4096
     training_args.num_train_epochs = 1
-    model_args.model_path = "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16"
-    model_args.vision_tower = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
+    model_args.model_path = "/mnt/afs/share/llava_qwen2_32B-qwen25encoder-st4-veomni-down16"
+    model_args.vision_tower = "/mnt/afs/share/qwen25_vl_encoder"
+    model_args.eval_first = False
     data_args.eval_path = "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/videommmu_mme_lvbench.json"
     
     training_args.dataloader_num_workers = 0
@@ -1223,7 +1310,8 @@ if __name__ == "__main__":
     # training_args.remote_dataloader = True
     # data_args.offset_file_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/offsets.npy"
     # data_args.file_maping_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0511_stage1_puretext/file_mapping.json"
-    data_args.train_path = "/mnt/afs/jiayi/code/LLaVA_hub/scripts/test_json/test_sub.jsonl"
+    data_args.train_path = "/mnt/afs/jiayi/data/mm_data/game_new/train_data/20260819_beebee_text_proactive_debug.json"
+    training_args.proactive = True
     # data_args.file_maping_path = "/mnt/afs/jiayi/code/LLaVA_hub/scripts/test_json/test_sub.jsonl"
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         "/mnt/afs/share/llava_qwen30B_A3B-qwen35encoder_veomni-down16",
@@ -1231,63 +1319,86 @@ if __name__ == "__main__":
         use_fast=True,
     )
     
-    
-
-    dataloader = get_eval_dataloader(
+    dataloader = get_train_dataloader(
         tokenizer=tokenizer,
         data_args=data_args,
         training_args=training_args,
         model_args=model_args,
-     
     )
-    eval_data = Qwen25VLEvaluationDataset(tokenizer, 
-                                                data_args,
-                                                training_args,
-                                                model_args)
-    eval_data.init_image_processor()
-    with open(data_args.eval_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
 
-    new_data = []
+    dataloader.launch()
+    
+    for data in dataloader:
+        token = data["input_ids"]
+        token[token == -200] = 15
+        token[token == -300] = 15
+        print("#"*20)
+        print(tokenizer.decode(token.cpu().view(-1).tolist()))
+        print("#"*20)
+        
+        label = data["labels"]
+        label[label == -100] = 15
+        print("#"*20)
+        print(tokenizer.decode(label.cpu().view(-1).tolist()))
+        print("#"*20)
+    
+    # dataloader = get_eval_dataloader(
+    #     tokenizer=tokenizer,
+    #     data_args=data_args,
+    #     training_args=training_args,
+    #     model_args=model_args,
+     
+    # )
+    # eval_data = Qwen25VLEvaluationDataset(tokenizer, 
+    #                                             data_args,
+    #                                             training_args,
+    #                                             model_args)
+    # eval_data.init_image_processor()
+    # with open(data_args.eval_path, "r", encoding="utf-8") as f:
+    #     data = json.load(f)
 
-    for line in data:
-        if line["category"] == "videommmu":
-            new_data.append(line)
+    # new_data = []
 
-    data = new_data
-    def check_single_item(line):
-        try:
-            eval_data._load_visual_features(line, max_tokens=4096)
-            return True, line, None
-        except Exception as e:
+    # for line in data:
+    #     if line["category"] == "videommmu":
+    #         new_data.append(line)
+
+    # data = new_data
+    # def check_single_item(line):
+    #     try:
+    #         eval_data._load_visual_features(line, max_tokens=4096)
+    #         return True, line, None
+    #     except Exception as e:
            
-            video_identifier = line.get("video") or line.get("id") or str(line)
-            return False, video_identifier, str(e)
+    #         video_identifier = line.get("video") or line.get("id") or str(line)
+    #         return False, video_identifier, str(e)
 
-    failed_items = []
-    num_workers = 16  
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    print(f"开始多线程校验，共 {len(data)} 条数据...")
+    # failed_items = []
+    # num_workers = 16  
+    # from concurrent.futures import ThreadPoolExecutor, as_completed
+    # print(f"开始多线程校验，共 {len(data)} 条数据...")
 
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    # with ThreadPoolExecutor(max_workers=num_workers) as executor:
        
-        futures = [executor.submit(check_single_item, line) for line in data]
+    #     futures = [executor.submit(check_single_item, line) for line in data]
         
-        for future in tqdm(as_completed(futures), total=len(data), desc="Validating Videos"):
-            success, video_id, err_msg = future.result()
-            if not success:
-                failed_items.append({"video": video_id, "error": err_msg})
+    #     for future in tqdm(as_completed(futures), total=len(data), desc="Validating Videos"):
+    #         success, video_id, err_msg = future.result()
+    #         if not success:
+    #             failed_items.append({"video": video_id, "error": err_msg})
 
 
-    print(f"\n校验完成！共计 {len(failed_items)} / {len(data)} 个视频无法正常加载。")
+    # print(f"\n校验完成！共计 {len(failed_items)} / {len(data)} 个视频无法正常加载。")
 
-    if failed_items:
-        print("\n[失败列表示例]:")
-        for item in failed_items[:10]:  # 仅展示前10个
-            print(f"路径/标识: {item['video']} | 错误原因: {item['error']}")
+    # if failed_items:
+    #     print("\n[失败列表示例]:")
+    #     for item in failed_items[:10]:  # 仅展示前10个
+    #         print(f"路径/标识: {item['video']} | 错误原因: {item['error']}")
         
-        # 将失败的视频列表保存到本地 json
-        output_fail_log = "failed_videos_log.json"
-        with open(output_fail_log, "w", encoding="utf-8") as f:
-            json.dump(failed_items, f, ensure_ascii=False, indent=2)
-        print(f"\n所有失败视频的完整日志已保存至: {output_fail_log}")
+    #     # 将失败的视频列表保存到本地 json
+    #     output_fail_log = "failed_videos_log.json"
+    #     with open(output_fail_log, "w", encoding="utf-8") as f:
+    #         json.dump(failed_items, f, ensure_ascii=False, indent=2)
+    #     print(f"\n所有失败视频的完整日志已保存至: {output_fail_log}")
+    
+    

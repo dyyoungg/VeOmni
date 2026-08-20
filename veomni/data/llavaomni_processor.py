@@ -1,5 +1,6 @@
 
 import io
+import copy
 import math
 import os
 import random
@@ -1298,12 +1299,15 @@ class OmniSampleProcessor:
                     if has_image:
                         value = re.sub(img_pat, "", value)
                     cur_text = asst_fmt.format(content=value)
-                    cur_tokens = self.tokenizer(cur_text)["input_ids"]
-                    text_tokens += cur_tokens
 
                     if c.get("infer"):
+                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                        text_tokens += cur_tokens
                         label_tokens += [IGNORE_INDEX] * len(cur_tokens)
+                        
                     elif c.get("first_token"):
+                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                        text_tokens += cur_tokens
                         new_labels = [IGNORE_INDEX] * len(cur_tokens)
                         new_labels[:2] = cur_tokens[:2]
                         label_tokens += new_labels
@@ -1314,15 +1318,18 @@ class OmniSampleProcessor:
                             if not part:
                                 continue
                             part_tokens = self.tokenizer(part)["input_ids"]
+                            text_tokens += part_tokens  # 同步追加 text token
                             if part.startswith(("(", "（")) and part.endswith((")", "）")):
                                 label_tokens += [IGNORE_INDEX] * len(part_tokens)
                             else:
                                 label_tokens += part_tokens
                     else:
+                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                        text_tokens += cur_tokens
                         label_tokens += cur_tokens
 
         assert len(label_tokens) == len(text_tokens), (
-            f"label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"
+            f"{sample_data} label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"
         )
         return text_tokens, label_tokens, audio_count
     
@@ -1705,12 +1712,14 @@ class LongVideoProcessor(OmniSampleProcessor):
                 else:
                     input_resolution = self.resize_to_max_side(init_resolution, self.model_args.mm_image_size[0])
             
+            
+            selected_downsample_ratio = self._get_dynamic_downsample_ratio(sample_data)
             # 预估 Token (为了切分 Chunk 判断)
             each_low_res_token, resized_resolution = self.calculate_video_each_frame_token(
-                height=input_resolution[1], width=input_resolution[0], merge_size=self.video_merge_size
+                height=input_resolution[1], width=input_resolution[0], selected_downsample_ratio=selected_downsample_ratio, merge_size=self.video_merge_size
             )
             each_high_res_token, _ = self.calculate_video_each_frame_token(
-                height=init_resolution[1], width=init_resolution[0], merge_size=self.video_merge_size
+                height=init_resolution[1], width=init_resolution[0], selected_downsample_ratio=selected_downsample_ratio, merge_size=self.video_merge_size
             )
             
             if self.data_args.high_resolution_interval > 0.0:
@@ -1850,7 +1859,7 @@ class LongVideoProcessor(OmniSampleProcessor):
                 if token_num + cur_token_num > max_len or sub_idx == len(subtitle_list) - 1:
                     
                     # 尝试构建 Chunk
-                    chunk = self._build_chunk(tokens, labels, types, video_segments, vr, video_file, reader_state)
+                    chunk = self._build_chunk(tokens, labels, types, video_segments, vr, video_file, reader_state, selected_downsample_ratio)
 
                     
                     # 如果遇到无法处理的视频文件，构建失败，丢弃整个视频直接返回
@@ -1909,7 +1918,7 @@ class LongVideoProcessor(OmniSampleProcessor):
             import gc
             gc.collect()
 
-    def _build_chunk(self, tokens: List[torch.Tensor], labels: List[torch.Tensor], types: List[str], video_segments: List[Any], vr, video_file: str, reader_state: Dict) -> Optional[OmniSample]:
+    def _build_chunk(self, tokens: List[torch.Tensor], labels: List[torch.Tensor], types: List[str], video_segments: List[Any], vr, video_file: str, reader_state: Dict, selected_downsample_ratio) -> Optional[OmniSample]:
         """将积累的视频帧和 Tokens 打包成 Qwen2.5-VL 需要的格式"""
         from PIL import Image
         video_clips = []
@@ -2004,6 +2013,10 @@ class LongVideoProcessor(OmniSampleProcessor):
             video_thw=video_grid_thw, 
             audio_feature_len=[]
         )
+        
+        video_downsample_ratios = None
+        if video_grid_thw is not None:
+            video_downsample_ratios = torch.full((video_grid_thw.shape[0],), selected_downsample_ratio, dtype=torch.float32)
 
         return OmniSample(
             input_ids=cur_input_ids,
@@ -2011,7 +2024,739 @@ class LongVideoProcessor(OmniSampleProcessor):
             caption_len=len(cur_input_ids),
             pixel_values_video=pixel_values_videos,
             video_grid_thw=video_grid_thw,
+            video_downsample_ratios=video_downsample_ratios,
             attention_mask_len=[len(cur_input_ids)],
             token_counts=token_counts,
         )
 
+
+
+class ProactiveVideoProcessor(LongVideoProcessor):
+    def __init__(
+        self,
+        tokenizer,
+        model_args,
+        data_args,
+        training_args,
+        *,
+        ceph_client,
+        bos_client,
+        rank: int,
+        build_inputs_token_fn,
+        preprocess_workers: int = 4,
+    ):
+        super().__init__(
+            tokenizer,
+            model_args,
+            data_args,
+            training_args,
+            ceph_client=ceph_client,
+            bos_client=bos_client,
+            rank=rank,
+            build_inputs_token_fn=build_inputs_token_fn,
+            preprocess_workers=preprocess_workers,
+        )
+
+    def find_subtensor_indices(self, text_token: List[int], sub_token: List[int]) -> List[Tuple[int, int]]:
+        """
+        Locates the start and end indices of sub_token inside text_token.
+        Used for targeted loss masking.
+        """
+        n, m = len(text_token), len(sub_token)
+        results = []
+        for i in range(n - m + 1):
+            if text_token[i : i + m] == sub_token:
+                results.append((i, i + m))
+        return results
+
+    def process(self, sample_data: Dict, sample_idx: int) -> Iterator[OmniSample]:
+        """
+        Dispatches incoming data to either the audio deployment loop
+        or the standard proactive video pipeline.
+        """
+        if "audio_deploy" in sample_data or sample_data.get("category") == "audio_deploy":
+            yield from self.process_audio_deploy(sample_data, sample_idx)
+        else:
+            yield from self.process_proactive_video(sample_data, sample_idx)
+
+    def process_proactive_video(self, sample_data: Dict, sample_idx: int) -> Iterator[OmniSample]:
+        """
+        Processes standard proactive videos with dynamic FPS compression,
+        resolution interleaving, active thinking structures, and sliding context memory.
+        """
+        video_file = self.get_video_path(sample_data)
+        if not video_file:
+            return
+
+        convs = sample_data.get('conversations', [])
+        if not convs:
+            return
+
+        system_prompt = sample_data.get("system", "You are a helpful assistant.")
+        if '<|im_start|>system' in system_prompt:
+            system_tokens = torch.tensor(self.tokenizer(system_prompt)['input_ids'], dtype=torch.long)
+        else:
+            system_tokens = self._build_inputs_token(system_prompt, input_type='system')
+
+        reader_state = {
+            "backend": "decord",
+            "video_iter": None,
+            "current_idx": -1,
+            "last_frame_array": None
+        }
+        vr = None
+        try:
+            vr = VideoReader(video_file, ctx=cpu(0))
+            fps = vr.get_avg_fps()
+            total_frames = len(vr)
+            init_resolution = (vr[0].shape[1], vr[0].shape[0])
+        except Exception:
+            reader_state["backend"] = "imageio"
+            vr = None
+            try:
+                with av.open(video_file) as container:
+                    stream = container.streams.video[0]
+                    fps = float(stream.average_rate) if stream.average_rate else 24.0
+                    video_iter = iio.imiter(video_file, plugin="pyav", thread_count=1)
+                    first_frame = next(video_iter)
+                    init_resolution = (first_frame.shape[1], first_frame.shape[0])
+                    if hasattr(video_iter, 'close'):
+                        video_iter.close()
+                    if stream.frames and stream.frames > 0:
+                        total_frames = stream.frames
+                    else:
+                        duration = container.duration / 1_000_000.0 if container.duration else 0.0
+                        total_frames = int(duration * fps)
+            except Exception:
+                self._cleanup_shm(video_file)
+                return
+
+        safe_max_frame = max(0, total_frames - 5)
+        
+        try:
+            if self.data_args.sub_native_resolution:
+                input_resolution = init_resolution
+            else:
+                if init_resolution == (1280, 720):
+                    input_resolution = (self.model_args.mm_image_size[0], self.model_args.mm_image_size[1])
+                else:
+                    input_resolution = self.resize_to_max_side(init_resolution, self.model_args.mm_image_size[0])
+
+            selected_downsample_ratio = self._get_dynamic_downsample_ratio(sample_data)
+            each_low_res_token, resized_resolution = self.calculate_video_each_frame_token(
+                height=input_resolution[1], width=input_resolution[0], selected_downsample_ratio=selected_downsample_ratio, merge_size=self.video_merge_size
+            )
+            each_high_res_token, _ = self.calculate_video_each_frame_token(
+                height=init_resolution[1], width=init_resolution[0], selected_downsample_ratio=selected_downsample_ratio, merge_size=self.video_merge_size
+            )
+
+            max_len = self.tokenizer.model_max_length
+            video_token_tensor = torch.tensor([VIDEO_TOKEN_INDEX], dtype=torch.long)
+            ignore_tensor = torch.tensor([IGNORE_INDEX], dtype=torch.long)
+            start_img_tensor = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_START_TOKEN)], dtype=torch.long)
+            end_img_tensor = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_END_TOKEN)], dtype=torch.long)
+
+            tokens = [system_tokens]
+            labels = [torch.full((system_tokens.shape[0],), IGNORE_INDEX, dtype=torch.long)]
+            types = ["system"]
+            video_segments = [None]
+
+            token_num = len(system_tokens)
+            text_token_num = len(system_tokens)
+            global_valid_image_count = 0
+            valid_text_count = 0
+            minimum_image_token_num = getattr(self.data_args, 'minimum_image_token_num', 60)
+            cur_time = 0
+
+            convs = sample_data.get('conversations', [])
+            last_label_token = None
+            last_text_token = None
+            for sub_idx, sub in enumerate(convs):
+                if 'start' in sub:
+                    start_time = sub['start']
+                    ignore_data = sub.get('infer', False)
+                    if start_time is None:
+                        start_time = -1
+                        ignore_data = True
+                else:
+                    ignore_data = True
+                    start_time = cur_time
+
+                cur_tokens = []
+                cur_labels = []
+                cur_types = []
+                cur_segments = []
+                cur_token_num = 0
+
+                frame_indices = []
+                while cur_time < start_time:
+                    frame_indices.append(min(int(cur_time * fps), safe_max_frame))
+                    cur_time += 1.0 / self.data_args.sample_fps
+
+                if frame_indices and getattr(self.data_args, 'compress_fps', True):
+                    last_kept_time = -float('inf')
+                    compressed_frames = []
+                    for f in frame_indices:
+                        current_t = f / fps
+                        time_until_start = start_time - current_t
+                        req_interval = self._get_required_interval(time_until_start, sub.get('fps4', False))
+                        if (current_t >= last_kept_time + req_interval - 1e-9) or (sub.get('fps4', False) and current_t >= last_kept_time + req_interval - 0.03):
+                            compressed_frames.append(f)
+                            last_kept_time = current_t
+                    frame_indices = compressed_frames
+
+                if valid_text_count == 0 or (len(frame_indices) * each_low_res_token) > max_len - self.data_args.max_subtitle_token_num:
+                    frame_indices = frame_indices[-minimum_image_token_num:]
+
+                if frame_indices:
+                    groups = []
+                    current_group_res = None
+                    current_group_frames = []
+                    for idx in frame_indices:
+                        if not getattr(self.data_args, 'no_image', False):
+                            global_valid_image_count += 1
+                            if self.data_args.high_resolution_interval > 0.0:
+                                interval = int(self.data_args.high_resolution_interval * self.data_args.sample_fps)
+                                pattern = [0] * (interval - 2) + [1, 1]
+                                res_mode = pattern[(global_valid_image_count - 1) % len(pattern)]
+                                res = init_resolution if res_mode == 1 else resized_resolution
+                            else:
+                                res = resized_resolution
+
+                            if current_group_res is None:
+                                current_group_res = res
+                            if res != current_group_res:
+                                groups.append((current_group_res, current_group_frames))
+                                current_group_res = res
+                                current_group_frames = [idx]
+                            else:
+                                current_group_frames.append(idx)
+                    if current_group_frames:
+                        groups.append((current_group_res, current_group_frames))
+
+                    valid_groups = []
+                    for res, f_indices in groups:
+                        if len(f_indices) % 2 != 0:
+                            f_indices.append(f_indices[-1])
+                        if f_indices:
+                            valid_groups.append((res, f_indices))
+
+                    if valid_groups:
+                        if getattr(self.model_args, 'split_img_token', True) and not getattr(self.data_args, 'no_image', False):
+                            cur_tokens.append(start_img_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("vision_start")
+                            cur_segments.append(None)
+                            cur_token_num += 1
+
+                        for res, f_indices in valid_groups:
+                            seg_tokens = len(f_indices) * (each_high_res_token if res == init_resolution else each_low_res_token)
+                            cur_tokens.append(video_token_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("video")
+                            cur_segments.append((res, f_indices))
+                            cur_token_num += seg_tokens
+
+                        if getattr(self.model_args, 'split_img_token', True) and not getattr(self.data_args, 'no_image', False):
+                            cur_tokens.append(end_img_tensor)
+                            cur_labels.append(ignore_tensor)
+                            cur_types.append("vision_end")
+                            cur_segments.append(None)
+                            cur_token_num += 1
+
+                if sub['from'].lower() in ['human', 'user']:
+                    last_text_token = self._build_inputs_token(sub['value'], input_type='user')
+                    last_label_token = torch.full((last_text_token.shape[0],), IGNORE_INDEX, dtype=torch.long)
+                    continue
+                elif sub['from'] == 'SYSTEM' or sub['from'] == 'system':
+                    last_text_token = self._build_inputs_token(sub['value'], input_type='system_in_middle_no_assistant')
+                    last_label_token = torch.full((last_text_token.shape[0],), IGNORE_INDEX, dtype=torch.long)
+                    continue
+                elif sub['from'] == 'ACTIVE':
+                    text_token = self._build_inputs_token(sub['caption'], input_type='thinking')
+                    prefix_token = self._build_inputs_token(input_type='thinking_prefix')
+                    label_token = text_token.clone()
+                    label_token[:len(prefix_token)] = IGNORE_INDEX
+
+                    if sub.get('active_line'):
+                        assistant_text_token = self._build_inputs_token(random.choice(sub['active_line']), input_type='assistant')
+                        prefix_asst_token = self._build_inputs_token(input_type='assistant_prefix')
+                        assistant_label_token = assistant_text_token.clone()
+                        assistant_label_token[:len(prefix_asst_token)] = IGNORE_INDEX
+                        text_token = torch.cat([text_token, assistant_text_token], dim=-1)
+                        label_token = torch.cat([label_token, assistant_label_token], dim=-1)
+                elif sub['from'] == 'CAPTION':
+                    text_token = self._build_inputs_token(sub['caption'], input_type='thinking')
+                    prefix_token = self._build_inputs_token(input_type='thinking_prefix')
+                    label_token = text_token.clone()
+                    label_token[:len(prefix_token)] = IGNORE_INDEX
+                    label_token[-1] = IGNORE_INDEX
+                elif sub['from'] == 'VIDEO':
+                    text_token = self._build_inputs_token(sub['value'], input_type='video')
+                    prefix_token = self._build_inputs_token(input_type='video_prefix')
+                    label_token = text_token.clone()
+                    label_token[:len(prefix_token)] = IGNORE_INDEX
+                    label_token[-1] = IGNORE_INDEX
+                else:
+                    if sub.get('active', False):
+                        text_token = self._build_inputs_token(sub['value'], input_type='assistant_active')
+                        prefix_token = self._build_inputs_token(input_type='assistant_active_prefix')
+                    else:
+                        text_token = self._build_inputs_token(sub['value'], input_type='assistant')
+                        prefix_token = self._build_inputs_token(input_type='assistant_prefix')
+                    label_token = text_token.clone()
+                    label_token[:len(prefix_token)] = IGNORE_INDEX
+
+                if ignore_data:
+                    label_token = torch.full((label_token.shape[0],), IGNORE_INDEX, dtype=torch.long)
+
+                if last_text_token is not None:
+                    cur_tokens.append(last_text_token)
+                    cur_labels.append(last_label_token)
+                    cur_types.append("text")
+                    cur_segments.append(None)
+                    cur_token_num += len(last_text_token)
+                    last_text_token = None
+                    last_label_token = None
+                    
+                cur_tokens.append(text_token)
+                cur_labels.append(label_token)
+                cur_types.append("text")
+                cur_segments.append(None)
+                cur_token_num += len(text_token)
+
+                if token_num + cur_token_num > max_len or sub_idx == len(convs) - 1:
+                    chunk = self._build_chunk(tokens, labels, types, video_segments, vr, video_file, reader_state, selected_downsample_ratio)
+                    if chunk is not None:
+                        yield chunk
+                    
+                    # Rolling history memory pruning
+                    remove_indices = []
+                    for i in range(1, len(tokens)):
+                        if types[i] in ["vision_start", "video", "vision_end"]:
+                            remove_indices.append(i)
+                        elif types[i] == "text":
+                            labels[i] = labels[i] * 0 + IGNORE_INDEX
+                            if text_token_num > getattr(self.data_args, 'max_subtitle_token_num', 2048):
+                                remove_indices.append(i)
+                                text_token_num -= len(tokens[i])
+
+                    for i in reversed(remove_indices):
+                        tokens.pop(i)
+                        labels.pop(i)
+                        types.pop(i)
+                        video_segments.pop(i)
+                    token_num = text_token_num
+
+                tokens.extend(cur_tokens)
+                labels.extend(cur_labels)
+                types.extend(cur_types)
+                video_segments.extend(cur_segments)
+                token_num += cur_token_num
+                text_token_num += len(text_token)
+                valid_text_count += len(text_token)
+
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Error in proactive video process: {e}, sample_data: {sample_data}")
+        finally:
+            if vr is not None:
+                del vr
+            if reader_state["video_iter"] is not None:
+                try:
+                    reader_state["video_iter"].close()
+                except Exception:
+                    pass
+            self._cleanup_shm(video_file)
+
+    def process_audio_deploy(self, sample_data: Dict, sample_idx: int) -> Iterator[OmniSample]:
+        """
+        Processes audio deployment sequences supporting custom multi-turn image/audio traces,
+        target-suffix loss calculation, system prompt overriding, and strict rolling windows.
+        """
+        convs = sample_data.get('conversations', [])
+        system = sample_data.get('system', 'You are a helpful assistant.')
+        if '<|im_start|>system' in system:
+            system_tokens = torch.tensor(self.tokenizer(system)['input_ids'], dtype=torch.long)
+        else:
+            system_tokens = self._build_inputs_token(system, input_type='system')
+
+        system_image_list = []
+        system_image_token_num = 0
+        system_text_token_num = 0
+        sub_idx = 0
+
+        selected_downsample_ratio = self._get_dynamic_downsample_ratio(sample_data)
+
+        # Handle system replacement checks
+        if len(convs) > 0 and convs[0].get('from') == 'replace_system' and convs[0].get('system_image_list'):
+            sys_item = convs[0]
+            sub_idx = 1
+            system_tokens = self._build_inputs_token(sys_item['value'], input_type='system_with_image')
+            for image_path in sys_item['system_image_list']:
+                raw = self._read_image_bytes(image_path)
+                if raw is not None:
+                    buf = io.BytesIO(np.frombuffer(raw, np.uint8))
+                    with Image.open(buf) as img:
+                        image = img.convert("RGB")
+                    each_token, _ = self.calculate_video_each_frame_token(image.height, image.width, selected_downsample_ratio)
+                    system_image_token_num += each_token
+                    system_image_list.append(image)
+
+            system_text_token_num = len(system_tokens) - len(system_image_list)
+            text_token_num = system_text_token_num
+            token_num = system_text_token_num + system_image_token_num
+        else:
+            text_token_num = len(system_tokens)
+            token_num = len(system_tokens)
+
+        tokens = [system_tokens]
+        labels = [torch.full((system_tokens.shape[0],), IGNORE_INDEX, dtype=torch.long)]
+        image_list = [None]
+        audio_list = []
+
+        image_token = torch.tensor([VIDEO_TOKEN_INDEX], dtype=torch.long)
+        ignore_index = torch.tensor([IGNORE_INDEX], dtype=torch.long)
+        start_img_token = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_START_TOKEN)], dtype=torch.long)
+        end_img_token = torch.tensor([self.tokenizer.convert_tokens_to_ids(DEFAULT_VISION_END_TOKEN)], dtype=torch.long)
+        valid_text_count = 0
+
+        last_label_token = []
+        last_text_token = []
+        last_audio_list = []
+        one_token_num = []
+
+        while sub_idx < len(convs):
+            sub = convs[sub_idx]
+            cur_tokens, cur_labels, cur_image_list, cur_audio_list = [], [], [], []
+            cur_token_num, cur_text_audio_num = 0, 0
+
+            # Turn-specific images
+            turn_images = sub.get('image', [])
+            if turn_images:
+                image_tokens_for_turn, image_labels_for_turn, image_path_for_turn = [], [], []
+                image_token_count = 0
+                for image_path in turn_images:
+                    raw = self._read_image_bytes(image_path)
+                    if raw is not None:
+                        buf = io.BytesIO(np.frombuffer(raw, np.uint8))
+                        with Image.open(buf) as img:
+                            image = img.convert("RGB")
+                        each_token, _ = self.calculate_video_each_frame_token(image.height, image.width, selected_downsample_ratio)
+                        if each_token > 0:
+                            image_tokens_for_turn.append(image_token)
+                            image_labels_for_turn.append(ignore_index)
+                            image_path_for_turn.append(image)
+                            image_token_count += each_token
+
+                if image_path_for_turn:
+                    if getattr(self.model_args, 'split_img_token', True):
+                        cur_tokens.extend([start_img_token] + image_tokens_for_turn + [end_img_token])
+                        cur_labels.extend([ignore_index] + image_labels_for_turn + [ignore_index])
+                        cur_image_list.extend([None] + image_path_for_turn + [None])
+                        cur_token_num += image_token_count + 2
+                    else:
+                        cur_tokens.extend(image_tokens_for_turn)
+                        cur_labels.extend(image_labels_for_turn)
+                        cur_image_list.extend(image_path_for_turn)
+                        cur_token_num += image_token_count
+
+            # Turn type handling
+            if sub['from'].lower() in ['human', 'user']:
+                user_text = sub['value']
+                if 'audio' in sub:
+                    cur_last_text_token = []
+                    cur_audio_data_list = self.get_audio_data_list(sub)
+                    formatted_text = f"\n<|im_start|>user\n{user_text.replace('<audio>', DEFAULT_AUDIO_TOKEN)}<|im_end|>"
+                    audio_chunks = formatted_text.split(DEFAULT_AUDIO_TOKEN)
+                    for i, chunk in enumerate(audio_chunks):
+                        tokens_audio = self.tokenizer(chunk)["input_ids"]
+                        cur_last_text_token.extend(tokens_audio)
+                        if i < len(audio_chunks) - 1:
+                            if getattr(self.model_args, "use_audio_start_end_token", False):
+                                s_aud = self.tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_START_TOKEN)
+                                e_aud = self.tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_END_TOKEN)
+                                cur_last_text_token.extend([s_aud, AUDIO_TOKEN_INDEX, e_aud])
+                            else:
+                                cur_last_text_token.append(AUDIO_TOKEN_INDEX)
+
+                    cur_last_text_token = torch.tensor(cur_last_text_token, dtype=torch.long)
+                    last_label_token.append(torch.full((cur_last_text_token.shape[0],), IGNORE_INDEX, dtype=torch.long))
+                    last_text_token.append(cur_last_text_token)
+                    cur_audio_token_num = self.calculate_audio_tokens(cur_audio_data_list)
+                    last_audio_list.extend(cur_audio_data_list)
+                    one_token_num.append(('text', len(cur_last_text_token) - 1, "audio", cur_audio_token_num))
+                else:
+                    cur_last_text_token = self._build_inputs_token(user_text, input_type='user')
+                    last_text_token.append(cur_last_text_token)
+                    last_label_token.append(torch.full((cur_last_text_token.shape[0],), IGNORE_INDEX, dtype=torch.long))
+                    one_token_num.append(('text', len(cur_last_text_token)))
+                sub_idx += 1
+                continue
+
+            elif sub['from'] in ['SYSTEM', 'system']:
+                cur_last_text_token = self._build_inputs_token(sub['value'], input_type='system_in_middle_no_assistant')
+                last_text_token.append(cur_last_text_token)
+                last_label_token.append(torch.full((cur_last_text_token.shape[0],), IGNORE_INDEX, dtype=torch.long))
+                one_token_num.append(('text', len(cur_last_text_token)))
+                sub_idx += 1
+                continue
+            
+            elif sub['from'] == 'replace_system':
+                pass
+            
+            else:  # Assistant
+                text_token = self._build_inputs_token(sub['value'], input_type='assistant')
+                label_token = text_token.clone()
+                prefix_token = self._build_inputs_token(input_type='assistant_prefix')
+                label_token[:len(prefix_token)] = IGNORE_INDEX
+
+                # Specific bracket closure active-learning tag validation (such as "无关）")
+                if sub.get("active", False):
+                    active_match_tags = ["无关）", "无聊）", "重复）", "滞后）", "打扰）", "幻觉）"]
+                    if any(tag in sub['value'][-5:] for tag in active_match_tags):
+                        start_paren = max(sub['value'].rfind('('), sub['value'].rfind('（'))
+                        if start_paren != -1:
+                            not_ignore_str = sub['value'][start_paren:]
+                            not_ignore_tokens = self.tokenizer(not_ignore_str)["input_ids"]
+                            not_ignore_idx = self.find_subtensor_indices(text_token.tolist(), not_ignore_tokens)
+                            if not_ignore_idx:
+                                label_token[:not_ignore_idx[0][0]] = IGNORE_INDEX
+                            else:
+                                not_ignore_idx = self.find_subtensor_indices(text_token.tolist(), not_ignore_tokens[1:])
+                                if not_ignore_idx:
+                                    label_token[:not_ignore_idx[0][0]] = IGNORE_INDEX
+                                else:
+                                    print(f"[WARNING] {sub} active 找不到忽略的对应token")
+                        else:
+                            print(f"[WARNING] {sub} active 找不到需要忽略的文本")
+
+
+            # Context accumulation
+            if sub['from'] != 'replace_system':
+                ignore_data = sub.get('infer', False)
+                if ignore_data:
+                    label_token = torch.full((label_token.shape[0],), IGNORE_INDEX, dtype=torch.long)
+
+                if last_text_token:
+                    cur_tokens += last_text_token
+                    cur_labels += last_label_token
+                    cur_audio_list.extend(last_audio_list)
+                    for item in one_token_num:
+                        turn_len = item[1]
+                        if 'audio' in item:
+                            turn_len += item[3]
+                        cur_image_list.append(item)
+                        cur_token_num += turn_len
+                        cur_text_audio_num += turn_len
+                    last_text_token, last_label_token, last_audio_list, one_token_num = [], [], [], []
+
+                cur_tokens.append(text_token)
+                cur_labels.append(label_token)
+                cur_image_list.append(('text', len(text_token)))
+                cur_token_num += len(text_token)
+                cur_text_audio_num += len(text_token)
+
+            # Build sequence and extract visual assets
+            if (token_num + cur_token_num > self.tokenizer.model_max_length) or sub_idx == len(convs) - 1 or sub['from'] == 'replace_system':
+                if sub_idx == len(convs) - 1:
+                    tokens.extend(cur_tokens)
+                    labels.extend(cur_labels)
+                    image_list.extend(cur_image_list)
+                    audio_list.extend(cur_audio_list)
+                    token_num += cur_token_num
+                    text_token_num += cur_text_audio_num
+                    if not ignore_data:
+                        valid_text_count += len(text_token)
+
+                # Process system images
+                if len(system_image_list):
+                    system_inputs = self.process_image_videos(video=system_image_list, merge_size=self.video_merge_size)
+                    images = [system_inputs["pixel_values_videos"]]
+                    images_thw = [system_inputs["video_grid_thw"]]
+                    image_merge_sizes = [self._get_merge_size_from_inputs(system_inputs)]
+                else:
+                    images, images_thw, image_merge_sizes = [], [], []
+
+                cur_image_batch = []
+                segments = []
+                pre_idx = -1
+                prev_resolution = None
+                
+                try:
+                    # Image resolution transition loop
+                    for idx, item in enumerate(image_list):
+                        if isinstance(item, Image.Image):
+                            current_resolution = item.size
+                            if prev_resolution is not None and current_resolution != prev_resolution and cur_image_batch:
+                                batch_inputs = self.process_image_videos(video=cur_image_batch, merge_size=self.video_merge_size)
+                                images.append(batch_inputs["pixel_values_videos"])
+                                images_thw.append(batch_inputs["video_grid_thw"])
+                                image_merge_sizes.append(self._get_merge_size_from_inputs(batch_inputs))
+                                segments.append((pre_idx, idx, batch_inputs["video_grid_thw"][0][0].item()))
+                                cur_image_batch = []
+                                pre_idx = -1
+
+                            prev_resolution = current_resolution
+                            if pre_idx == -1:
+                                pre_idx = idx
+                            processed_img = self.preprocess_image(item, selected_downsample_ratio, image_merge_size=self.image_merge_size)[0]
+                            cur_image_batch.append(processed_img)
+
+                        elif cur_image_batch:
+                            batch_inputs = self.process_image_videos(video=cur_image_batch, merge_size=self.video_merge_size)
+                            images.append(batch_inputs["pixel_values_videos"])
+                            images_thw.append(batch_inputs["video_grid_thw"])
+                            image_merge_sizes.append(self._get_merge_size_from_inputs(batch_inputs))
+                            segments.append((pre_idx, idx, batch_inputs["video_grid_thw"][0][0].item()))
+                            cur_image_batch, pre_idx, prev_resolution = [], -1, None
+
+                    if cur_image_batch:
+                        idx = len(image_list)
+                        batch_inputs = self.process_image_videos(video=cur_image_batch, merge_size=self.video_merge_size)
+                        images.append(batch_inputs["pixel_values_videos"])
+                        images_thw.append(batch_inputs["video_grid_thw"])
+                        image_merge_sizes.append(self._get_merge_size_from_inputs(batch_inputs))
+                        segments.append((pre_idx, idx, batch_inputs["video_grid_thw"][0][0].item()))
+
+                    input_tokens = copy.deepcopy(tokens)
+                    input_labels = copy.deepcopy(labels)
+                    for start, end, actual_num in reversed(segments):
+                        input_tokens[start:end] = [image_token]
+                        input_labels[start:end] = [ignore_index]
+
+                    input_token_ids = torch.cat(input_tokens, dim=0).long()
+                    label_ids = torch.cat(input_labels, dim=0).long()
+
+                    audio_mel, actual_audio_len, raw_audio_len, audio_chunk_counts = self._extract_audio_features(audio_list)
+                    flat_input_ids, flat_labels, token_counts = self._expand_multimodal_tokens(
+                        input_token_ids.tolist(),
+                        label_ids.tolist(),
+                        image_thw=None,
+                        video_thw=torch.cat(images_thw, dim=0) if images_thw else None,
+                        audio_feature_len=actual_audio_len,
+                        audio_chunk_counts=audio_chunk_counts,
+                        downsample_ratio=selected_downsample_ratio
+                    )
+
+                    video_downsample_ratios = None
+                    if images_thw:
+                        cat_thw = torch.cat(images_thw, dim=0)
+                        video_downsample_ratios = torch.full((cat_thw.shape[0],), selected_downsample_ratio, dtype=torch.float32)
+
+                    if valid_text_count > 0:
+                        yield OmniSample(
+                            input_ids=flat_input_ids,
+                            labels=flat_labels,
+                            caption_len=len(flat_input_ids),
+                            pixel_values_video=torch.cat(images, dim=0) if images else None,
+                            video_grid_thw=torch.cat(images_thw, dim=0) if images_thw else None,
+                            video_downsample_ratios=video_downsample_ratios,
+                            audio_features=audio_mel,
+                            audio_features_lens=raw_audio_len,
+                            actual_audio_feature_len=actual_audio_len,
+                            attention_mask_len=[len(flat_input_ids)],
+                            token_counts=token_counts,
+                        )
+                except Exception as e:
+                    print(f'Error processing image list or tokens: {repr(e)}, sample: {sample_data["file_path"]}')
+                    traceback.print_exc()
+                    break
+                
+                # Reset state counters and apply rolling window image pruning
+                valid_text_count = 0
+                remove_indices = set()
+                image_boundaries = []
+                boundary_start = -1
+                for idx, t in enumerate(image_list[1:], 1):
+                    if t is None and tokens[idx].item() == start_img_token.item():
+                        boundary_start = idx
+                    elif t is None and tokens[idx].item() == end_img_token.item() and boundary_start != -1:
+                        image_boundaries.append((boundary_start, idx))
+                        boundary_start = -1
+
+                image_res_token_num = 0
+                keep_limit = getattr(self.data_args, "keep_last_n_image_turns", 0)
+                if len(image_boundaries) > keep_limit:
+                    for s, e in image_boundaries[: len(image_boundaries) - keep_limit]:
+                        for i in range(s, e + 1):
+                            remove_indices.add(i)
+                    for s, e in image_boundaries[len(image_boundaries) - keep_limit :]:
+                        for i in range(s, e + 1):
+                            if isinstance(image_list[i], Image.Image):
+                                image_token_num, _ = self.calculate_video_each_frame_token(image_list[i].height, image_list[i].width, selected_downsample_ratio)
+                                image_res_token_num += image_token_num
+                            elif image_list[i] is None and tokens[i].item() in [start_img_token.item(), end_img_token.item()]:
+                                image_res_token_num += 1
+
+                for idx, t in enumerate(image_list[1:], 1):
+                    if not isinstance(t, Image.Image):
+                        length = 0
+                        if isinstance(t, tuple):
+                            length = t[1] + (t[3] if 'audio' in t else 0)
+                        elif t is None:
+                            length = len(tokens[idx])
+
+                        if text_token_num > self.data_args.max_subtitle_token_num:
+                            remove_indices.add(idx)
+                            text_token_num -= length
+
+                for idx in range(1, len(image_list)):
+                    if idx not in remove_indices:
+                        labels[idx] = torch.full_like(labels[idx], IGNORE_INDEX)
+
+                # Align indices when removing historical audio inputs
+                audio_remove_indices = []
+                audio_counter = 0
+                for i, t in enumerate(image_list):
+                    if isinstance(t, tuple) and 'audio' in t:
+                        if i in remove_indices:
+                            audio_remove_indices.append(audio_counter)
+                        audio_counter += 1
+
+                for idx in sorted(list(remove_indices), reverse=True):
+                    tokens.pop(idx)
+                    labels.pop(idx)
+                    image_list.pop(idx)
+
+                for idx in reversed(audio_remove_indices):
+                    audio_list.pop(idx)
+
+                token_num = text_token_num + image_res_token_num
+
+            # System prompt updates
+            if sub['from'] == 'replace_system':
+                system_tokens = self._build_inputs_token(sub['value'], input_type='system_with_image' if sub['system_image_list'] else 'system')
+                tokens[0] = system_tokens
+                labels[0] = torch.full((system_tokens.shape[0],), IGNORE_INDEX, dtype=torch.long)
+
+                system_image_list = []
+                new_image_token_num = 0
+                for path in sub['system_image_list']:
+                    raw = self._read_image_bytes(path)
+                    if raw is not None:
+                        buf = io.BytesIO(np.frombuffer(raw, np.uint8))
+                        with Image.open(buf) as img:
+                            image = img.convert("RGB")
+                        each_token, _ = self.calculate_video_each_frame_token(image.height, image.width, selected_downsample_ratio)
+                        new_image_token_num += each_token
+                        system_image_list.append(image)
+
+                new_text_token_num = len(system_tokens) - len(system_image_list)
+                text_token_num = text_token_num - system_text_token_num + new_text_token_num
+                system_text_token_num = new_text_token_num
+
+                token_num = token_num - system_image_token_num + new_image_token_num
+                system_image_token_num = new_image_token_num
+            else:
+                tokens.extend(cur_tokens)
+                labels.extend(cur_labels)
+                image_list.extend(cur_image_list)
+                audio_list.extend(cur_audio_list)
+                token_num += cur_token_num
+                text_token_num += cur_text_audio_num
+                if not ignore_data:
+                    valid_text_count += len(text_token)
+
+            sub_idx += 1
+            
