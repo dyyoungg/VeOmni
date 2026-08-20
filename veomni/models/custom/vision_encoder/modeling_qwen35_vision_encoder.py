@@ -26,6 +26,7 @@ from torch import Tensor
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
+import math
 
 from flash_attn import flash_attn_varlen_func
 from transformers import AutoConfig
@@ -309,7 +310,8 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
             for blk in self.blocks:
                 if self.gradient_checkpointing and self.training:
                     hidden_states = checkpoint(
-                        blk.__call__, hidden_states, cu_seqlens, None, position_embeddings
+                        blk.__call__, hidden_states, cu_seqlens, None, position_embeddings,
+                        use_reentrant=False,
                     )
                 else:
                     hidden_states = blk(
@@ -420,11 +422,22 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
                 data_type="image",
             )
         else:
-            if self.freeze_vit:
-                with torch.no_grad():
-                    features = super().forward(features, grid_thw)
+            chunk_size = getattr(self, "vit_chunk_size", 0)
+            # Flatten videos into per-frame entries: [T,H,W] -> T x [1,H,W]
+            # so we can chunk uniformly by frame count.
+            flat_thw = grid_thw.repeat_interleave(grid_thw[:, 0], dim=0)
+            flat_thw[:, 0] = 1  # each entry is now a single frame
+            num_frames = flat_thw.shape[0]
+
+            if chunk_size > 0:
+                features = self._chunked_vit_forward(features, flat_thw, chunk_size)
             else:
-                features = super().forward(features, grid_thw)
+                # Non-chunked path: use original grid_thw (identical result)
+                if self.freeze_vit:
+                    with torch.no_grad():
+                        features = super().forward(features, grid_thw)
+                else:
+                    features = super().forward(features, grid_thw)
 
         if _VIT_PROFILE and getattr(self, "_vit_timings", None):
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -444,6 +457,67 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
         else:
             features, seq_len = self.mm_projector(features, grid_thw, downsample_ratios=downsample_ratios)
         return features, seq_len
+
+    def _chunked_vit_forward(
+        self, features: torch.Tensor, grid_thw: torch.Tensor, chunk_size: int
+    ) -> torch.Tensor:
+        """
+        Args:
+            features: [seq_total, patch_dim] — all frames' patches concatenated.
+            grid_thw: [num_frames, 3] — per-frame grid, T is always 1.
+            chunk_size: max number of frames per ViT forward call.
+
+        Returns:
+            Concatenated ViT output features [seq_merged_total, hidden].
+        """
+
+        num_frames = grid_thw.shape[0]
+        tokens_per_frame = (grid_thw[:, 1] * grid_thw[:, 2]).tolist()  # T=1, so just H*W
+
+        local_chunks = math.ceil(num_frames / chunk_size)
+
+        # Sync chunk count across all ranks to prevent FSDP collective hangs
+        if dist.is_initialized():
+            chunks_tensor = torch.tensor([local_chunks], device=features.device, dtype=torch.long)
+            dist.all_reduce(chunks_tensor, op=dist.ReduceOp.MAX)
+            max_chunks = int(chunks_tensor.item())
+        else:
+            max_chunks = local_chunks
+
+        all_features = []
+        token_offset = 0
+
+        for chunk_idx in range(max_chunks):
+            frame_start = chunk_idx * chunk_size
+            frame_end = min(frame_start + chunk_size, num_frames)
+
+            if frame_start < num_frames:
+                chunk_token_count = sum(tokens_per_frame[frame_start:frame_end])
+                chunk_features = features[token_offset:token_offset + chunk_token_count]
+                chunk_thw = grid_thw[frame_start:frame_end]
+                token_offset += chunk_token_count
+
+                if self.freeze_vit:
+                    with torch.no_grad():
+                        chunk_out = super().forward(chunk_features, chunk_thw)
+                else:
+                    chunk_out = super().forward(chunk_features, chunk_thw)
+
+                all_features.append(chunk_out)
+            else:
+                # Dummy forward to keep FSDP collectives aligned in both
+                # forward (parameter all-gather) AND backward (recompute all-gather).
+                dummy_data = self._get_lm_dummy_data()
+                if self.freeze_vit:
+                    with torch.no_grad():
+                        _ = super().forward(dummy_data["features"], dummy_data["grid_thw"])
+                else:
+                    dummy_out = super().forward(dummy_data["features"], dummy_data["grid_thw"])
+                    # Connect to computation graph with zero contribution so backward
+                    # triggers the same FSDP block all-gathers as real chunks.
+                    all_features[-1] = all_features[-1] + dummy_out.sum() * 0
+
+        return torch.cat(all_features, dim=0)
 
     def _get_lm_dummy_data(self) -> Dict[str, torch.Tensor]:
         patch_size = getattr(self.config, "patch_size", 16)

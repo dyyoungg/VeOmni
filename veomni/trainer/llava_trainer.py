@@ -94,6 +94,18 @@ class VLMTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether or not to freeze the MoE router (gate) parameters, keeping the pretrained routing fixed while experts/attention still train."},
     )
+    vit_chunk_forward: bool = field(
+        default=False,
+        metadata={"help": "Enable chunked ViT forward to reduce peak activation memory. "
+                  "Images are processed in chunks of vit_chunk_size through the ViT backbone, "
+                  "then all features are passed through the projector at once."},
+    )
+    vit_chunk_size: int = field(
+        default=20,
+        metadata={"help": "Max number of images per ViT forward chunk. "
+                  "Only effective when vit_chunk_forward=True. "
+                  "Under FSDP, ranks auto-align forward count via one scalar all-reduce."},
+    )
 
     vit_lr: float = field(
         default=1e-6,
@@ -360,10 +372,21 @@ class VLMTrainer:
             self.model.omni_config.modality_aware_routing = self.args.train.modality_aware_routing
         self.model_config.freeze_vit = self.args.train.freeze_vit
         self.model_config.freeze_audio = self.args.train.freeze_audio_tower
+        self.model_config.freeze_audio_projector = self.args.train.freeze_audio_projector
         self.model_config.freeze_llm = self.args.train.freeze_llm
         self.model_config.gradient_checkpointing = self.args.train.gradient_checkpointing.enable
+        self.model_config.gradient_checkpointing_vit = (
+            self.args.train.gradient_checkpointing.enable and self.args.train.gradient_checkpointing.enable_vit
+        )
         self.model.config.encoder_data_balance = self.args.model.encoder_data_balance
         self.model.config.encoder_data_balance_sorting_algo = self.args.model.encoder_data_balance_sorting_algo
+
+        # Chunked ViT forward config
+        if self.args.train.vit_chunk_forward:
+            self.model.image_encoder.vit_chunk_size = self.args.train.vit_chunk_size
+            logger.info_rank0(f"Enabled chunked ViT forward with chunk_size={self.args.train.vit_chunk_size}")
+        else:
+            self.model.image_encoder.vit_chunk_size = 0
 
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.args
@@ -939,17 +962,50 @@ class VLMTrainer:
                 self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
  
     
+    def _collect_modality_stats(self, micro_batches: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Collect per-step multimodal statistics for logging.
+        """
+        num_images = 0
+        vision_tokens = 0
+        num_audio_clips = 0
+        audio_tokens = 0
+
+        for mb in micro_batches:
+            img_thw = mb.get("image_grid_thw")
+            vid_thw = mb.get("video_grid_thw")
+            if img_thw is not None and img_thw.numel() > 0:
+                num_images += img_thw[:, 0].sum().item()
+                vision_tokens += (img_thw[:, 0] * img_thw[:, 1] * img_thw[:, 2]).sum().item()
+            if vid_thw is not None and vid_thw.numel() > 0:
+                num_images += vid_thw[:, 0].sum().item()
+                vision_tokens += (vid_thw[:, 0] * vid_thw[:, 1] * vid_thw[:, 2]).sum().item()
+
+            audio_lens = mb.get("audio_features_lens")
+            audio_feat = mb.get("audio_features")
+            if audio_lens is not None and isinstance(audio_lens, torch.Tensor) and audio_lens.numel() > 0:
+                num_audio_clips += audio_lens.shape[0]
+                audio_tokens += audio_lens.sum().item()
+            elif audio_feat is not None and audio_feat.numel() > 0:
+                num_audio_clips += audio_feat.shape[0] if audio_feat.dim() == 3 else 1
+                audio_tokens += audio_feat.shape[-1] * (audio_feat.shape[0] if audio_feat.dim() == 3 else 1)
+
+        return {
+            "mm_stats/num_images": num_images,
+            "mm_stats/vision_tokens": vision_tokens,
+            "mm_stats/num_audio_clips": num_audio_clips,
+            "mm_stats/audio_tokens": audio_tokens,
+        }
 
     def train_step(
         self,
         micro_batches: Any,
     ) -> Dict[str, float]:
         args = self.args
-        
+
         # micro_batches: List[Dict[str, Any]] = next(data_iterator)
         if isinstance(micro_batches, dict):
             micro_batches = [micro_batches]
-        
+
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
@@ -957,6 +1013,9 @@ class VLMTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+
+        # Multimodal stats
+        total_loss_dict.update(self._collect_modality_stats(micro_batches))
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)

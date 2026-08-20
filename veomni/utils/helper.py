@@ -219,17 +219,19 @@ class EnvironMeter:
 
     def step(self, delta_time: float, global_step: int, worker_metrics_queue=None) -> Dict[str, Any]:
         if len(self.images_seqlens) > 0 or len(self.audio_seqlens) > 0:
-            flops_achieved, flops_promised = self.estimate_flops(
+            flops_achieved, flops_promised, flops_breakdown = self.estimate_flops(
                 self.batch_seqlens, delta_time,
                 images_seqlens=self.images_seqlens,
                 audio_seqlens=self.audio_seqlens,
                 freeze_vit=self.config.freeze_vit,
                 freeze_audio=self.config.freeze_audio,
+                freeze_audio_projector=getattr(self.config, "freeze_audio_projector", False),
                 freeze_llm=getattr(self.config, "freeze_llm", False),
                 gradient_checkpointing=getattr(self.config, "gradient_checkpointing", False),
+                gradient_checkpointing_vit=getattr(self.config, "gradient_checkpointing_vit", False),
             )
         else:
-            flops_achieved, flops_promised = self.estimate_flops(
+            flops_achieved, flops_promised, flops_breakdown = self.estimate_flops(
                 self.batch_seqlens, delta_time,
                 freeze_llm=getattr(self.config, "freeze_llm", False),
                 gradient_checkpointing=getattr(self.config, "gradient_checkpointing", False),
@@ -240,6 +242,15 @@ class EnvironMeter:
             op="sum",
             group=get_parallel_state().dp_group,
         )
+        # all_reduce breakdown components (each is per-rank TFLOPs, sum across DP)
+        if flops_breakdown:
+            keys = sorted(flops_breakdown.keys())
+            breakdown_values = [flops_breakdown[k] for k in keys]
+            breakdown_reduced = all_reduce(breakdown_values, op="sum", group=get_parallel_state().dp_group)
+            if not isinstance(breakdown_reduced, (list, tuple)):
+                breakdown_reduced = [breakdown_reduced]
+            flops_breakdown = {k: v for k, v in zip(keys, breakdown_reduced)}
+
         flops_promised = flops_promised * self.world_size
         mfu = flops_achieved / flops_promised
 
@@ -282,6 +293,10 @@ class EnvironMeter:
             "memory/cpu_memory_usage(%)": cpu_memory_info.percent,
             "memory/num_alloc_retries": num_alloc_retries,
         }
+        # flops breakdown by component (llm, vit, audio)
+        for component, tflops in flops_breakdown.items():
+            if tflops > 0:
+                metrics[f"system_metric/flops_{component}(T)"] = tflops
         worker_metrics = self.get_worker_metrics(worker_metrics_queue)
         metrics.update(worker_metrics)
         if self.enable_multisource:

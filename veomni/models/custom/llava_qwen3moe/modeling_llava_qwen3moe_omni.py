@@ -364,7 +364,7 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         else:
             audio_has_trainable = not (
                 getattr(self.audio_encoder, "freeze_audio_encoder", False)
-                or getattr(self.audio_encoder, "freeze_audio_projector", False)
+                and getattr(self.audio_encoder, "freeze_audio_projector", False)
             )
             if audio_has_trainable:
                 with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():

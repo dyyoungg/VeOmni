@@ -319,8 +319,10 @@ class EnvironMeterCallback(Callback):
                        if k.startswith("channel_loss_sum/") or k.startswith("channel_token_count/")}
         channel_passthrough = {k: v for k, v in loss_dict.items()
                                if k.startswith("channel_loss/") or k.startswith("channel_tokens/")}
+        mm_stats = {k: v for k, v in loss_dict.items()
+                    if k.startswith("mm_stats/")}
         regular_metrics = {k: v for k, v in loss_dict.items()
-                          if k not in channel_raw and k not in channel_passthrough}
+                          if k not in channel_raw and k not in channel_passthrough and k not in mm_stats}
         step_train_metrics.update(regular_metrics)
         step_train_metrics["grad_norm"] = grad_norm
 
@@ -352,6 +354,11 @@ class EnvironMeterCallback(Callback):
         step_train_metrics["training/lr_vit"] = lr_vit
         step_train_metrics["mfu"] = step_env_metrics.get('system_metric/mfu', 0)
         step_env_metrics.update(step_train_metrics)
+
+        # mm_stats: all_reduce then add to env_metrics only (wandb/tb), skip tqdm
+        if mm_stats:
+            mm_reduced = {k: all_reduce(v, group=get_parallel_state().fsdp_group) for k, v in mm_stats.items()}
+            step_env_metrics.update(mm_reduced)
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
