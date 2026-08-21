@@ -404,22 +404,22 @@ class EnvironMeterCallback(Callback):
                 parts = [f"{k.split('/')[-1]}: {v:.4f}" for k, v in sorted(ch_losses.items()) if k != "channel_loss/time"]
                 logger.info(f"  channel_loss ({ch_time:.3f}s): {' | '.join(parts)}")
 
-        if state.global_step == 50:
-            tracemalloc.start(10)  # 10层调用栈
-            self._tracemalloc_snapshot = tracemalloc.take_snapshot()
-            logger.info("[MemTrace] baseline snapshot taken.")
+        # if state.global_step == 50:
+        #     tracemalloc.start(10)  # 10层调用栈
+        #     self._tracemalloc_snapshot = tracemalloc.take_snapshot()
+        #     logger.info("[MemTrace] baseline snapshot taken.")
         
-        elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
-            # 之后每 100 步和基准对比
-            new_snapshot = tracemalloc.take_snapshot()
-            top_stats = new_snapshot.compare_to(
-                self._tracemalloc_snapshot, 'lineno'
-            )
-            logger.info(f"[MemTrace] step={state.global_step} top memory growth:")
-            for stat in top_stats[:10]:  
-                logger.info(f"  {stat}")
+        # elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
+        #     # 之后每 100 步和基准对比
+        #     new_snapshot = tracemalloc.take_snapshot()
+        #     top_stats = new_snapshot.compare_to(
+        #         self._tracemalloc_snapshot, 'lineno'
+        #     )
+        #     logger.info(f"[MemTrace] step={state.global_step} top memory growth:")
+        #     for stat in top_stats[:10]:  
+        #         logger.info(f"  {stat}")
            
-            self._tracemalloc_snapshot = new_snapshot
+        #     self._tracemalloc_snapshot = new_snapshot
 
     def _reduce_channel_loss(self, channel_raw: Dict[str, float]) -> Dict[str, float]:
         """All-gather channel keys across ranks, then all_reduce sum/count tensors.
