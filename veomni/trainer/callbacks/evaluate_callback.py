@@ -41,9 +41,11 @@ ASR_CATEGORIES = frozenset({"aishell", "librispeech", "cantonese", "commonvoice_
 class EvaluateCallback(Callback):
     """Runs evaluation at configurable step / epoch intervals.
  
-    Supports two mutually-exclusive evaluation modes per run:
+    Supports three evaluation modes per run:
       • MCQ  – single forward pass, argmax over option logits.
       • ASR  – autoregressive generation, scored with WER / CER.
+      • LLM  – autoregressive generation, evaluated by rule matches (e.g. function call).
+
  
     Results are:
       1. Written to  <output_dir>/eval_results.jsonl  (rank-0 only).
@@ -120,6 +122,97 @@ class EvaluateCallback(Callback):
             results[c] = (right / total).item() if total.item() > 0 else 0.0
         return results
     
+    def _autoregressive_generate(
+        self, model, data: torch.Tensor, max_gen: int = 32, 
+    ) -> tuple[str, torch.device]:
+        """Core autoregressive decoding loop supporting optional audio context."""
+        tokenizer  = self.trainer.tokenizer
+        device     = self._device
+        REP_PEN    = 1.05
+        TEMP       = 0.0
+        TOP_K      = 20
+        TOP_P      = 0.8
+        FILTER_VAL = -float("Inf")
+        
+        input_ids = data.pop("input_ids")
+
+        cur_ids    = input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)
+        past_kv    = DynamicCache()
+        repeat_ids = torch.empty(0, dtype=torch.long, device=device)
+        output_ids: list[int] = []
+        gen_device = None
+
+        for step in range(max_gen):
+            model_kwargs = dict(
+                input_ids=cur_ids,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            # 仅在生成的首步传入多模态特征
+            if step == 0:
+                model_kwargs["audio_features"]       = data.pop("audio_features", None)
+                model_kwargs["audio_features_lens"]  = data.pop("audio_features_lens", None)
+                model_kwargs["pixel_values"]         = data.pop("pixel_values", None)
+                model_kwargs["pixel_values_videos"]  = data.pop("pixel_values_videos", None)
+                model_kwargs["image_grid_thw"]       = data.pop("image_grid_thw", None)
+                model_kwargs["video_grid_thw"]       = data.pop("video_grid_thw", None)
+
+            out     = model(**model_kwargs)
+            past_kv = out.past_key_values
+            logit   = out.logits[0, -1]
+
+            if gen_device is None:
+                gen_device = logit.device
+            repeat_ids = repeat_ids.to(logit.device)
+
+            # 重复惩罚
+            scores = torch.gather(logit, 0, repeat_ids)
+            scores = torch.where(scores < 0, scores * REP_PEN, scores / REP_PEN)
+            logit  = torch.scatter(logit, 0, repeat_ids, scores)
+
+            # top-k
+            k         = min(TOP_K, logit.size(0))
+            threshold = torch.topk(logit, k)[0][-1]
+            logit     = logit.masked_fill(logit < threshold, FILTER_VAL)
+
+            # top-p
+            sorted_l, sorted_i = torch.sort(logit, descending=False)
+            cum_p     = sorted_l.softmax(-1).cumsum(-1)
+            to_remove = cum_p <= (1 - TOP_P)
+            to_remove[-1:] = False
+            logit = logit.masked_fill(
+                to_remove.scatter(0, sorted_i, to_remove), FILTER_VAL,
+            )
+
+            # 采样/贪婪
+            if TEMP == 0.0:
+                tok = logit.argmax().item()
+            else:
+                tok = torch.multinomial(
+                    torch.nn.functional.softmax(logit / TEMP, dim=-1),
+                    num_samples=1,
+                ).item()
+
+            new_tok    = torch.tensor([[tok]], dtype=torch.long, device=gen_device)
+            cur_ids    = new_tok
+            repeat_ids = torch.cat([repeat_ids, new_tok[0]])
+            output_ids.append(tok)
+
+        # 截断特殊字符
+        special_ids = {
+            tokenizer.eos_token_id,
+            tokenizer.bos_token_id,
+            tokenizer.pad_token_id,
+        } - {None}
+        for i, tok in enumerate(output_ids):
+            if tok in special_ids:
+                output_ids = output_ids[:i]
+                break
+
+        hypothesis = tokenizer.decode(output_ids, skip_special_tokens=True)
+        return hypothesis, gen_device or device
+
+
 
     def _eval_mcq_batch(
         self, model, data: dict,
@@ -178,30 +271,52 @@ class EvaluateCallback(Callback):
         provided the entire eval set consists only of ASR samples.
         Returns (metric, device).
         """
-        input_ids      = data.pop("input_ids")
-        gt_str, lang   = data.pop("audio_ground_truth_text")[0]
-        audio          = data.pop("audio_features")
-        audio_feat_len = data.pop("audio_features_lens")
  
         return self._generate_and_score(
-            model, input_ids, gt_str, lang, audio, audio_feat_len,
+            model, data
         )
     
+    def _eval_llm_batch(self, model, data: dict, category: str) -> tuple[bool, str, torch.device]:
+        """Decodes autoregressively for LLM text generation tasks and scores by rules."""
+        
+        # 对于 LLM 生成，设置 max_gen 为 128 
+        hypothesis, gen_device = self._autoregressive_generate(
+            model, data, max_gen=128
+        )
+
+        acc = False
+        if "function_call" in category:
+            if "_nosearch" in category:
+                acc = "（搜索：" not in hypothesis
+            elif "_search" in category:
+                acc = "（搜索：" in hypothesis
+            elif "_silence" in category:
+                acc = "（模式切换：暂停工作）" in hypothesis
+            elif "_nosilence" in category:
+                acc = "（模式切换：暂停工作）" not in hypothesis
+            elif "_volume" in category:
+                acc = "（调整音量" in hypothesis[:6]
+            elif "_novolume" in category:
+                acc = "（调整音量：" not in hypothesis
+            elif "_time" in category:
+                acc = "（查询：时间" in hypothesis[:6]
+            elif "_notime" in category:
+                acc = "（查询：时间" not in hypothesis[:6]
+            elif "_no_world_book_link" in category:
+                acc = "www.link" not in hypothesis
+            elif "_world_book_link" in category:
+                acc = "www.link" in hypothesis
+        else:
+            acc = False
+
+        return acc, hypothesis, gen_device
+    
     def _generate_and_score(
-        self, model, input_ids, gt_str: str, language: str,
-        audios, audio_feature_len,
+        self, model, data,
     ) -> tuple[float, torch.device]:
         """Greedy / top-p/k generation loop followed by WER / CER scoring."""
-        
-        tokenizer  = self.trainer.tokenizer
-        device     = self._device
-        MAX_GEN    = 32
-        REP_PEN    = 1.05
-        TEMP       = 0.0
-        TOP_K      = 20
-        TOP_P      = 0.8
-        FILTER_VAL = -float("Inf")
- 
+
+        gt_str, language = data.pop("audio_ground_truth_text")[0]
         cc = opencc.OpenCC("s2hk")
  
         # ── text-normalisation helpers ────────────────────────────────────────
@@ -255,82 +370,12 @@ class EvaluateCallback(Callback):
             else:
                 raise NotImplementedError(f"[Eval ASR] language '{lang}' not supported")
  
-        # ── generation loop ───────────────────────────────────────────────────
-        # KV-cache is used so only the new token is passed after the first step.
-        # audio features are passed only on the first step (they are embedded into
-        # the KV cache via the audio encoder); subsequent steps skip them.
-        cur_ids    = input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)
-        past_kv    = DynamicCache()
-        repeat_ids = torch.empty(0, dtype=torch.long, device=device)
-        output_ids: list[int] = []
-        gen_device = None
- 
-        for step in range(MAX_GEN):
-            model_kwargs = dict(
-                input_ids=cur_ids,
-                past_key_values=past_kv,
-                use_cache=True,
-            )
-            # Audio inputs are only meaningful on the first decode step.
-            if step == 0:
-                model_kwargs["audio_features"] = audios
-                model_kwargs["audio_features_lens"] = audio_feature_len
- 
-            out     = model(**model_kwargs)
-            past_kv = out.past_key_values
-            logit   = out.logits[0, -1]
- 
-            if gen_device is None:
-                gen_device = logit.device
-            repeat_ids = repeat_ids.to(logit.device)
- 
-            # repetition penalty
-            scores = torch.gather(logit, 0, repeat_ids)
-            scores = torch.where(scores < 0, scores * REP_PEN, scores / REP_PEN)
-            logit  = torch.scatter(logit, 0, repeat_ids, scores)
- 
-            # top-k filtering
-            k         = min(TOP_K, logit.size(0))
-            threshold = torch.topk(logit, k)[0][-1]
-            logit     = logit.masked_fill(logit < threshold, FILTER_VAL)
- 
-            # top-p (nucleus) filtering
-            sorted_l, sorted_i = torch.sort(logit, descending=False)
-            cum_p     = sorted_l.softmax(-1).cumsum(-1)
-            to_remove = cum_p <= (1 - TOP_P)
-            to_remove[-1:] = False   # always keep at least one token
-            logit = logit.masked_fill(
-                to_remove.scatter(0, sorted_i, to_remove), FILTER_VAL,
-            )
- 
-            # sample / greedy
-            if TEMP == 0.0:
-                tok = logit.argmax().item()
-            else:
-                tok = torch.multinomial(
-                    torch.nn.functional.softmax(logit / TEMP, dim=-1),
-                    num_samples=1,
-                ).item()
- 
-            new_tok    = torch.tensor([[tok]], dtype=torch.long, device=gen_device)
-            cur_ids    = new_tok                               # only the new token next iter
-            repeat_ids = torch.cat([repeat_ids, new_tok[0]])
-            output_ids.append(tok)
- 
-        # trim at the first EOS / BOS / PAD token
-        special_ids = {
-            tokenizer.eos_token_id,
-            tokenizer.bos_token_id,
-            tokenizer.pad_token_id,
-        } - {None}
-        for i, tok in enumerate(output_ids):
-            if tok in special_ids:
-                output_ids = output_ids[:i]
-                break
- 
-        hypothesis = tokenizer.decode(output_ids, skip_special_tokens=True)
-        metric     = _score(gt_str, hypothesis, language)
-        return metric, gen_device or device, hypothesis
+        # max_gen = 32
+        hypothesis, gen_device = self._autoregressive_generate(
+            model, data, max_gen=32
+        )
+        metric = _score(gt_str, hypothesis, language)
+        return metric, gen_device, hypothesis
 
     def _evaluate(self, state: TrainerState) -> None:
         args   = self.trainer.args
@@ -388,6 +433,16 @@ class EvaluateCallback(Callback):
                     )
                     pred_record["prediction"] = hypothesis
                     pred_record["metric"] = metric
+                    pred_record["eval_type"] = "asr"
+                elif ("function_call" in category) or ("deploy" in category) or ("generate" in category):
+                    # 指令/工具调用评估
+                    acc, hypothesis, _ = self._eval_llm_batch(model, data, category)
+                    category_acc[category].append(
+                        torch.tensor(1.0 if acc else 0.0, dtype=torch.float, device=device)
+                    )
+                    pred_record["prediction"] = hypothesis
+                    pred_record["is_correct"] = bool(acc)
+                    pred_record["eval_type"] = "generation"
  
                 else:
                     # MCQ: 1 forward per sample

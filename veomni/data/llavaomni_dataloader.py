@@ -1185,9 +1185,14 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
 
         for message in prompt_list:
             content = message["value"]
-            if message['role'].lower() in ['human',"user"]:
+            if 'role' in message:
+                role = 'role'
+            elif 'from' in message:
+                role = 'from'
+                
+            if message[role].lower() in ['human',"user"]:
                 prompt += user_format.format(content=content)
-            elif message["role"].lower() in ["assistant", "gpt"]:
+            elif message[role].lower() in ["assistant", "gpt"]:
                 prompt += assistant_format.format(content=content)
             else:
                 pass
@@ -1219,14 +1224,20 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 question_tokens, audio_list = self._build_mixed_audio_tokens(sample_data, question, category)
                 if not question_tokens: 
                     return None
-                
-            no_loss_txt = 'My best option: ('
-            with_loss_txt = f"{chr(ord('A') + answer_idx)}"
-            mask_len = len(self.tokenizer(no_loss_txt)['input_ids'])
-            answer_tokens = self.tokenizer(no_loss_txt + with_loss_txt)['input_ids']
             
-            subtitle_tokens = question_tokens + answer_tokens
-            label_tokens = [IGNORE_INDEX] * len(question_tokens) + [IGNORE_INDEX] * mask_len + answer_tokens[-(len(answer_tokens) - mask_len):]
+            is_generation_task = "generate" in category
+            
+            if is_generation_task:
+                subtitle_tokens = question_tokens
+                label_tokens = [IGNORE_INDEX] * len(question_tokens)
+            else:
+                no_loss_txt = 'My best option: ('
+                with_loss_txt = f"{chr(ord('A') + answer_idx)}"
+                mask_len = len(self.tokenizer(no_loss_txt)['input_ids'])
+                answer_tokens = self.tokenizer(no_loss_txt + with_loss_txt)['input_ids']
+                
+                subtitle_tokens = question_tokens + answer_tokens
+                label_tokens = [IGNORE_INDEX] * len(question_tokens) + [IGNORE_INDEX] * mask_len + answer_tokens[-(len(answer_tokens) - mask_len):]
         else:
             # 纯文本
             question_tokens = self.build_inputs_qwen2(question, system_prompt=system_prompt) 
