@@ -330,7 +330,7 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
             # Whisper forward, ~2s/step). Skip it in that case.
             audio_has_trainable = not (
                 getattr(self.audio_encoder, "freeze_audio_encoder", False)
-                or getattr(self.audio_encoder, "freeze_audio_projector", False)
+                and getattr(self.audio_encoder, "freeze_audio_projector", False)
             )
             if audio_has_trainable:
                 with step_timer.measure("whisper") if step_timer else contextlib.nullcontext():

@@ -368,49 +368,243 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
     
-    def _estimate_audio_flops(self, audio_seqlens, audio_config):
+    def _estimate_audio_flops(self, audio_seqlens, audio_config,
+                              freeze_audio=False, freeze_audio_projector=False,
+                              gradient_checkpointing=False):
         """
-        Estimate flops for Whisper encoder.
-        audio_seqlens: list of mel feature lengths for each audio sample
+        Estimate FLOPs for audio encoder + projector.
+
+        Dispatches based on audio_config.model_type:
+          - "beebee_qwen3_audio_model" / contains "qwen3_audio" → Qwen3 audio encoder
+          - otherwise → Whisper encoder
+
+        Args:
+            audio_seqlens: list of mel feature lengths (raw mel frames per sample)
+            audio_config: encoder config (BeeBeeAudioModelConfig or BeeBeeQwen3AudioModelConfig)
+            freeze_audio: encoder frozen (torch.no_grad → 2x linear, 4x attn dot)
+            freeze_audio_projector: projector also frozen
+            gradient_checkpointing: GC enabled (only affects trainable transformer layers)
         """
-        # Whisper encoder 结构参数
+        model_type = getattr(audio_config, "model_type", "")
+        if "qwen3_audio" in model_type:
+            return self._estimate_qwen3_audio_flops(
+                audio_seqlens, audio_config,
+                freeze_audio=freeze_audio,
+                freeze_audio_projector=freeze_audio_projector,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+        else:
+            return self._estimate_whisper_audio_flops(
+                audio_seqlens, audio_config,
+                freeze_audio=freeze_audio,
+                freeze_audio_projector=freeze_audio_projector,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+
+    def _estimate_whisper_audio_flops(self, audio_seqlens, audio_config,
+                                      freeze_audio=False, freeze_audio_projector=False,
+                                      gradient_checkpointing=False):
+        """
+        Whisper encoder architecture:
+          Conv1d stem: conv1(128→d_model, k=3, s=1) + conv2(d_model→d_model, k=3, s=2)
+          N transformer layers (pre-norm): Attn(Q,K,V,O) + FFN(fc1, fc2)
+          Projector (AudioConvUpScaleProjector): Conv1d(k=2,s=2) + reshape + MLP(linear1→GELU→linear2)
+
+        FLOPs factors:
+          - Conv stem: NOT under GC. frozen=2x, trainable=6x
+          - Transformer layers: frozen=2x/4x(attn dot). trainable+GC=8x/16x. trainable-GC=6x/12x
+          - Projector MLP: NOT under GC. frozen=2x, trainable=6x
+        """
         hidden_size = getattr(audio_config, "d_model", 1280)
         num_hidden_layers = getattr(audio_config, "encoder_layers", 32)
         num_attention_heads = getattr(audio_config, "encoder_attention_heads", 20)
         ffn_dim = getattr(audio_config, "encoder_ffn_dim", hidden_size * 4)
-
+        num_mel_bins = getattr(audio_config, "num_mel_bins", 128)
         head_dim = hidden_size // num_attention_heads
 
-        # conv1d stem: 2层卷积将 mel 特征降采样
-        # conv1(kernel=3) + conv2(kernel=3, stride=2)
-        # flops = 2 * kernel_size * in_channels * out_channels * seq_len
+        # FLOPs factors
+        conv_factor = 2 if freeze_audio else 6  # conv stem not under GC
+        if freeze_audio:
+            linear_factor = 2
+            attn_dot_factor = 4
+        else:
+            linear_factor = 8 if gradient_checkpointing else 6
+            attn_dot_factor = 16 if gradient_checkpointing else 12
+        projector_factor = 2 if freeze_audio_projector else 6  # projector not under GC
+
+        # === Conv1d stem ===
         conv_flops = 0
-        for audio_len in audio_seqlens:
-            # conv1: mel_bins(80) -> hidden_size, kernel=3
-            conv1_flops = 2 * 3 * 80 * hidden_size * audio_len
-            # conv2: hidden_size -> hidden_size, kernel=3, stride=2, seq缩短一半
-            conv2_flops = 2 * 3 * hidden_size * hidden_size * (audio_len // 2)
+        for mel_len in audio_seqlens:
+            # conv1: (num_mel_bins → d_model, k=3, s=1, p=1) output_len = mel_len
+            conv1_flops = 2 * 3 * num_mel_bins * hidden_size * mel_len
+            # conv2: (d_model → d_model, k=3, s=2, p=1) output_len ≈ mel_len//2
+            out_len_conv2 = (mel_len - 1) // 2 + 1
+            conv2_flops = 2 * 3 * hidden_size * hidden_size * out_len_conv2
             conv_flops += conv1_flops + conv2_flops
+        conv_flops *= conv_factor
 
-        tokens_sum = sum(s // 2 for s in audio_seqlens)  # conv stride=2 后的实际长度
+        # === Transformer layers ===
+        # After conv2: token count per sample = (mel_len - 1) // 2 + 1
+        tokens_per_sample = [(s - 1) // 2 + 1 for s in audio_seqlens]
+        tokens_sum = sum(tokens_per_sample)
 
-        # attention linear: Q K V O
-        q_size = hidden_size
-        k_size = hidden_size
-        v_size = hidden_size
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + hidden_size)
-        attn_linear_flops = 6 * attn_linear_N * num_hidden_layers * tokens_sum
+        # Attention linear (Q, K, V, O): all d_model → d_model
+        attn_linear_N = 4 * hidden_size * hidden_size
+        # FFN: fc1(d_model → ffn_dim) + fc2(ffn_dim → d_model)
+        ffn_N = 2 * hidden_size * ffn_dim
+        transformer_linear_flops = linear_factor * (attn_linear_N + ffn_N) * num_hidden_layers * tokens_sum
 
-        # FFN: fc1 + fc2 (Whisper 用 GELU，两个线性层)
-        ffn_N = hidden_size * ffn_dim * 2
-        ffn_flops = 6 * ffn_N * num_hidden_layers * tokens_sum
+        # Attention dot product: full self-attention within each sample
+        seqlen_square_sum = sum(s * s for s in tokens_per_sample)
+        attn_dot_flops = attn_dot_factor * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
-        # attention qkv flops（序列长度平方）
-        seqlen_square_sum = sum((s // 2) * (s // 2) for s in audio_seqlens)
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        # === Projector (AudioConvUpScaleProjector) ===
+        downsample_ratio = getattr(audio_config, "audio_downsample_size", 10)
+        output_size = getattr(audio_config, "output_size", 6144)
+        compress_ratio = downsample_ratio // 2
 
-        audio_flops = conv_flops + attn_linear_flops + ffn_flops + attn_qkv_flops
+        # Projector conv1d(d_model, d_model, k=2, s=2): tokens_sum → tokens_sum//2
+        proj_conv_flops = projector_factor * 2 * 2 * hidden_size * hidden_size * (tokens_sum // 2)
 
+        # After conv + reshape: tokens_after_proj = tokens_sum // downsample_ratio
+        tokens_after_proj = sum((s + downsample_ratio - 1) // downsample_ratio for s in tokens_per_sample)
+        # linear1: (d_model * compress_ratio) → output_size
+        # linear2: output_size → output_size
+        proj_mlp_N = (hidden_size * compress_ratio) * output_size + output_size * output_size
+        proj_mlp_flops = projector_factor * 2 * proj_mlp_N * tokens_after_proj
+
+        audio_flops = conv_flops + transformer_linear_flops + attn_dot_flops + proj_conv_flops + proj_mlp_flops
+        return audio_flops
+
+    def _estimate_qwen3_audio_flops(self, audio_seqlens, audio_config,
+                                    freeze_audio=False, freeze_audio_projector=False,
+                                    gradient_checkpointing=False):
+        """
+        Qwen3 Audio encoder architecture:
+          Conv2d stem: 3x Conv2d(k=3, s=2, p=1) → 8x temporal downsample
+            conv2d1: (1 → dhs), conv2d2: (dhs → dhs), conv2d3: (dhs → dhs)
+            conv_out: Linear(dhs * freq_after_conv → d_model)
+          N transformer layers (pre-norm): Attn(Q,K,V,O with bias) + FFN(fc1→GELU→fc2)
+            Attention uses windowed flash_attn_varlen (window ≈ n_window_infer tokens)
+          Projector (AudioMultiConvProjector): log2(ratio) Conv1d layers + MLP
+
+        FLOPs factors:
+          - Conv2d stem + conv_out: NOT under GC. frozen=2x, trainable=6x
+          - Transformer layers: frozen=2x/4x(attn dot). trainable+GC=8x/16x. trainable-GC=6x/12x
+          - Projector: NOT under GC. frozen=2x, trainable=6x
+        """
+        hidden_size = getattr(audio_config, "d_model", 1280)
+        num_hidden_layers = getattr(audio_config, "encoder_layers", 32)
+        num_attention_heads = getattr(audio_config, "encoder_attention_heads", 20)
+        ffn_dim = getattr(audio_config, "encoder_ffn_dim", 5120)
+        num_mel_bins = getattr(audio_config, "num_mel_bins", 128)
+        dhs = getattr(audio_config, "downsample_hidden_size", 480)
+        n_window = getattr(audio_config, "n_window", 50)
+        n_window_infer = getattr(audio_config, "n_window_infer", 800)
+        head_dim = hidden_size // num_attention_heads
+
+        # Frequency dimension after 3x Conv2d (each stride=2)
+        freq_after_conv = (((num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2  # = 16 for 128 mel bins
+
+        # FLOPs factors
+        conv_factor = 2 if freeze_audio else 6  # conv stem not under GC
+        if freeze_audio:
+            linear_factor = 2
+            attn_dot_factor = 4
+        else:
+            linear_factor = 8 if gradient_checkpointing else 6
+            attn_dot_factor = 16 if gradient_checkpointing else 12
+        projector_factor = 2 if freeze_audio_projector else 6
+
+        # === Conv2d stem ===
+        # Total conv FLOPs = sum over all samples of conv operations
+        # Conv2d FLOPs = 2 * k^2 * C_in * C_out * H_out * W_out
+        conv_flops = 0
+        for mel_len in audio_seqlens:
+            # conv2d1: (1 → dhs, k=3, s=2) output: (freq_out1, time_out1)
+            freq_out1 = (num_mel_bins - 1) // 2 + 1  # 64
+            time_out1 = (mel_len - 1) // 2 + 1
+            conv_flops += 2 * 9 * 1 * dhs * freq_out1 * time_out1
+
+            # conv2d2: (dhs → dhs, k=3, s=2)
+            freq_out2 = (freq_out1 - 1) // 2 + 1  # 32
+            time_out2 = (time_out1 - 1) // 2 + 1
+            conv_flops += 2 * 9 * dhs * dhs * freq_out2 * time_out2
+
+            # conv2d3: (dhs → dhs, k=3, s=2)
+            freq_out3 = (freq_out2 - 1) // 2 + 1  # 16
+            time_out3 = (time_out2 - 1) // 2 + 1
+            conv_flops += 2 * 9 * dhs * dhs * freq_out3 * time_out3
+
+            # conv_out: Linear(dhs * freq_after_conv → d_model), per time step
+            conv_flops += 2 * (dhs * freq_after_conv) * hidden_size * time_out3
+
+        conv_flops *= conv_factor
+
+        # === Transformer layers ===
+        # Output token count uses _get_feat_extract_output_lengths formula
+        # Simplified: ~13 tokens per chunk (chunk=2*n_window=100 frames) + remainder
+        def _encoder_output_len(mel_len):
+            chunk_len = n_window * 2
+            num_full_chunks = mel_len // chunk_len
+            remainder = mel_len % chunk_len
+            if remainder == 0:
+                return num_full_chunks * 13
+            # remainder chunk conv output
+            feat_len = (remainder - 1) // 2 + 1
+            feat_len = (feat_len - 1) // 2 + 1
+            feat_len = (feat_len - 1) // 2 + 1
+            return num_full_chunks * 13 + feat_len
+
+        tokens_per_sample = [_encoder_output_len(s) for s in audio_seqlens]
+        tokens_sum = sum(tokens_per_sample)
+
+        # Attention linear (Q, K, V, O all d_model → d_model, with bias)
+        attn_linear_N = 4 * hidden_size * hidden_size
+        # FFN: fc1(d_model → ffn_dim) + fc2(ffn_dim → d_model), GELU activation
+        ffn_N = 2 * hidden_size * ffn_dim
+        transformer_linear_flops = linear_factor * (attn_linear_N + ffn_N) * num_hidden_layers * tokens_sum
+
+        # Attention dot product: windowed attention
+        # Window size = max_chunk_aftercnn * n_window_ratio
+        max_chunk_aftercnn = 13  # (100 mel frames → 13 tokens after 3 conv layers)
+        n_window_ratio = n_window_infer // (n_window * 2)  # typically 800/100 = 8
+        window_size = max_chunk_aftercnn * n_window_ratio  # typically 104
+
+        attn_seqlen_sq_sum = 0
+        for enc_len in tokens_per_sample:
+            # Each sample split into windows of window_size
+            num_full_windows = enc_len // window_size
+            remainder = enc_len % window_size
+            attn_seqlen_sq_sum += num_full_windows * (window_size * window_size)
+            if remainder > 0:
+                attn_seqlen_sq_sum += remainder * remainder
+        attn_dot_flops = attn_dot_factor * attn_seqlen_sq_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        # === Projector (AudioMultiConvProjector) ===
+        downsample_ratio = getattr(audio_config, "audio_downsample_size", 2)
+        output_size = getattr(audio_config, "output_size", 5120)
+        import math as _math
+        n_conv_layers = int(_math.log2(downsample_ratio)) if downsample_ratio > 1 else 0
+
+        # Conv1d layers: each (d_model → d_model, k=3, s=2, p=1)
+        proj_conv_flops = 0
+        # Tokens after each conv: tokens_sum → tokens_sum/2 → tokens_sum/4 → ...
+        current_tokens = tokens_sum
+        for _ in range(n_conv_layers):
+            out_tokens = (current_tokens + 1) // 2  # ceil(L/2) approximately
+            proj_conv_flops += 2 * 3 * hidden_size * hidden_size * out_tokens
+            current_tokens = out_tokens
+        proj_conv_flops *= projector_factor
+
+        # MLP: linear1(d_model → output_size) + linear2(output_size → output_size)
+        tokens_after_proj = sum(
+            (s + downsample_ratio - 1) // downsample_ratio for s in tokens_per_sample
+        )
+        proj_mlp_N = hidden_size * output_size + output_size * output_size
+        proj_mlp_flops = projector_factor * 2 * proj_mlp_N * tokens_after_proj
+
+        audio_flops = conv_flops + transformer_linear_flops + attn_dot_flops + proj_conv_flops + proj_mlp_flops
         return audio_flops
     
     def _estimate_llavaqwen2_omni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
@@ -466,7 +660,8 @@ class VeomniFlopsCounter:
                 freeze_projector = kwargs.get("freeze_projector", False)
                 vit_flops = self._estimate_beebee_vit_flop(
                     images_seqlens, image_config,
-                    freeze_vit=freeze_vit, freeze_projector=freeze_projector
+                    freeze_vit=freeze_vit, freeze_projector=freeze_projector,
+                    gradient_checkpointing=gradient_checkpointing
                 )
             else:
                 vit_flops = 0
@@ -478,19 +673,34 @@ class VeomniFlopsCounter:
         if audio_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             audio_config = getattr(self.config.encoder_config, "audio_config", None)
             if audio_config is not None:
-                audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
+                freeze_audio_projector = kwargs.get("freeze_audio_projector", False)
+                audio_flops = self._estimate_audio_flops(
+                    audio_seqlens, audio_config,
+                    freeze_audio=freeze_audio,
+                    freeze_audio_projector=freeze_audio_projector,
+                    gradient_checkpointing=gradient_checkpointing,
+                )
             else:
                 audio_flops = 0
-            audio_flops = audio_flops * (2.0 / 6.0) if freeze_audio else audio_flops
-
         else:
             audio_flops = 0
 
         flops_all = dense_N_flops + attn_qkv_flops + vit_flops + audio_flops
-        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
-        return flops_achieved
-    
-    def _estimate_beebee_vit_flop(self, images_seqlens, config, freeze_vit=False, freeze_projector=False):
+        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs/s (throughput)
+
+        llm_flops = (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
+        vit_tflops = vit_flops / delta_time / 1e12
+        audio_tflops = audio_flops / delta_time / 1e12
+        flops_breakdown = {
+            "llm": llm_flops,
+            "vit": vit_tflops,
+            "audio": audio_tflops,
+            "workload_total": flops_all / 1e12,
+        }
+
+        return flops_achieved, flops_breakdown
+
+    def _estimate_beebee_vit_flop(self, images_seqlens, config, freeze_vit=False, freeze_projector=False, gradient_checkpointing=False):
         """
         Estimate ViT FLOPs for BeeBeeVL vision encoder (both Qwen2.5 and Qwen3.5 MoE variants).
 
@@ -501,8 +711,13 @@ class VeomniFlopsCounter:
         The merger has NO linear layer — just normalization + spatial token grouping.
         The projector MLP processes tokens AFTER pooling, so token count is greatly reduced.
 
-        freeze_vit: ViT backbone is frozen (forward only, factor 2); projector still trains.
+        freeze_vit: ViT backbone is frozen (torch.no_grad, forward only, factor 2).
         freeze_projector: projector is also frozen (forward only, factor 2).
+        gradient_checkpointing: GC enabled. Only affects trainable components:
+            - frozen uses torch.no_grad() → always 2x regardless of GC
+            - trainable linear: 6x (no GC) → 8x (with GC, adds 1 fwd recomp)
+            - trainable attn dot: 12x (no GC) → 16x (with GC, adds 1 fwd recomp)
+            - projector MLP is not wrapped in GC (too small), always 6x when trainable
         """
 
         if config is None:
@@ -545,8 +760,18 @@ class VeomniFlopsCounter:
         downsample_ratio = getattr(config, "image_downsample_size", 8)
         tokens_after_pool = tokens_sum / (spatial_merge_size ** 2 * downsample_ratio)
 
-        # --- FLOPs factor: frozen = forward only (2x), trainable = fwd+bwd (6x) ---
-        backbone_factor = 2 if freeze_vit else 6
+        # --- FLOPs factor ---
+        # frozen (torch.no_grad): 2x always, GC irrelevant
+        # trainable without GC: linear 6x, attn 12x
+        # trainable with GC: linear 8x (2fwd+2recomp+4bwd), attn 16x (4fwd+4recomp+8bwd)
+        if freeze_vit:
+            backbone_factor = 2
+            attn_factor = 4
+        else:
+            backbone_factor = 8 if gradient_checkpointing else 6
+            attn_factor = 16 if gradient_checkpointing else 12
+
+        # projector MLP: not wrapped in GC (only 2 layers), always 6x when trainable
         projector_factor = 2 if freeze_projector else 6
 
         # --- Dense FLOPs ---
@@ -570,8 +795,6 @@ class VeomniFlopsCounter:
                 full_attn_layers = depth
             window_attn_layers = depth - full_attn_layers
 
-        # attn compute: fwd = 4x, fwd+bwd = 12x
-        attn_factor = 4 if freeze_vit else 12
         seqlen_square_sum = sum(s * s for s in images_seqlens)
         attn_qkv_flops = attn_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layers
 
@@ -644,13 +867,15 @@ class VeomniFlopsCounter:
 
         # image encoder flops
         images_seqlens = kwargs.get("images_seqlens", None)
+        gradient_checkpointing_vit = kwargs.get("gradient_checkpointing_vit", gradient_checkpointing)
         if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             image_config = getattr(self.config.encoder_config, "image_config", None)
             if image_config is not None:
                 freeze_projector = kwargs.get("freeze_projector", False)
                 vit_flops = self._estimate_beebee_vit_flop(
                     images_seqlens, image_config,
-                    freeze_vit=freeze_vit, freeze_projector=freeze_projector
+                    freeze_vit=freeze_vit, freeze_projector=freeze_projector,
+                    gradient_checkpointing=gradient_checkpointing_vit
                 )
             else:
                 vit_flops = 0
@@ -662,19 +887,33 @@ class VeomniFlopsCounter:
         if audio_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
             audio_config = getattr(self.config.encoder_config, "audio_config", None)
             if audio_config is not None:
-                audio_flops = self._estimate_audio_flops(audio_seqlens, audio_config)
+                freeze_audio_projector = kwargs.get("freeze_audio_projector", False)
+                audio_flops = self._estimate_audio_flops(
+                    audio_seqlens, audio_config,
+                    freeze_audio=freeze_audio,
+                    freeze_audio_projector=freeze_audio_projector,
+                    gradient_checkpointing=gradient_checkpointing,
+                )
             else:
                 audio_flops = 0
-            
-            audio_flops = audio_flops * (2.0 / 6.0) if freeze_audio else audio_flops
-
         else:
             audio_flops = 0
 
         flops_all = dense_flops + attn_qkv_flops + vit_flops + audio_flops
-        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs
-        # print(f" vit flops:{vit_flops}, LLM flops: {dense_flops+attn_qkv_flops}, audio flops: {audio_flops}")
-        return flops_achieved
+        flops_achieved = flops_all / delta_time / 1e12  # TFLOPs/s (throughput)
+
+        llm_flops = (dense_flops + attn_qkv_flops) / delta_time / 1e12
+        vit_tflops = vit_flops / delta_time / 1e12
+        audio_tflops = audio_flops / delta_time / 1e12
+        flops_breakdown = {
+            "llm": llm_flops,
+            "vit": vit_tflops,
+            "audio": audio_tflops,
+            # 原始workload（TFLOP/step），不除delta_time，用于区分是计算量变了还是速度变了
+            "workload_total": flops_all / 1e12,
+        }
+
+        return flops_achieved, flops_breakdown
 
     def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
         # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
@@ -1071,9 +1310,15 @@ class VeomniFlopsCounter:
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
             promised_flops (float): The expected FLOPS of the current device.
+            flops_breakdown (dict): Per-component TFLOPs breakdown (llm, vit, audio). Empty dict if not supported.
         """
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
-        estimated_flops = func(tokens_sum, batch_seqlens, delta_time, **kwargs)
+        result = func(tokens_sum, batch_seqlens, delta_time, **kwargs)
+        if isinstance(result, tuple):
+            estimated_flops, flops_breakdown = result
+        else:
+            estimated_flops = result
+            flops_breakdown = {}
         promised_flops = get_device_flops()
-        return estimated_flops, promised_flops
+        return estimated_flops, promised_flops, flops_breakdown

@@ -319,8 +319,10 @@ class EnvironMeterCallback(Callback):
                        if k.startswith("channel_loss_sum/") or k.startswith("channel_token_count/")}
         channel_passthrough = {k: v for k, v in loss_dict.items()
                                if k.startswith("channel_loss/") or k.startswith("channel_tokens/")}
+        mm_stats = {k: v for k, v in loss_dict.items()
+                    if k.startswith("mm_stats/")}
         regular_metrics = {k: v for k, v in loss_dict.items()
-                          if k not in channel_raw and k not in channel_passthrough}
+                          if k not in channel_raw and k not in channel_passthrough and k not in mm_stats}
         step_train_metrics.update(regular_metrics)
         step_train_metrics["grad_norm"] = grad_norm
 
@@ -352,6 +354,11 @@ class EnvironMeterCallback(Callback):
         step_train_metrics["training/lr_vit"] = lr_vit
         step_train_metrics["mfu"] = step_env_metrics.get('system_metric/mfu', 0)
         step_env_metrics.update(step_train_metrics)
+
+        # mm_stats: all_reduce then add to env_metrics only (wandb/tb), skip tqdm
+        if mm_stats:
+            mm_reduced = {k: all_reduce(v, group=get_parallel_state().fsdp_group) for k, v in mm_stats.items()}
+            step_env_metrics.update(mm_reduced)
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
@@ -397,22 +404,22 @@ class EnvironMeterCallback(Callback):
                 parts = [f"{k.split('/')[-1]}: {v:.4f}" for k, v in sorted(ch_losses.items()) if k != "channel_loss/time"]
                 logger.info(f"  channel_loss ({ch_time:.3f}s): {' | '.join(parts)}")
 
-        if state.global_step == 50:
-            tracemalloc.start(10)  # 10层调用栈
-            self._tracemalloc_snapshot = tracemalloc.take_snapshot()
-            logger.info("[MemTrace] baseline snapshot taken.")
+        # if state.global_step == 50:
+        #     tracemalloc.start(10)  # 10层调用栈
+        #     self._tracemalloc_snapshot = tracemalloc.take_snapshot()
+        #     logger.info("[MemTrace] baseline snapshot taken.")
         
-        elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
-            # 之后每 100 步和基准对比
-            new_snapshot = tracemalloc.take_snapshot()
-            top_stats = new_snapshot.compare_to(
-                self._tracemalloc_snapshot, 'lineno'
-            )
-            logger.info(f"[MemTrace] step={state.global_step} top memory growth:")
-            for stat in top_stats[:10]:  
-                logger.info(f"  {stat}")
+        # elif state.global_step % 100 == 0 and self._tracemalloc_snapshot is not None:
+        #     # 之后每 100 步和基准对比
+        #     new_snapshot = tracemalloc.take_snapshot()
+        #     top_stats = new_snapshot.compare_to(
+        #         self._tracemalloc_snapshot, 'lineno'
+        #     )
+        #     logger.info(f"[MemTrace] step={state.global_step} top memory growth:")
+        #     for stat in top_stats[:10]:  
+        #         logger.info(f"  {stat}")
            
-            self._tracemalloc_snapshot = new_snapshot
+        #     self._tracemalloc_snapshot = new_snapshot
 
     def _reduce_channel_loss(self, channel_raw: Dict[str, float]) -> Dict[str, float]:
         """All-gather channel keys across ranks, then all_reduce sum/count tensors.
