@@ -150,6 +150,18 @@ class ProfileConfig:
             "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
         },
     )
+    prefix: str = field(
+        default="",
+        metadata={"help": "Prefix for trace filename. If empty, uses timestamp."},
+    )
+    warmup_steps: int = field(
+        default=2,
+        metadata={"help": "Number of warmup steps before active profiling."},
+    )
+    print_nccl_breakdown: bool = field(
+        default=True,
+        metadata={"help": "Print NCCL communication breakdown table after profiling."},
+    )
 
 
 @dataclass

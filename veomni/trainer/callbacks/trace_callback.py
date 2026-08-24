@@ -266,6 +266,8 @@ class ProfileTraceCallback(Callback):
                 profile_memory=args.train.profile.profile_memory,
                 with_stack=args.train.profile.with_stack,
                 global_rank=args.train.global_rank,
+                prefix=args.train.profile.prefix,
+                warmup_steps=args.train.profile.warmup_steps,
             )
             self.profiler.start()
 
@@ -277,6 +279,24 @@ class ProfileTraceCallback(Callback):
 
             if state.global_step == args.train.profile.end_step:
                 self.profiler.stop()
+                if args.train.profile.print_nccl_breakdown and args.train.global_rank == 0:
+                    self._print_nccl_breakdown()
+
+    def _print_nccl_breakdown(self):
+        """打印 NCCL 通信耗时分解"""
+        prof = self.profiler._p if hasattr(self.profiler, '_p') else self.profiler
+        nccl_events = [e for e in prof.key_averages() if "nccl" in e.key.lower()]
+        if not nccl_events:
+            return
+        print("\n" + "=" * 80)
+        print("NCCL COMMUNICATION BREAKDOWN:")
+        print("=" * 80)
+        print(f"{'Operation':<50} {'Count':>8} {'Device Total (ms)':>18} {'Avg (ms)':>10}")
+        print("-" * 86)
+        for e in sorted(nccl_events, key=lambda x: -(x.device_time * x.count)):
+            total_ms = e.device_time * e.count / 1000
+            avg_ms = e.device_time / 1000
+            print(f"{e.key:<50} {e.count:>8} {total_ms:>18.2f} {avg_ms:>10.2f}")
 
 
 class EnvironMeterCallback(Callback):

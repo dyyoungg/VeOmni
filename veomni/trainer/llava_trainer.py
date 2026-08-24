@@ -850,7 +850,7 @@ class VLMTrainer:
         # Pop non-tensor metadata that the model doesn't accept
         _channel_ids = micro_batch.pop("channel_ids", None)
         step_timer = None
-        dist.barrier()
+        # dist.barrier()
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             step_timer = getattr(self, "_current_step_timer", None)
             with step_timer.measure("forward") if step_timer else contextlib.nullcontext():

@@ -697,6 +697,8 @@ def create_profiler(
     profile_memory: bool,
     with_stack: bool,
     global_rank: int,
+    prefix: str = "",
+    warmup_steps: int = 2,
 ):
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -715,6 +717,7 @@ def create_profiler(
 
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
+        file_prefix = f"{prefix}_rank{global_rank}" if prefix else f"veomni_rank{global_rank}_{time}"
 
         trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
@@ -722,12 +725,12 @@ def create_profiler(
         if trace_dir.startswith("hdfs://"):
             hdfs_io.makedirs(trace_dir, exist_ok=True)
             os.makedirs(CACHE_DIR, exist_ok=True)
-            trace_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
-            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(CACHE_DIR, f"{file_prefix}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(CACHE_DIR, f"{file_prefix}.{gpu_memory_file_extension}")
         else:
             os.makedirs(trace_dir, exist_ok=True)
-            trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
-            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(trace_dir, f"{file_prefix}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(trace_dir, f"{file_prefix}.{gpu_memory_file_extension}")
 
         if IS_NPU_AVAILABLE:
             nonlocal npu_trace_handler
@@ -777,8 +780,8 @@ def create_profiler(
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
         experimental_config = None
 
-    warmup = 0 if start_step == 1 else 1
-    wait = start_step - warmup - 1
+    warmup = warmup_steps
+    wait = max(0, start_step - warmup - 1)
     active = end_step - start_step
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 

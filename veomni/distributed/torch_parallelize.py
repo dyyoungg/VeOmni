@@ -402,6 +402,11 @@ def parallelize_model_fsdp2(
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
             para_fsdp_kwargs["shard_placement_fn"] = lambda param: Shard(1)
+            # set_gradient_divide_factor uses PreMulSum NCCL op which only supports
+            # fp16/fp32/fp64. Ensure reduce_dtype=float32 even when mixed_precision
+            # is disabled, so bf16 gradients are cast before the reduce-scatter.
+            if "mp_policy" not in para_fsdp_kwargs:
+                para_fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(reduce_dtype=torch.float32)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
         else:
             extra_parallel_fsdp_kwargs[para] = None
@@ -485,10 +490,14 @@ def parallelize_model_fsdp2(
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
-    # configure manual prefetching when needed
-    need_manual_prefetch = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    # configure manual prefetching
+    # Without this, backward all-gather is fully exposed (no overlap with compute).
+    # Manual prefetch ensures layer N's backward triggers layer N-1's all-gather,
+    # so the ~23ms AG hides behind ~100ms of recompute+backward compute.
+    # Also improves forward overlap for LLM layers (default FSDP2 prefetch is insufficient).
+    need_manual_prefetch = kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
-        blocks = [pair[1][0] for pair in layer_pairs_list]
+        blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:
