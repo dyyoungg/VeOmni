@@ -7,7 +7,7 @@ import os
 import torch
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 import glob
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 from veomni.models.custom.llava_qwen3moe.configuration_qwen3moe_omni import Qwen3MoeOmniConfig
 from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeAudioModelConfig
@@ -324,52 +324,33 @@ def merge_component_models(
     audio_projector_type="mlp_channel",
     audio_encoder_type="qwen3_audio",
 ):
-    """Merge component models into a single omni checkpoint.
+    """Memory-efficient merge: streams weights from component checkpoints directly to
+    output shards without materializing the full model.
 
-    Args:
-        vision_model_path: Path to vision encoder config/weights and processor.
-        save_directory: Output directory for the merged checkpoint.
-        vlm_path: Optional path to a trained VLM checkpoint to load weights from.
-        load_vlm_components: Which components to load from ``vlm_path``.
-            A tuple/list/set containing any of:
-              - ``"language"``: LM backbone (model.layers, embed_tokens, norm, lm_head)
-              - ``"vision"``:   Vision encoder + projector weights
-              - ``"audio"``:    Audio encoder + projector weights
-            Defaults to ``("language", "vision")``.
-            Set to ``()`` or ``None`` to skip vlm_path loading entirely.
-        language_model_path: Path to the base language model.
-        audio_encoder_path: Path to the audio encoder.
-        image_downsample_size: Downsample ratio for image projector.
-        image_projector_type: Type of image projector.
-        audio_downsample_size: Downsample ratio for audio projector.
-        audio_projector_type: Type of audio projector.
-        audio_encoder_type: Type of audio encoder ("whisper" or "qwen3_audio").
+    Peak memory ≈ one output shard (~8GB) + small encoder weights.
     """
+    import gc
+    import math
+    from collections import OrderedDict, defaultdict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from transformers import AutoTokenizer, AutoProcessor
+    from safetensors.torch import save_file as safetensors_save_file
     from veomni.utils.constants import DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_PAD_TOKEN
+
+    SHARD_SIZE_BYTES = 8_000_000_000  # 8GB per output shard
 
     # Normalize load_vlm_components
     if load_vlm_components is None:
         load_vlm_components = set()
     else:
         load_vlm_components = set(load_vlm_components)
-    valid_components = {"language", "vision", "audio"}
-    invalid = load_vlm_components - valid_components
-    if invalid:
-        raise ValueError(f"Invalid load_vlm_components: {invalid}. Valid values: {valid_components}")
 
-    processor = AutoProcessor.from_pretrained(vision_model_path)
+    os.makedirs(save_directory, exist_ok=True)
 
-    print("正在加载语言模型的 Tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        language_model_path,
-        padding_side="right",
-        use_fast=True
-    )
-
-    # ---- Step 1: 构建模型结构，加载各 component 权重 ----
-    print("正在构建 Omni 模型结构...")
-    model = build_qwen3moe_omni_from_components(
+    # ---- Step 1: Build meta model to discover parameter names & shapes (zero memory) ----
+    print("构建 meta 模型获取参数结构...")
+    meta_model = build_qwen3moe_omni_from_components(
         foundation_config_path=language_model_path,
         foundation_weights_path=language_model_path,
         encoders={
@@ -382,7 +363,7 @@ def merge_component_models(
                 "model_path": audio_encoder_path,
             },
         },
-        init_device="cuda",
+        init_device="meta",
         torch_dtype="bfloat16",
         image_downsample_size=image_downsample_size,
         image_projector_type=image_projector_type,
@@ -390,138 +371,285 @@ def merge_component_models(
         audio_projector_type=audio_projector_type,
         audio_encoder_type=audio_encoder_type,
     )
+    omni_config = meta_model.omni_config
 
-    print(f"Built omni model: {type(model)}")
-    print(f"image_encoder: {type(model.image_encoder) if model.image_encoder is not None else None}")
-    print(f"audio_encoder: {type(model.audio_encoder) if model.audio_encoder is not None else None}")
+    # ---- Step 2: Tokenizer + vocab size ----
+    processor = AutoProcessor.from_pretrained(vision_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(language_model_path, padding_side="right", use_fast=True)
 
-    # ---- Step 2: 从已训练的 VLM checkpoint 按需加载权重 ----
-    explicit_weights_to_load = {}
-
-    if vlm_path and load_vlm_components:
-        print(f"正在从 VLM checkpoint 加载 {load_vlm_components}: {vlm_path}")
-
-        lm_weight_prefixes = (
-            "model.layers.",
-            "model.embed_tokens.",
-            "model.norm.",
-            "lm_head.",
-        )
-        vision_prefix = ("model.vision_tower.vision_tower.",)
-        projector_key_mapping = {
-            "model.mm_projector.mlp.0.bias": "image_encoder.mm_projector.mlp.0.bias",
-            "model.mm_projector.mlp.0.weight": "image_encoder.mm_projector.mlp.0.weight",
-            "model.mm_projector.mlp.2.bias": "image_encoder.mm_projector.mlp.2.bias",
-            "model.mm_projector.mlp.2.weight": "image_encoder.mm_projector.mlp.2.weight",
-        }
-        audio_prefixes = ("audio_encoder.",)
-
-        weight_files = glob.glob(os.path.join(vlm_path, "*.safetensors"))
-        if not weight_files:
-            weight_files = glob.glob(os.path.join(vlm_path, "pytorch_model*.bin"))
-
-        for w_file in weight_files:
-            if w_file.endswith(".safetensors"):
-                state_dict = load_file(w_file)
-            else:
-                state_dict = torch.load(w_file, map_location="cpu")
-
-            for key, tensor in state_dict.items():
-                # Vision: projector key remapping + vision encoder weights
-                if "vision" in load_vlm_components:
-                    if key in projector_key_mapping:
-                        new_key = projector_key_mapping[key]
-                        explicit_weights_to_load[new_key] = tensor
-                        print(f"  Projector: {key} -> {new_key}")
-                    elif key.startswith(vision_prefix) or key.startswith("image_encoder."):
-                        new_key = key.replace("model.vision_tower.vision_tower.", "image_encoder.")
-                        explicit_weights_to_load[new_key] = tensor
-
-                # Language: LM backbone weights
-                if "language" in load_vlm_components:
-                    if key.startswith(lm_weight_prefixes):
-                        explicit_weights_to_load[key] = tensor
-
-                # Audio: audio encoder weights
-                if "audio" in load_vlm_components:
-                    if key.startswith(audio_prefixes):
-                        explicit_weights_to_load[key] = tensor
-
-        print(f"从 VLM 加载了 {len(explicit_weights_to_load)} 个权重 (components: {load_vlm_components})")
-
-    # ---- Step 3: 添加 special tokens，resize embeddings ----
     special_tokens_dict = [DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN, DEFAULT_AUDIO_PAD_TOKEN]
     num_new_tokens = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens_dict})
-    audio_token_id = tokenizer.convert_tokens_to_ids(DEFAULT_AUDIO_PAD_TOKEN)
-    print(f"audio pad token: {audio_token_id}")
-    print(f"Tokenizer 新增了 {num_new_tokens} 个 token，当前词表总大小: {len(tokenizer)}")
-    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+    print(f"Tokenizer 新增 {num_new_tokens} token，词表大小: {len(tokenizer)}")
 
-    # ---- Step 4: 注入 VLM 权重，处理 vocab size 对齐 ----
-    if explicit_weights_to_load:
-        for key in ["model.embed_tokens.weight", "lm_head.weight"]:
-            if key in explicit_weights_to_load:
-                ckpt_tensor = explicit_weights_to_load[key]
-                base_tensor = (model.model.embed_tokens.weight.data.clone()
-                               if "embed_tokens" in key else model.lm_head.weight.data.clone())
-                ckpt_vocab_size = ckpt_tensor.shape[0]
-                model_vocab_size = base_tensor.shape[0]
+    # Compute target vocab size (pad to multiple of 64)
+    target_vocab_size = int(math.ceil(len(tokenizer) / 64.0)) * 64
 
-                if ckpt_vocab_size != model_vocab_size:
-                    max_vocab_size = max(ckpt_vocab_size, model_vocab_size)
-                    hidden_size = base_tensor.shape[1]
-                    print(f"对齐 {key}: ckpt({ckpt_vocab_size}) vs model({model_vocab_size}) -> {max_vocab_size}")
-                    new_tensor = torch.zeros(max_vocab_size, hidden_size, dtype=base_tensor.dtype, device=base_tensor.device)
-                    new_tensor[:model_vocab_size, :] = base_tensor
-                    new_tensor[:ckpt_vocab_size, :] = ckpt_tensor
-                    explicit_weights_to_load[key] = new_tensor
+    # Resize meta model embeddings to get correct param shapes
+    meta_model.resize_token_embeddings(target_vocab_size, pad_to_multiple_of=64)
 
-        # Resize if needed
-        for key in ["model.embed_tokens.weight", "lm_head.weight"]:
-            if key in explicit_weights_to_load:
-                target_vocab_size = explicit_weights_to_load[key].shape[0]
-                current_vocab_size = model.model.embed_tokens.weight.shape[0]
-                if target_vocab_size != current_vocab_size:
-                    print(f"Resize model embeddings: {current_vocab_size} -> {target_vocab_size}")
-                    model.resize_token_embeddings(target_vocab_size)
-                break
+    # Collect all param names and shapes from meta model
+    param_info = {}  # {name: (shape, dtype, nbytes)}
+    for name, param in meta_model.named_parameters():
+        shape = tuple(param.shape)
+        dtype = param.dtype
+        nbytes = param.numel() * param.element_size()
+        param_info[name] = (shape, dtype, nbytes)
 
-        print(f"共 {len(explicit_weights_to_load)} 个权重张量，注入模型...")
-        missing_keys, unexpected_keys = model.load_state_dict(explicit_weights_to_load, strict=False)
-        # Filter missing keys: only warn about components that were supposed to be loaded
-        expected_missing_prefixes = []
-        if "vision" not in load_vlm_components:
-            expected_missing_prefixes.append("image_encoder.")
-        if "audio" not in load_vlm_components:
-            expected_missing_prefixes.append("audio_encoder.")
-        if "language" not in load_vlm_components:
-            expected_missing_prefixes.extend(["model.", "lm_head."])
-        unexpected_missing = [
-            k for k in missing_keys
-            if not any(k.startswith(p) for p in expected_missing_prefixes)
-        ]
-        if unexpected_missing:
-            print(f"[WARNING] unexpected missing keys: {unexpected_missing[:20]}")
-        print("权重注入完成！")
+    print(f"模型共 {len(param_info)} 个参数，目标 vocab_size={target_vocab_size}")
+    del meta_model
+    gc.collect()
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"total_params={total_params:,} trainable_params={trainable_params:,}")
+    # ---- Step 3: Build source indexes (header-only, no tensor data) ----
+    def _build_source_index(model_path):
+        """Build {key: filepath} from safetensors headers."""
+        shard_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+        index = {}
+        for filepath in shard_files:
+            with safe_open(filepath, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    index[key] = filepath
+        return index
 
-    # ---- Step 5: 保存 ----
-    print(f"保存至: {save_directory}")
-    processor.save_pretrained(save_directory)
-    model.save_pretrained(save_directory, safe_serialization=True, max_shard_size="8GB")
+    print("索引源 checkpoint...")
+    foundation_index = _build_source_index(language_model_path)
+    vision_index = _build_source_index(vision_model_path)
+    audio_index = _build_source_index(audio_encoder_path)
+
+    # VLM index (if provided)
+    vlm_index = {}
+    if vlm_path and load_vlm_components:
+        vlm_index = _build_source_index(vlm_path)
+
+    print(f"  Foundation: {len(foundation_index)} keys")
+    print(f"  Vision: {len(vision_index)} keys")
+    print(f"  Audio: {len(audio_index)} keys")
+    if vlm_index:
+        print(f"  VLM: {len(vlm_index)} keys")
+
+    # ---- Step 4: Map each output param to its source ----
+    # Source types: "foundation", "vision", "audio", "vlm", "init"
+    param_source = {}  # {output_name: (source_type, source_key)}
+
+    # VLM key remapping tables
+    vlm_vision_prefix = "model.vision_tower.vision_tower."
+    vlm_projector_mapping = {
+        "model.mm_projector.mlp.0.bias": "image_encoder.mm_projector.mlp.0.bias",
+        "model.mm_projector.mlp.0.weight": "image_encoder.mm_projector.mlp.0.weight",
+        "model.mm_projector.mlp.2.bias": "image_encoder.mm_projector.mlp.2.bias",
+        "model.mm_projector.mlp.2.weight": "image_encoder.mm_projector.mlp.2.weight",
+    }
+    # Reverse: output_key -> vlm_source_key
+    vlm_projector_reverse = {v: k for k, v in vlm_projector_mapping.items()}
+
+    for name in param_info:
+        source_assigned = False
+
+        # Check VLM first (higher priority if specified)
+        if vlm_path and load_vlm_components:
+            # Language from VLM
+            if "language" in load_vlm_components and (
+                name.startswith("model.") or name.startswith("lm_head.")
+            ):
+                if name in vlm_index:
+                    param_source[name] = ("vlm", name)
+                    source_assigned = True
+
+            # Vision from VLM
+            if not source_assigned and "vision" in load_vlm_components and name.startswith("image_encoder."):
+                # Check projector remapping
+                if name in vlm_projector_reverse and vlm_projector_reverse[name] in vlm_index:
+                    param_source[name] = ("vlm", vlm_projector_reverse[name])
+                    source_assigned = True
+                else:
+                    # Try direct key or remapped key
+                    vlm_key = vlm_vision_prefix + name[len("image_encoder."):]
+                    if vlm_key in vlm_index:
+                        param_source[name] = ("vlm", vlm_key)
+                        source_assigned = True
+                    elif name in vlm_index:
+                        param_source[name] = ("vlm", name)
+                        source_assigned = True
+
+            # Audio from VLM
+            if not source_assigned and "audio" in load_vlm_components and name.startswith("audio_encoder."):
+                if name in vlm_index:
+                    param_source[name] = ("vlm", name)
+                    source_assigned = True
+
+        if source_assigned:
+            continue
+
+        # Default source mapping
+        if name.startswith("image_encoder."):
+            source_key = name[len("image_encoder."):]
+            if source_key in vision_index:
+                param_source[name] = ("vision", source_key)
+            else:
+                param_source[name] = ("init", name)
+        elif name.startswith("audio_encoder."):
+            source_key = name[len("audio_encoder."):]
+            if source_key in audio_index:
+                param_source[name] = ("audio", source_key)
+            else:
+                param_source[name] = ("init", name)
+        elif name in foundation_index:
+            param_source[name] = ("foundation", name)
+        else:
+            param_source[name] = ("init", name)
+
+    # Count sources
+    source_counts = defaultdict(int)
+    for src_type, _ in param_source.values():
+        source_counts[src_type] += 1
+    print(f"参数来源: {dict(source_counts)}")
+
+    # ---- Step 5: Plan output shards ----
+    output_keys_ordered = list(param_info.keys())
+    shards = []
+    current_shard = []
+    current_size = 0
+    for name in output_keys_ordered:
+        _, _, nbytes = param_info[name]
+        if current_shard and current_size + nbytes > SHARD_SIZE_BYTES:
+            shards.append(current_shard)
+            current_shard = []
+            current_size = 0
+        current_shard.append(name)
+        current_size += nbytes
+    if current_shard:
+        shards.append(current_shard)
+    print(f"输出 shard 数: {len(shards)}")
+
+    # ---- Step 6: Helper to load tensors from sources ----
+
+    def _load_batch_from_source(keys_with_source):
+        """Load multiple tensors batched by file for efficiency."""
+        file_to_entries = defaultdict(list)
+        for output_name, source_type, source_key in keys_with_source:
+            if source_type == "foundation":
+                filepath = foundation_index[source_key]
+            elif source_type == "vision":
+                filepath = vision_index[source_key]
+            elif source_type == "audio":
+                filepath = audio_index[source_key]
+            elif source_type == "vlm":
+                filepath = vlm_index[source_key]
+            else:
+                continue
+            file_to_entries[filepath].append((output_name, source_key))
+
+        result = {}
+
+        def _read_file(filepath, entries):
+            tensors = {}
+            with safe_open(filepath, framework="pt", device="cpu") as f:
+                for output_name, source_key in entries:
+                    tensors[output_name] = f.get_tensor(source_key)
+            return tensors
+
+        if len(file_to_entries) <= 1:
+            for filepath, entries in file_to_entries.items():
+                result.update(_read_file(filepath, entries))
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(file_to_entries))) as executor:
+                futures = {
+                    executor.submit(_read_file, fp, entries): fp
+                    for fp, entries in file_to_entries.items()
+                }
+                for future in as_completed(futures):
+                    result.update(future.result())
+
+        return result
+
+    # ---- Step 7: Write each shard ----
+    from tqdm import tqdm
+
+    weight_map = {}
+    total_size = 0
+
+    for shard_idx, shard_keys in enumerate(tqdm(shards, desc="Writing shards")):
+        if len(shards) == 1:
+            shard_filename = "model.safetensors"
+        else:
+            shard_filename = f"model-{shard_idx + 1:05d}-of-{len(shards):05d}.safetensors"
+
+        # Separate keys by source type
+        keys_to_load = []  # (output_name, source_type, source_key)
+        keys_to_init = []  # output_name
+
+        for name in shard_keys:
+            src_type, src_key = param_source[name]
+            if src_type == "init":
+                keys_to_init.append(name)
+            else:
+                keys_to_load.append((name, src_type, src_key))
+
+        # Batch load from source files
+        loaded = _load_batch_from_source(keys_to_load)
+
+        # Assemble shard
+        shard_state_dict = OrderedDict()
+        for name in shard_keys:
+            target_shape, target_dtype, _ = param_info[name]
+
+            if name in loaded:
+                tensor = loaded[name].to(target_dtype)
+                # Handle vocab size mismatch (embed_tokens, lm_head)
+                if tensor.shape != target_shape:
+                    if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                        padded = torch.zeros(target_shape, dtype=target_dtype)
+                        min_vocab = min(tensor.shape[0], target_shape[0])
+                        padded[:min_vocab] = tensor[:min_vocab]
+                        tensor = padded
+                    else:
+                        print(f"[WARNING] Shape mismatch: {name}: source {tensor.shape} vs target {target_shape}")
+                shard_state_dict[name] = tensor
+            else:
+                # Random init for projectors etc.
+                shard_state_dict[name] = torch.randn(target_shape, dtype=target_dtype) * 0.02
+
+            weight_map[name] = shard_filename
+
+        del loaded
+        gc.collect()
+
+        # Compute total size
+        for tensor in shard_state_dict.values():
+            total_size += tensor.numel() * tensor.element_size()
+
+        # Save shard
+        safetensors_save_file(shard_state_dict, os.path.join(save_directory, shard_filename))
+        del shard_state_dict
+        gc.collect()
+        print(f"  Saved {shard_filename} ({len(shard_keys)} tensors)")
+
+    # ---- Step 8: Write index + metadata ----
+    if len(shards) > 1:
+        import json as _json
+        index_data = {
+            "metadata": {"total_size": total_size},
+            "weight_map": weight_map,
+        }
+        index_path = os.path.join(save_directory, "model.safetensors.index.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            _json.dump(index_data, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    # Save config, tokenizer, processor
+    omni_config.save_pretrained(save_directory)
     tokenizer.save_pretrained(save_directory)
-    print("模型保存完成！")
+    processor.save_pretrained(save_directory)
+
+    total_params = sum(shape[0] * (shape[1] if len(shape) > 1 else 1) for shape, _, _ in param_info.values())
+    print(f"Done! total_params≈{total_params:,}, saved to {save_directory}")
 
 
 
 if __name__ == "__main__":
-    vision_path = "/mnt/afs/share/Qwen38_27B_vision_encoder"
+    vision_path = "/mnt/afs/share/Qwen35_A3B_vision_encoder"
 
     vlm_path = "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/0513_llavaomni_30A3B_qwen35encoder_puretext_lr1e4/checkpoints/hf_ckpt"
-    save_directory = "/mnt/afs/share/llava_qwen30A3B_qwen38encoder_qwen3audio_gametext"
+    save_directory = "/mnt/afs/share/llava_qwen235A22B_qwen35encoder_qwen3audio"
 
     # load_vlm_components 控制从 vlm_path 加载哪些部分:
     #   ("language", "vision")       - 只加载 LM + vision (默认)
@@ -531,9 +659,9 @@ if __name__ == "__main__":
     merge_component_models(
         vision_path,
         save_directory,
-        vlm_path=vlm_path,
+        vlm_path=None,
         load_vlm_components=("language",),
-        language_model_path="/mnt/afs/share/Qwen3-30B-A3B-Instruct-2507-veomni-merge",
+        language_model_path="/mnt/afs/share/Qwen3-235B-A22B-Instruct-2507-veomni",
         audio_encoder_path="/mnt/afs/share/Qwen3-Omni-AudioTransformer",
         image_downsample_size=4,
         image_projector_type="dynamic_avgpool",
