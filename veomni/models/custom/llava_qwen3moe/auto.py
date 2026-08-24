@@ -637,8 +637,9 @@ def merge_component_models(
 
     # Save config, tokenizer, processor
     omni_config.save_pretrained(save_directory)
-    tokenizer.save_pretrained(save_directory)
+    
     processor.save_pretrained(save_directory)
+    tokenizer.save_pretrained(save_directory)  # must be AFTER processor to avoid being overwritten
 
     total_params = sum(shape[0] * (shape[1] if len(shape) > 1 else 1) for shape, _, _ in param_info.values())
     print(f"Done! total_params≈{total_params:,}, saved to {save_directory}")
