@@ -49,6 +49,8 @@ def get_device_flops(unit="T"):
         flops = 354e12
     elif "B200" in device_name:
         flops = 2250e12
+    elif "BW1000_H" in device_name:
+        flops = 480e12
     flops_unit = unit_convert(flops, unit)
     return flops_unit
 
@@ -198,9 +200,10 @@ class VeomniFlopsCounter:
         # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # nn.Embedding is a table lookup with no matmul FLOPs; only lm_head contributes.
+        lm_head_N = vocab_size * hidden_size
         # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * moe_N * tokens_sum
 
@@ -628,7 +631,8 @@ class VeomniFlopsCounter:
         # per layer params
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # nn.Embedding is a table lookup with no matmul FLOPs; only lm_head contributes.
+        lm_head_N = vocab_size * hidden_size
 
         # FLOPs系数
         if gradient_checkpointing:
@@ -641,10 +645,10 @@ class VeomniFlopsCounter:
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * num_hidden_layers
         dense_N_flops = linear_factor * dense_N * tokens_sum
-        # embedding & lm_head (不在GC范围内)
+        # lm_head (不在GC范围内)
         emb_factor = 2 if freeze_llm else 6
-        emb_flops = emb_factor * emd_and_lm_head_N * tokens_sum
-        dense_N_flops += emb_flops
+        lm_head_flops = emb_factor * lm_head_N * tokens_sum
+        dense_N_flops += lm_head_flops
 
         # attn all_layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
@@ -833,12 +837,14 @@ class VeomniFlopsCounter:
 
         # MoE FFN：只有被激活的 expert 参与计算
         # 每个 token 激活 num_experts_per_tok 个 expert
+        num_experts = getattr(llm_config, "num_local_experts", getattr(llm_config, "num_experts", 0))
+        moe_router_N = hidden_size * num_experts
         moe_ffn_N_per_token = hidden_size * moe_intermediate_size * 3 * num_experts_per_tok
         # shared expert 每个 token 都要过
         shared_ffn_N = hidden_size * shared_expert_intermediate_size * 3 if shared_expert_intermediate_size > 0 else 0
 
-        # embedding + lm_head
-        emb_and_lm_head_N = vocab_size * hidden_size * 2
+        # nn.Embedding is a table lookup with no matmul FLOPs; only lm_head contributes.
+        lm_head_N = vocab_size * hidden_size
 
         # FLOPs系数:
         # - linear部分: frozen+GC = 6x (2fwd + 2recomp + 2act_grad), trainable+GC = 8x, trainable无GC = 6x
@@ -853,13 +859,13 @@ class VeomniFlopsCounter:
 
         # attn linear
         attn_linear_flops = linear_factor * attn_linear_N * num_hidden_layers * tokens_sum
-        # moe ffn（按激活参数量算，不是总参数量）
-        moe_ffn_flops = linear_factor * (moe_ffn_N_per_token + shared_ffn_N) * num_hidden_layers * tokens_sum
-        # embedding & lm_head (不在GC范围内，frozen时只有forward=2x)
+        # moe ffn（按激活参数量算，不是总参数量）+ router gate
+        moe_ffn_flops = linear_factor * (moe_router_N + moe_ffn_N_per_token + shared_ffn_N) * num_hidden_layers * tokens_sum
+        # lm_head (不在GC范围内，frozen时只有forward=2x)
         emb_factor = 2 if freeze_llm else 6
-        emb_flops = emb_factor * emb_and_lm_head_N * tokens_sum
+        lm_head_flops = emb_factor * lm_head_N * tokens_sum
 
-        dense_flops = attn_linear_flops + moe_ffn_flops + emb_flops
+        dense_flops = attn_linear_flops + moe_ffn_flops + lm_head_flops
 
         # attention qkv flops（与序列长度平方相关）
         seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -939,9 +945,10 @@ class VeomniFlopsCounter:
         # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # nn.Embedding is a table lookup with no matmul FLOPs; only lm_head contributes.
+        lm_head_N = vocab_size * hidden_size
         # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops
         dense_N_flops = 6 * moe_N * tokens_sum
         # attn all_layer & all_token fwd & bwd flops
