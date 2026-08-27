@@ -354,7 +354,7 @@ For a complete working example of how preprocessors integrate into the training 
    - Launches distributed training with torchrun
 
 **2. Training Script**: [tasks/train_vlm.py](../../tasks/train_vlm.py)
-   - [data/multimodal/data_transform.py](../../veomni/data/multimodal/data_transform.py) Imports `conv_preprocess` from the preprocessor registry
+   - [data/data_transform.py](../../veomni/data/data_transform.py) imports `conv_preprocess` from [data/multimodal](../../veomni/data/multimodal/__init__.py), which re-exports it from the module that owns the preprocessor registry
    - Each transform function defines `process_sample()` function that:
      - Calls `conv_preprocess()` at to apply the registered preprocessor
      - Handles image processing and tokenization
@@ -374,7 +374,7 @@ For a complete working example of how preprocessors integrate into the training 
 ```
 Config (qwen2_vl.yaml)
   └─> source_name: sharegpt4v_pretrain
-       └─> Training Script (train_qwen2_vl.py)
+       └─> Training Script (train_vlm.py)
             └─> process_sample() calls conv_preprocess("sharegpt4v_pretrain", ...)
                  └─> Registry looks up sharegpt4v_pretrain_preprocess()
                       └─> Preprocessor (preprocess.py) transforms raw data

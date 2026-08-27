@@ -27,12 +27,17 @@ get_started/installation/install_ascend_arm.md
 
 usage/arguments.md
 usage/basic_modules.md
+usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
+usage/support_new_models/dit_model_guide.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/agent_workflow.md
+usage/hdfs_fuse_patch.md
+testing.md
 ```
 
 ```{toctree}
@@ -40,6 +45,14 @@ usage/trainer.md
 :caption: Hardware Support
 
 hardware_support/get_started_npu.md
+hardware_support/typical_usage.md
+hardware_support/npu_variables.md
+hardware_support/precision_analysis.md
+hardware_support/profiling_analysis.md
+hardware_support/AscendDockerUsage/build_a2_docker.md
+hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/FAQ.md
+hardware_support/rocm/README.md
 ```
 
 ```{toctree}
@@ -51,7 +64,12 @@ examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
+examples/qwen3_omni_offline_av.md
 examples/wan2.1.md
+examples/wan2.1_I2V_1.3B.md
+examples/ltx-2.3.md
+examples/qwen3_dpo.md
+examples/seed_oss.md
 ```
 
 ```{toctree}
@@ -61,7 +79,9 @@ examples/wan2.1.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/extra_parallel.md
 key_features/ulysses.md
+key_features/lora.md
 
 ```
 
@@ -70,6 +90,11 @@ key_features/ulysses.md
 :caption: Design
 
 design/kernel_selection.md
+design/fused_moe_kernels.md
+design/local_parallel_state.md
+design/patchgen.md
+design/unified_kernel_registry.md
+design/verl_topk_distill_integration.md
 ```
 
 ```{toctree}

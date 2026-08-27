@@ -54,7 +54,6 @@ train:
 
   vit_lr: 2.0e-4
   min_lr_rate: 0.5
-  enable_mixed_precision: false
   gc_steps: 200
   empty_cache_steps: 200
   logging_steps: 2            # 每步都打印，方便观察吞吐
@@ -71,7 +70,6 @@ train:
     enable_async: false
     fsdp_config:
       fsdp_mode: fsdp2
-      full_shard: true
       reshard_after_forward: true
       reshard_after_backward: true
       offload: false

@@ -4,6 +4,17 @@
 
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
+> **Scope note:** VeOmni now ships patchgen-generated modeling files under
+> `veomni/models/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
+> patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
+> are unchanged; what has changed is *where* the patches are declared
+> (declarative patchgen config emitted into `generated/`) rather than applied
+> at import time. See
+> [the patchgen design guide](../../design/patchgen.md) and
+> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+
 ---
 
 ## P1. Fix `tie_word_embeddings` (Config)
@@ -129,8 +140,8 @@ sp_enabled = self.training and get_parallel_state().sp_enabled
 sp_group = get_parallel_state().sp_group if sp_enabled else None
 
 if sp_enabled:
-    inputs_embeds = gather_seq_scatter_heads(
-        inputs_embeds, seq_dim=1, head_dim=2, group=sp_group
+    inputs_embeds = gather_outputs(
+        inputs_embeds, gather_dim=1, group=sp_group
     )
 
 # Step 2: Same transform on image/video/audio embeddings, then fill back
@@ -138,8 +149,8 @@ if pixel_values is not None:
     image_embeds = self.get_image_features(pixel_values, image_grid_thw)
     if sp_enabled:
         # (seq//sp, hidden) → (seq, hidden//sp)
-        image_embeds = gather_seq_scatter_heads(
-            image_embeds, seq_dim=0, head_dim=-1, group=sp_group
+        image_embeds = gather_outputs(
+            image_embeds, gather_dim=0, group=sp_group
         )
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 # repeat for video, audio...
@@ -147,8 +158,8 @@ if pixel_values is not None:
 # Step 3: Restore SP layout
 # (bs, seq, hidden//sp) → (bs, seq//sp, hidden)
 if sp_enabled:
-    inputs_embeds = gather_heads_scatter_seq(
-        inputs_embeds, head_dim=2, seq_dim=1, group=sp_group
+    inputs_embeds = slice_input_tensor(
+        inputs_embeds, dim=1, group=sp_group
     )
 ```
 
@@ -296,7 +307,7 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 Replace the model's built-in CE loss with `ForCausalLMLoss` to get Liger/fused kernel selection and correct SP loss reduction:
 
 ```python
-from ....ops.fused_cross_entropy import ForCausalLMLoss
+from ....ops.kernels.cross_entropy import ForCausalLMLoss
 
 if labels is not None:
     loss, logits = ForCausalLMLoss(
@@ -480,7 +491,7 @@ Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [te
 Run:
 ```bash
 source .venv/bin/activate
-CI_MODEL_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
+CI_HF_MODELS_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
 pytest -s tests/e2e/test_e2e_training.py -k your_model
 ```
 

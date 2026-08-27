@@ -4,6 +4,16 @@
 
 This document walks through the specific patches applied to integrate **Qwen3-VL MoE** into VeOmni. It is a concrete example of the patterns described in [guide_and_checklist.md](./guide_and_checklist.md), covering FSDP, Sequence Parallelism, Expert Parallelism, and model registration.
 
+> **Scope note:** VeOmni now ships patchgen-generated modeling files under
+> `veomni/models/transformers/<model>/generated/`, so the actual code lives in
+> [veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
+> rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
+> patterns (FSDP dummy forward, SP slicing, fused MoE, EP plan) are unchanged;
+> what has changed is *where* the patches are declared (in the patchgen config
+> and emitted into `generated/`) rather than applied at import time. See
+> [the patchgen design guide](../../design/patchgen.md) and
+> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+
 ---
 
 ## 1. FSDP: Dummy ViT Forward
@@ -122,8 +132,8 @@ After ViT processing, image embeddings must be scattered into the correct positi
 ```python
 if get_parallel_state().sp_enabled:
     # (batch, seq//sp, hidden) → (batch, seq, hidden//sp)
-    inputs_embeds = gather_seq_scatter_heads(
-        inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
+    inputs_embeds = gather_outputs(
+        inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group
     )
 ```
 
@@ -131,8 +141,8 @@ if get_parallel_state().sp_enabled:
 ```python
 if get_parallel_state().sp_enabled:
     # (seq//sp, hidden) → (seq, hidden//sp)
-    image_embeds = gather_seq_scatter_heads(
-        image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
+    image_embeds = gather_outputs(
+        image_embeds, gather_dim=0, group=get_parallel_state().sp_group
     )
 ```
 
@@ -147,8 +157,8 @@ inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 ```python
 if get_parallel_state().sp_enabled:
     # (batch, seq, hidden//sp) → (batch, seq//sp, hidden)
-    inputs_embeds = gather_heads_scatter_seq(
-        inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+    inputs_embeds = slice_input_tensor(
+        inputs_embeds, dim=1, group=get_parallel_state().sp_group
     )
 ```
 
@@ -205,7 +215,7 @@ def get_parallel_plan():
         "model.language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
         "model.language_model.layers.*.mlp.experts.down_proj": Shard(0),
     }
-    return ParallelPlan(ep_plan=ep_plan)
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 ```
 
 ### 3.2 Fused MoE Forward

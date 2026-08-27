@@ -60,6 +60,9 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
         save_async: Optional[bool],
         global_steps: Optional[int],
+        trainable_only: bool = False,
+        save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ):
         return
 
@@ -68,19 +71,26 @@ class CheckpointerBase(ABC):
         cls,
         path: str,
         state: Dict[str, Any],
+        trainable_only: bool = False,
+        parallel_state=None,
     ):
+        return
+
+    @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until any in-flight async save completes.
+
+        Default: no-op for backends that do not support async saves.
+        Backends with async support (e.g. DCP) override this.
+        """
         return
 
 
 @CHECKPOINTER_REGISTRY.register("dcp")
 def dcp_checkpointer(dist_backend: str):
-    from ..utils.import_utils import is_torch_version_greater_than
-
-    if not is_torch_version_greater_than("2.4"):
-        raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
-    if dist_backend not in ["ddp", "fsdp1", "fsdp2"]:
+    if dist_backend not in ["ddp", "fsdp2"]:
         raise ValueError(
-            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp1, fsdp2"
+            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp2"
         )
     from .dcp_checkpointer import DistributedCheckpointer
 
@@ -89,10 +99,6 @@ def dcp_checkpointer(dist_backend: str):
 
 @CHECKPOINT_TO_STATE_DICT_REGISTRY.register("dcp")
 def dcp_ckpt_to_state_dict(save_checkpoint_path: Union[str, os.PathLike], **kwargs):
-    from ..utils.import_utils import is_torch_version_greater_than
-
-    if not is_torch_version_greater_than("2.4"):
-        raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
     from .dcp_checkpointer import dcp_to_torch_state_dict
 
     return dcp_to_torch_state_dict(save_checkpoint_path)

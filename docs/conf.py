@@ -5,13 +5,13 @@ import sys
 sys.path.insert(0, os.path.abspath("../.."))
 
 # -- Project information -----------------------------------------------------
-version_file = "../veomni/__init__.py"
+version_file = "../veomni/_version.py"
 with open(version_file, encoding="utf-8") as f:
     try:
         version_line = next(line for line in f if line.startswith("__version__"))
         __version__ = version_line.split("=")[1].strip().strip("'\"")
-    except (StopIteration, IndexError):
-        raise RuntimeError("Unable to find version string.")
+    except (StopIteration, IndexError) as e:
+        raise RuntimeError("Unable to find version string.") from e
 
 project = "VeOmni"
 copyright = "2025 ByteDance Seed Foundation MLSys Team"

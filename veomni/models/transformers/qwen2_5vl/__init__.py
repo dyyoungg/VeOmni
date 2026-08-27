@@ -17,18 +17,17 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_vl")
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_vl_text")
 def register_qwen2_5_vl_config():
-    from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, apply_veomni_qwen25_vl_patch
-
-    apply_veomni_qwen25_vl_patch()
+    from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 
     return Qwen2_5_VLConfig
 
 
 @MODELING_REGISTRY.register("qwen2_5_vl")
 def register_qwen2_5_vl_modeling(architecture: str):
-    from .modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel, apply_veomni_qwen25_vl_patch
-
-    apply_veomni_qwen25_vl_patch()
+    from .generated.patched_modeling_qwen2_5_vl_gpu import (
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5_VLModel,
+    )
 
     if "ForConditionalGeneration" in architecture:
         return Qwen2_5_VLForConditionalGeneration

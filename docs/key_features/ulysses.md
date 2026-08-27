@@ -24,7 +24,7 @@ Reference Paper: [DeepSpeed Ulysses: System Optimizations for Enabling Training 
 To enable Ulysses, users can specify the `accelerator.ulysses_size` parameter in the configuration file or the launch command:
 
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
     --train.accelerator.ulysses_size 4
@@ -202,7 +202,8 @@ After the collator, the model receives:
 ### Softmax Attention (Flash Attention) SP Flow
 
 For standard softmax attention layers (e.g., `Qwen3_5Attention`), Ulysses SP is handled
-**internally** by `flash_attention_forward` in `veomni/ops/flash_attn/__init__.py`.
+**internally** by `flash_attention_forward` in
+`veomni/ops/kernels/attention/__init__.py`.
 
 The flow through a softmax attention layer:
 
@@ -344,7 +345,7 @@ To enable Async Ulysses, simply set the `accelerator.enable_async` parameter to 
 Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --train.accelerator.ulysses_size 4 \
     --train.accelerator.enable_async true
 ```

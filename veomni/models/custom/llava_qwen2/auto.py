@@ -17,8 +17,11 @@ from veomni.models.custom.vision_encoder.modeling_qwen35_vision_encoder import B
 from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-from veomni.models.transformers.qwen2.gpu_patch import apply_veomni_qwen2_gpu_patch
 from veomni.utils.logging import get_logger
+from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.auto import _bind_veomni_ops
+from veomni.ops import apply_ops_config
+from veomni.models.transformers.qwen2.generated import patched_modeling_qwen2_gpu as _patched_qwen2_module
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
     from transformers.initialization import no_init_weights
@@ -27,13 +30,30 @@ else:
 
 logger = get_logger(__name__)
 
+
 def _set_attn_implementation_in_config(config: PretrainedConfig, attn_implementation: str) -> None:
     # The custom omni wrapper forwards `config._attn_implementation` into submodules.
     setattr(config, "_attn_implementation", attn_implementation)
-    apply_veomni_qwen2_gpu_patch()
-    
-      
-        
+
+
+def _install_veomni_qwen2_ops(ops_implementation: OpsImplementationConfig) -> None:
+    """Modern replacement for the deleted ``apply_veomni_qwen2_gpu_patch``.
+
+    Old world: monkey-patched ``transformers.models.qwen2.modeling_qwen2`` at
+    runtime (RMSNorm / RoPE / SwiGLU / CE loss). New world:
+      1. ``apply_ops_config`` installs LOSS_MAPPING (CE kernel) + GLOBAL ops +
+         populates the ops-config singleton (idempotent — safe to call twice).
+      2. ``_bind_veomni_ops`` walks the patchgen'd modeling module and binds
+         each ``OpSlot`` (rms_norm / rotary_pos_emb / swiglu_mlp /
+         cross_entropy_loss) from the config; the OpSlot guards inside the
+         patched ``forward`` methods then route to the fused kernels.
+
+    The patchgen'd module must already be imported (it is — via
+    ``modeling_llava_qwen2``) so its module-level OpSlot globals exist.
+    """
+    apply_ops_config(ops_implementation)
+    _bind_veomni_ops(_patched_qwen2_module, ops_implementation)
+
 
 def _set_foundation_dtype_in_config(config: PretrainedConfig, torch_dtype: str) -> None:
     if torch_dtype == "bfloat16":
@@ -164,10 +184,10 @@ def build_llavaqwen2_omni_from_pretrained(
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     torch_dtype: Literal["bfloat16", "float32"] = "bfloat16",
     attn_implementation: str = "veomni_flash_attention_2_with_sp",
-    # moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     freeze_except_projectors: bool = False,
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> LlavaQwen2ForCausalLM:
     """
     Load a *composite* omni model directory created by `model.save_pretrained(...)`.
@@ -180,7 +200,13 @@ def build_llavaqwen2_omni_from_pretrained(
     parallel_state = get_parallel_state()
     global_rank = parallel_state.global_rank if parallel_state is not None else 0
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
-  
+
+    if ops_implementation is not None:
+        # Honour config-side attn_implementation (matches the ``build_foundation_model``
+        # semantics: the ops_implementation is the source of truth).
+        attn_implementation = ops_implementation.attn_implementation
+        _install_veomni_qwen2_ops(ops_implementation)
+
     _set_attn_implementation_in_config(omni_config.foundation_config, attn_implementation)
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
@@ -214,6 +240,7 @@ def build_qwen25_omni_from_components(
     audio_downsample_size: int = 10,
     audio_projector_type: str = "channel_upscale",
     audio_encoder_type: str = "whisper",
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> LlavaQwen2ForCausalLM:
     """
     Build the omni wrapper and load weights *separately*:
@@ -227,6 +254,10 @@ def build_qwen25_omni_from_components(
     parallel_state = get_parallel_state()
     global_rank = parallel_state.global_rank if parallel_state is not None else 0
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
+
+    if ops_implementation is not None:
+        attn_implementation = ops_implementation.attn_implementation
+        _install_veomni_qwen2_ops(ops_implementation)
 
     foundation_cfg = AutoConfig.from_pretrained(foundation_config_path, trust_remote_code=True)
     

@@ -15,7 +15,7 @@
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
-from abc import ABC
+from abc import ABC, abstractmethod
 
 import torch
 from transformers import (
@@ -25,6 +25,7 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
@@ -37,19 +38,12 @@ try:
 except ImportError:
     AutoModelForVision2Seq = AutoModelForImageTextToText
 
+from transformers.initialization import no_init_weights
+
 from ..utils import logging
 from ..utils.env import get_env
-from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from ..utils.registry import Registry
 from .module_utils import init_empty_weights, load_model_weights
-
-
-# `no_init_weights` was moved to `transformers.initialization` in:
-# https://github.com/huggingface/transformers/pull/42957
-if is_transformers_version_greater_or_equal_to("5.0.0"):
-    from transformers.initialization import no_init_weights
-else:
-    from transformers.modeling_utils import no_init_weights
 
 
 MODELING_REGISTRY = Registry("Modeling")
@@ -57,6 +51,18 @@ MODEL_CONFIG_REGISTRY = Registry("ModelConfig")
 MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 
 logger = logging.get_logger(__name__)
+
+
+def raise_unsupported_veomni_modeling(model_name: str) -> None:
+    # Gate for models whose VeOmni modeling path has NOT been ported to the
+    # patchgen/generated flow. ``get_model_class`` in this module short-circuits
+    # when MODELING_BACKEND=hf, so this function is only reached when the caller
+    # wants VeOmni's patched classes — fail loudly instead of returning a stub
+    # that would silently produce broken graphs.
+    raise RuntimeError(
+        f"{model_name} does not have a VeOmni modeling path. Set MODELING_BACKEND=hf "
+        f"to bypass VeOmni patches and load upstream HuggingFace classes directly."
+    )
 
 
 def get_model_config(config_path: str, **kwargs):
@@ -82,7 +88,9 @@ def get_model_config(config_path: str, **kwargs):
                 return config
         except Exception:  # load from veomni
             config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-            model_type = config_dict["model_type"]
+            model_type = (
+                config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
+            )  # diffusers use _class_name
             logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
             kwargs.pop("trust_remote_code", None)
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
@@ -147,6 +155,12 @@ def get_model_class(model_config: PretrainedConfig):
         load_class = AutoModelForCausalLM
     elif (
         arch_name is not None
+        and "ForTokenClassification" in arch_name
+        and type(model_config) in AutoModelForTokenClassification._model_mapping.keys()
+    ):
+        load_class = AutoModelForTokenClassification
+    elif (
+        arch_name is not None
         and "ForSequenceClassification" in arch_name
         and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
     ):
@@ -157,9 +171,11 @@ def get_model_class(model_config: PretrainedConfig):
 
 
 class BaseModelLoader(ABC):
+    @abstractmethod
     def __init__(self):
         pass
 
+    @abstractmethod
     def load_model(self, model_config, **kwargs):
         raise NotImplementedError
 
@@ -236,8 +252,22 @@ class CustomizedModelingLoader(BaseModelLoader):
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
 
-            # we should tie embeddings after loading weights because init_empty_weights() leads to untied weights,
-            if getattr(model.config, "tie_word_embeddings", True):
+            # init_empty_weights() leaves embeddings untied; re-tie only when
+            # the config asks for it. Nested multimodal layouts can disable tying
+            # on either side (InternVL on inner, Qwen3VLMoe on outer with inner
+            # silent), so AND both. Treat unset as True so a silent side does not
+            # override an explicit True, but require at least one side to set the
+            # flag -- if neither does, default to False (matches HF v5).
+            text_config = (
+                model.config.get_text_config(decoder=True)
+                if hasattr(model.config, "get_text_config")
+                else model.config
+            )
+            if (
+                (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings"))
+                and getattr(model.config, "tie_word_embeddings", True)
+                and getattr(text_config, "tie_word_embeddings", True)
+            ):
                 try:
                     input_embeddings = model.get_input_embeddings()
                     output_embeddings = model.get_output_embeddings()

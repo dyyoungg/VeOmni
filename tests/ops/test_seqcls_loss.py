@@ -1,7 +1,9 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 
-import veomni.ops.fused_cross_entropy as m
+import veomni.ops.kernels.cross_entropy as m
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type, get_torch_device
 
@@ -45,7 +47,7 @@ def test_seqcls_loss_logits_path_manual_handcalc(monkeypatch):
     labels = torch.tensor([[ignore, ignore, 2]])
 
     expected = _manual_ce_one_token(logits[0, 2], target=2)
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _aux = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=num_labels,
@@ -67,7 +69,6 @@ def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatc
         sp_enabled = False
     """
     monkeypatch.setattr(m, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
-    monkeypatch.setattr(m, "_cross_entropy", m.eager_cross_entropy)
 
     ignore = -100
     num_labels = 4
@@ -93,7 +94,7 @@ def test_seqcls_loss_hidden_states_weights_path_build_logits_and_loss(monkeypatc
     supervised_logits = torch.tensor([1.0, 1.0, 2.0, -1.0])
     expected = _manual_ce_one_token(supervised_logits, target=2)
 
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _aux = m.ForSequenceClassificationLoss(
         logits=None,
         labels=labels,
         num_labels=num_labels,
@@ -122,8 +123,10 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
       - loss is computed from (hidden_states, weights, labels) via fused linear cross-entropy.
         The passed-in `logits` is NOT used for loss computation in this fused path.
       - out_logits is the flattened *input* logits, because fused_liger_kernel_cross_entropy
-        returns `(loss, logits)` without materializing projected logits.
+        returns `(loss, logits, log_probs=None, entropy=None)` without materializing projected logits.
     """
+    from veomni.ops.kernels.cross_entropy.liger import fused_liger_kernel_cross_entropy
+
     dev_api = get_torch_device()
     local_rank = 0
     dev_api.set_device(f"{get_device_type()}:{local_rank}")
@@ -148,13 +151,14 @@ def test_seqcls_loss_prefers_cross_entropy_when_hidden_states_and_weights_presen
     logits = torch.randn((B, T, C), device=device, dtype=torch.float32)
     labels = torch.tensor([[ignore, 1]], device=device, dtype=torch.long)
 
-    loss, out_logits = m.ForSequenceClassificationLoss(
+    loss, out_logits, _aux = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=C,
         ignore_index=ignore,
         hidden_states=hidden_states,
         weights=weights,
+        cross_entropy_fn=fused_liger_kernel_cross_entropy,
     )
 
     proj = hidden_states.reshape(-1, H) @ weights.t()  # [B*T, C]
@@ -211,7 +215,7 @@ def test_seqcls_loss_sp_enabled_calls_reduce_with_correct_num_valid_tokens(monke
     e1 = _manual_ce_one_token(logits[0, 2], target=1)
     expected = (e0 + e1) / 2.0
 
-    loss, _ = m.ForSequenceClassificationLoss(
+    loss, _, _aux = m.ForSequenceClassificationLoss(
         logits=logits,
         labels=labels,
         num_labels=num_labels,
@@ -245,3 +249,44 @@ def test_seqcls_loss_assertions(monkeypatch):
     # logits and hidden_states both None -> assert
     with pytest.raises(ValueError, match="Either hidden_states or logits must be provided"):
         m.ForSequenceClassificationLoss(logits=None, labels=labels, num_labels=3)
+
+
+# ---------------------------------------------------------------------------
+# ReduceLoss zero-division guard (SP group all-padding scenario)
+# ---------------------------------------------------------------------------
+# When Ulysses SP splits a sequence and ALL ranks in a group receive only
+# padding (n_valid=0), ReduceLoss previously computed 0/0 = NaN.  The NaN
+# propagated through Liger element_mul_kernel and FSDP all-reduce, permanently
+# corrupting the model.  The fix returns zero loss / grad instead.
+# ---------------------------------------------------------------------------
+
+
+_RL_PREFIX = "veomni.distributed.sequence_parallel.loss"
+
+
+def _noop_all_reduce(tensor, group=None, **kwargs):
+    """Mock all_reduce as no-op (partner also has zero)."""
+    pass
+
+
+def test_reduce_loss_no_nan_when_sp_group_all_padding():
+    """ReduceLoss.forward+backward must return 0 (not NaN) when global tokens = 0."""
+    from veomni.distributed.sequence_parallel.loss import ReduceLoss
+
+    with (
+        patch(f"{_RL_PREFIX}.get_unified_sequence_parallel_group", return_value=MagicMock()),
+        patch(f"{_RL_PREFIX}.dist.get_world_size", return_value=2),
+        patch(f"{_RL_PREFIX}.dist.all_reduce", side_effect=_noop_all_reduce),
+    ):
+        x = torch.tensor(0.5, requires_grad=True)
+        loss = x * 1.0  # non-leaf, simulating CE output
+        n_valid = torch.tensor(0.0)
+
+        result = ReduceLoss.apply(loss, n_valid)
+        assert not torch.isnan(result), "forward returned NaN on global_num_tokens=0"
+        assert result.item() == 0.0
+
+        result.backward()
+        assert x.grad is not None
+        assert not torch.isnan(x.grad), "backward produced NaN grad on global_num_tokens=0"
+        assert x.grad.item() == 0.0

@@ -14,16 +14,16 @@
 
 
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
-
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
-from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
-import datetime
+from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from ..utils import logging
 from ..utils.device import get_device_type
@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 _PARALLEL_STATE: "ParallelState" = None
+
+# Cache of built parallel states keyed by full topology.
+_PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
+
+# Named registry of parallel states (independent of the topology cache).
+# This round every trainer registers under ``"base"``; multi-module names later.
+_PARALLEL_STATE_REGISTRY: Dict[str, "ParallelState"] = {}
 
 
 def requires_mesh(fn: Callable) -> Callable:
@@ -109,10 +116,14 @@ def _build_sp_cpu_gloo_group(sp_gpu_group: "ProcessGroup") -> Optional["ProcessG
     my_sp_ranks = sorted(
         [dist.get_global_rank(sp_gpu_group, r) for r in range(sp_size)]
     )
-    my_ranks_tensor = torch.tensor(my_sp_ranks, dtype=torch.long)
- 
+    # Use CUDA tensor for the all_gather — the default process group is NCCL
+    # which requires device tensors.  Using CPU tensors would rely on PyTorch
+    # auto-staging which is fragile on some setups.
+    device = torch.device(get_device_type(), int(os.getenv("LOCAL_RANK", "0")))
+    my_ranks_tensor = torch.tensor(my_sp_ranks, dtype=torch.long, device=device)
+
     # ── Step 2: all_gather so every rank knows all groups ────────────────────
-    all_ranks_tensors = [torch.zeros(sp_size, dtype=torch.long) for _ in range(world_size)]
+    all_ranks_tensors = [torch.zeros(sp_size, dtype=torch.long, device=device) for _ in range(world_size)]
     dist.all_gather(all_ranks_tensors, my_ranks_tensor)
  
     # ── Step 3: deduplicate group lists ──────────────────────────────────────
@@ -144,7 +155,7 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
-    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1"
+    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
@@ -152,11 +163,12 @@ class ParallelState:
     extra_parallel_sizes: Dict[str, int] = field(default_factory=lambda: {"ep": 1})
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
-    # ── CPU Gloo group mirroring the SP (ulysses) group ──────────────────────
-    # Used by the dataloader to verify data consistency across SP ranks without
-    # touching GPU resources.  Excluded from equality / hash comparisons because
-    # ProcessGroup objects are not reliably comparable.
-   
+    # CPU (gloo) mirror of the Ulysses SP group. Populated in ``__post_init__``
+    # when SP is enabled and ``ulysses_size > 1``; used by the dataloader (see
+    # ``get_ulysses_sequence_parallel_cpu_group``) to verify data consistency
+    # across SP ranks without touching GPU resources. Excluded from eq/hash —
+    # ``ProcessGroup`` isn't reliably comparable.
+    ulysses_cpu_group: Optional["ProcessGroup"] = field(default=None, compare=False, hash=False, repr=False)
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
@@ -173,69 +185,33 @@ class ParallelState:
                 f"The product of dp_replicate_size: {self.dp_replicate_size} and dp_shard_size: {self.dp_shard_size} should be equal to dp_size: {self.dp_size}."
             )
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import (
-                init_sequence_parallel,
-                set_context_parallel_group,
-                set_data_parallel_group,
-                set_ulysses_sequence_parallel_group,
-                set_unified_sequence_parallel_group,
-                set_ulysses_sequence_parallel_cpu_group
+        # SP / DP / CP process groups are NOT cached in module-level globals.
+        # Every ``sequence_parallel.comm`` getter resolves its group from the
+        # *current* ParallelState's device mesh (see ``dp_group`` / ``sp_group``
+        # / ``ulysses_group`` / ``cp_group`` below), so a per-module forward
+        # scoped by ``use_parallel_state`` automatically gets its own groups —
+        # even when sibling Omni modules run at different SP sizes. Meshless SP
+        # is therefore unsupported (a bare ``ParallelState(ulysses_size>1)`` with
+        # no mesh has no group to resolve).
+        if self.sp_enabled and self.device_mesh is None:
+            raise ValueError(
+                "A sequence-parallel ParallelState must be built with a device mesh "
+                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
             )
 
-            if self.device_mesh is not None:
-                set_data_parallel_group(self.device_mesh.get_group("dp"))
-                if self.ulysses_size > 1:
-                    ulysses_group = self.device_mesh.get_group("ulysses")
-                    set_ulysses_sequence_parallel_group(ulysses_group)
-                    set_ulysses_sequence_parallel_cpu_group(group=None, group_key="default")
-
-                    my_global_rank = dist.get_rank()
-                    my_ranks = sorted(dist.get_process_group_ranks(ulysses_group))
-                    print(f"rank: {my_global_rank}, local ulysses rank: {my_ranks}")
-                    my_ranks_tensor = torch.tensor(my_ranks, dtype=torch.long, device="cuda")
-                    
-                    world_size = dist.get_world_size()
-                    all_ranks_tensors = [torch.zeros_like(my_ranks_tensor) for _ in range(world_size)]
-                    dist.all_gather(all_ranks_tensors, my_ranks_tensor)
-                    
-                    seen = set()
-                    unique_groups = []
-                    for t in all_ranks_tensors:
-                        group_tuple = tuple(t.tolist())
-                        if group_tuple not in seen:
-                            seen.add(group_tuple)
-                            unique_groups.append(list(group_tuple))
-                    _KEEPALIVE_GLOO_GROUPS = []
-                    my_cpu_group = None
-                    for g_ranks in unique_groups:
-                        gloo_group = dist.new_group(
-                            ranks=g_ranks, 
-                            backend="gloo", 
-                            timeout=datetime.timedelta(seconds=120)
-                        )
-                        _KEEPALIVE_GLOO_GROUPS.append(gloo_group)
-                        if my_global_rank in g_ranks:
-                            my_cpu_group = gloo_group
-                    try:
-                        global _PERSISTENT_GROUPS 
-                        _PERSISTENT_GROUPS = _KEEPALIVE_GLOO_GROUPS
-                        set_ulysses_sequence_parallel_cpu_group(group=my_cpu_group, group_key="default")
-                        logger.info(f"rank {my_global_rank} success initialize data cpu sync group!!")
-                    except ImportError:
-                        logger.error("Failed to initialize data cpu sync group!!")
-
-                   
-                if self.cp_size > 1:
-                    set_context_parallel_group(self.device_mesh.get_group("cp"))
-                # set unified sequence parallel group
-                set_unified_sequence_parallel_group(self.device_mesh.get_group("sp"))
-            else:
-                init_sequence_parallel(
-                    ulysses_size=self.ulysses_size,
-                    sep_dp=True,
-                    ulysses_group_key="default",
-                    cp_size=self.cp_size,
+        # Build the CPU (gloo) mirror of the Ulysses group and attach it to this
+        # (frozen) state. Like ``ulysses_group``, it's scoped per-module by
+        # ``use_parallel_state``: each ParallelState carries its own CPU group,
+        # so heterogeneous per-module SP sizes each get an independent one.
+        if self.sp_enabled and self.ulysses_size > 1 and self.device_mesh is not None:
+            ulysses_group = self.device_mesh.get_group("ulysses")
+            cpu_group = _build_sp_cpu_gloo_group(ulysses_group)
+            # frozen dataclass — bypass immutability to store the built group.
+            object.__setattr__(self, "ulysses_cpu_group", cpu_group)
+            if cpu_group is not None:
+                logger.info(
+                    f"rank {dist.get_rank()} initialized Ulysses CPU (gloo) group "
+                    f"(ulysses_size={self.ulysses_size})"
                 )
 
     @property
@@ -259,27 +235,58 @@ class ParallelState:
         return 1
 
     # ------------------------------ DP ------------------------------ #
+    def _get_mesh_group(self, name: str, *fallbacks: str) -> Optional["ProcessGroup"]:
+        """Get a process group by flattened mesh dim name, with fallback.
+
+        ``_flatten`` on a single-dimension submesh is a no-op on some PyTorch
+        versions, so the flattened alias (e.g. "dp") may not be registered.
+        Fall back to the underlying base dim names in order.
+        """
+        for dim_name in (name, *fallbacks):
+            try:
+                return self.device_mesh.get_group(dim_name)
+            except KeyError:
+                continue
+        raise KeyError(
+            f"None of mesh dimensions {(name, *fallbacks)} exist on mesh "
+            f"with dims {self.device_mesh.mesh_dim_names}"
+        )
+
+    def _get_mesh_local_rank(self, name: str, *fallbacks: str) -> int:
+        """Get local rank by flattened mesh dim name, with fallback."""
+        for dim_name in (name, *fallbacks):
+            try:
+                return self.device_mesh.get_local_rank(dim_name)
+            except KeyError:
+                continue
+        raise KeyError(
+            f"None of mesh dimensions {(name, *fallbacks)} exist on mesh "
+            f"with dims {self.device_mesh.mesh_dim_names}"
+        )
+
+    def _get_submesh(self, name: str, *fallbacks: str) -> "DeviceMesh":
+        """Get a submesh by flattened mesh dim name, with fallback."""
+        for dim_name in (name, *fallbacks):
+            try:
+                return self.device_mesh[dim_name]
+            except KeyError:
+                continue
+        raise KeyError(
+            f"None of mesh dimensions {(name, *fallbacks)} exist on mesh "
+            f"with dims {self.device_mesh.mesh_dim_names}"
+        )
+
     @property
     def dp_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None:
-            return self.device_mesh.get_group("dp")
+            return self._get_mesh_group("dp", "dp_shard")
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_group
-
-            return get_data_parallel_group()
-
-        return self.fsdp_group
+        return None
 
     @property
     def dp_rank(self) -> int:
         if self.device_mesh is not None:
-            return self.device_mesh.get_local_rank("dp")
-
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_rank
-
-            return get_data_parallel_rank()
+            return self._get_mesh_local_rank("dp", "dp_shard")
 
         return self.fsdp_rank
 
@@ -287,7 +294,7 @@ class ParallelState:
     @requires_mesh
     def dp_mesh(self) -> "DeviceMesh":
         if self.device_mesh is not None:
-            return self.device_mesh["dp"]
+            return self._get_submesh("dp", "dp_shard")
 
         raise self.fsdp_mesh
 
@@ -323,6 +330,11 @@ class ParallelState:
             return self.device_mesh.get_group("dp_shard")
 
     @property
+    def dp_shard_sp_group(self) -> Optional["ProcessGroup"]:
+        if self.device_mesh is not None:
+            return self._get_mesh_group("dp_shard_sp", "dp_shard")
+
+    @property
     def dp_shard_rank(self) -> int:
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp_shard")
@@ -341,12 +353,12 @@ class ParallelState:
     @property
     def fsdp_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None:
-            return self.device_mesh.get_group("dp_sp")
+            return self._get_mesh_group("dp_sp", "dp_shard_sp", "dp_shard")
 
     @property
     def fsdp_rank(self) -> int:
         if self.device_mesh is not None:
-            return self.device_mesh.get_local_rank("dp_sp")
+            return self._get_mesh_local_rank("dp_sp", "dp_shard_sp", "dp_shard")
 
         return self.global_rank
 
@@ -368,11 +380,11 @@ class ParallelState:
                 return self.device_mesh["dp_replicate"]
         # FSDP
         elif self.dp_shard_sp_enabled:
-            return self.device_mesh["dp_shard_sp"]
+            return self._get_submesh("dp_shard_sp")
         elif self.dp_shard_enabled:
             return self.device_mesh["dp_shard"]
         else:
-            return self.device_mesh["dp"]
+            return self._get_submesh("dp", "dp_shard")
 
     @property
     def fsdp_enabled(self) -> bool:
@@ -442,6 +454,10 @@ class ParallelState:
         return self.extra_parallel_enabled("ep")
 
     @property
+    def ep_size(self) -> int:
+        return self.extra_parallel_sizes["ep"]
+
+    @property
     def ep_rank(self) -> int:
         return self.extra_parallel_rank("ep")
 
@@ -498,25 +514,15 @@ class ParallelState:
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
-            return self.device_mesh.get_group("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_group
-
-            return get_unified_sequence_parallel_group()
+        if self.device_mesh is not None and self.sp_enabled:
+            return self._get_mesh_group("sp", "ulysses", "cp")
 
         return None
 
     @property
     def sp_rank(self) -> int:
-        if self.device_mesh is not None:
-            return self.device_mesh.get_local_rank("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_rank
-
-            return get_unified_sequence_parallel_rank()
+        if self.device_mesh is not None and self.sp_enabled:
+            return self._get_mesh_local_rank("sp", "ulysses", "cp")
 
         return -1
 
@@ -530,25 +536,15 @@ class ParallelState:
 
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_group("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_group
-
-            return get_ulysses_sequence_parallel_group()
 
         return None
 
     @property
     def ulysses_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_local_rank("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_rank
-
-            return get_ulysses_sequence_parallel_rank()
 
         return -1
 
@@ -558,31 +554,43 @@ class ParallelState:
 
     @property
     def cp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_group("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_group
-
-            return get_context_parallel_group()
 
         return None
 
     @property
     def cp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_local_rank("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_rank
-
-            return get_context_parallel_rank()
 
         return -1
 
     @property
     def cp_enabled(self) -> bool:
         return self.cp_size > 1
+
+
+def clear_parallel_state() -> None:
+    """
+    Drop the ambient state, topology cache, and named registry.
+
+    Call after ``destroy_process_group()`` (or in test teardown) so a later
+    ``init_parallel_state`` with the same topology cannot reuse DeviceMesh /
+    process groups from a destroyed distributed session.
+    """
+    global _PARALLEL_STATE
+    _PARALLEL_STATE = None
+    _PARALLEL_STATE_CACHE.clear()
+    _PARALLEL_STATE_REGISTRY.clear()
+
+
+def get_parallel_state_by_name(name: str) -> "ParallelState":
+    """Look up a registered parallel state by module name."""
+    if name not in _PARALLEL_STATE_REGISTRY:
+        registered = sorted(_PARALLEL_STATE_REGISTRY)
+        raise ValueError(f"Parallel state {name!r} is not registered. Registered names: {registered}")
+    return _PARALLEL_STATE_REGISTRY[name]
 
 
 def init_parallel_state(
@@ -593,21 +601,39 @@ def init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1",
+    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
-    extra_parallel_placement_innermost: Tuple[bool] = (1,),
+    extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-) -> None:
+    name: Optional[str] = "base",
+) -> "ParallelState":
     """
-    Initializes global parallel state.
+    Initialize a parallel state, register it under ``name``, and set it as the
+    global state when none is current yet.
+
+    If ``name`` is already registered, log a warning and return the existing
+    state without building, caching, or overwriting anything.
+
+    ``name=None`` claims no registry key, for a caller that holds the returned
+    state itself rather than looking it up later — it would otherwise have to
+    collide on ``"base"`` with the standalone trainers or invent a key nobody
+    reads. Only the registry is opted out of: the state is still topology-cached
+    and still becomes the ambient global if none is set, so a later named call
+    with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
+
+    if name is not None and name in _PARALLEL_STATE_REGISTRY:
+        logger.warning(
+            f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
+        )
+        return _PARALLEL_STATE_REGISTRY[name]
+
     if _PARALLEL_STATE is not None:
         logger.warning("Parallel state has already been initialized.")
-        return
 
     if device_type is None:
         device_type = get_device_type()
@@ -616,7 +642,50 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
-    assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names)
+    extra_parallel_sizes = tuple(extra_parallel_sizes)
+    extra_parallel_placement_innermost = tuple(extra_parallel_placement_innermost)
+    extra_parallel_names = tuple(extra_parallel_names)
+
+    # Note that Expert Parallel is included into Extra Parallel
+    assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
+        "each extra parallel should correspond to a size, a placement and a name"
+    )
+
+    # Reuse an already-built state for an identical topology (e.g. the omni
+    # orchestrator builds one ParallelState per module, many of which share the
+    # global topology). Building the device mesh / extra-parallel meshes creates
+    # process groups via collectives — all ranks run the same call sequence in
+    # the same order, so cache hits/misses are rank-consistent and no duplicate
+    # groups are created. The key spans every field that shapes the mesh or the
+    # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    cache_key = (
+        dp_size,
+        dp_replicate_size,
+        dp_shard_size,
+        tp_size,
+        pp_size,
+        cp_size,
+        ulysses_size,
+        dp_mode,
+        device_type,
+        include_sp_in_fsdp,
+        extra_parallel_sizes,
+        extra_parallel_placement_innermost,
+        extra_parallel_names,
+        async_enabled,
+    )
+    cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
+    if cached_state is not None:
+        logger.info_rank0("Reusing cached parallel state for identical topology.")
+        # Mirror the build path below: only (re)establish the default global if it
+        # has not been set yet. The cache is a module-level global that outlives the
+        # global state (e.g. tests reset ``_PARALLEL_STATE = None`` at teardown but
+        # never clear the cache), so a same-topology hit may find the global cleared.
+        if _PARALLEL_STATE is None:
+            _PARALLEL_STATE = cached_state
+        if name is not None:
+            _PARALLEL_STATE_REGISTRY[name] = cached_state
+        return cached_state
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
@@ -633,81 +702,95 @@ def init_parallel_state(
 
     extra_parallel_fsdp_device_mesh = {f"{para_name}": None for para_name in extra_parallel_names}
 
-    if is_torch_version_greater_than("2.4"):
-        mesh_shape = []
-        mesh_dim_names = []
-        for d, name in zip(
-            [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
-            ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
-        ):
-            if d > 1 or name in ["dp_shard"]:
-                mesh_shape.append(d)
-                mesh_dim_names.append(name)
+    mesh_shape = []
+    mesh_dim_names = []
+    for d, dim_name in zip(
+        [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
+        ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+    ):
+        if d > 1 or dim_name in ["dp_shard"]:
+            mesh_shape.append(d)
+            mesh_dim_names.append(dim_name)
 
-        device_mesh = init_device_mesh(
-            device_type=device_type,
-            mesh_shape=tuple(mesh_shape),
-            mesh_dim_names=tuple(mesh_dim_names),
-        )
+    device_mesh = init_device_mesh(
+        device_type=device_type,
+        mesh_shape=tuple(mesh_shape),
+        mesh_dim_names=tuple(mesh_dim_names),
+    )
 
-        # Mesh for data loading (no communication on this mesh)
-        dp_mesh_dim_names = []
-        # Mesh for param sharding
-        dp_shard_sp_mesh_dim_names = []
-        # Mesh for loss all-reduce
-        dp_sp_mesh_dim_names = []
-        # Mesh for sequence parallel
-        sp_mesh_dim_names = []
+    # Mesh for data loading (no communication on this mesh)
+    dp_mesh_dim_names = []
+    # Mesh for param sharding
+    dp_shard_sp_mesh_dim_names = []
+    # Mesh for loss all-reduce
+    dp_sp_mesh_dim_names = []
+    # Mesh for sequence parallel
+    sp_mesh_dim_names = []
 
-        if dp_replicate_size > 1:
-            dp_mesh_dim_names.append("dp_replicate")
-            dp_sp_mesh_dim_names.append("dp_replicate")
-        if dp_shard_size >= 1:
-            dp_mesh_dim_names.append("dp_shard")
-            dp_shard_sp_mesh_dim_names.append("dp_shard")
-            dp_sp_mesh_dim_names.append("dp_shard")
-        if ulysses_size > 1:
-            dp_shard_sp_mesh_dim_names.append("ulysses")
-            sp_mesh_dim_names.append("ulysses")
-            dp_sp_mesh_dim_names.append("ulysses")
-        if cp_size > 1:
-            dp_shard_sp_mesh_dim_names.append("cp")
-            sp_mesh_dim_names.append("cp")
-            dp_sp_mesh_dim_names.append("cp")
+    if dp_replicate_size > 1:
+        dp_mesh_dim_names.append("dp_replicate")
+        dp_sp_mesh_dim_names.append("dp_replicate")
+    if dp_shard_size >= 1:
+        dp_mesh_dim_names.append("dp_shard")
+        dp_shard_sp_mesh_dim_names.append("dp_shard")
+        dp_sp_mesh_dim_names.append("dp_shard")
+    if ulysses_size > 1:
+        dp_shard_sp_mesh_dim_names.append("ulysses")
+        sp_mesh_dim_names.append("ulysses")
+        dp_sp_mesh_dim_names.append("ulysses")
+    if cp_size > 1:
+        dp_shard_sp_mesh_dim_names.append("cp")
+        sp_mesh_dim_names.append("cp")
+        dp_sp_mesh_dim_names.append("cp")
 
-        if dp_mesh_dim_names != []:
-            device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+    if dp_mesh_dim_names != []:
+        device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
 
-        if dp_shard_sp_mesh_dim_names != []:
-            device_mesh[tuple(dp_shard_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_sp")
+    if dp_shard_sp_mesh_dim_names != []:
+        device_mesh[tuple(dp_shard_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_sp")
 
-        if dp_sp_mesh_dim_names != []:
-            device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
+    if dp_sp_mesh_dim_names != []:
+        device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
 
-        if sp_mesh_dim_names != []:
-            device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
+    if sp_mesh_dim_names != []:
+        device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
 
-        for para_size, para_outside, para_name in zip(
-            extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
-        ):
-            if para_size > 1:
-                world_size = dist.get_world_size()
-                assert world_size % para_size == 0, f"{para_name}_size must be a factor of world_size"
-                para_fsdp_size = world_size // para_size
-                mesh = init_para_mesh_matrix(
-                    para_size=para_size, para_fsdp_size=para_fsdp_size, para_outside=para_outside
-                )
-                extra_parallel_fsdp_device_mesh[f"{para_name}"] = DeviceMesh(
-                    device_type=device_type,
-                    mesh=mesh,
-                    mesh_dim_names=(para_name, f"{para_name}_fsdp"),
-                )
+    for para_size, para_outside, para_name in zip(
+        extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
+    ):
+        if para_size > 1:
+            # TODO: drop para_outside?
+            assert not para_outside, f"{para_name} is not supported when para_outside is True."
 
-        logger.info_rank0(f"Device mesh: {device_mesh}")
-        for para_name in extra_parallel_names:
-            logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
+            # NOTE: Support HSDP for extra parallel. For example, world_size=1024
+            # - dense param device_mesh: (dp_replicate, dp_shard_sp)=(4, 256)
+            # - ep_size=8, expert parallel device_mesh: (ep_replicate, ep_fsdp, ep)=(4, 32, 8)
+            # Note that ep_size should be a factor of dp_shard_sp_size.
+            param_mesh_shape, para_mesh_dim_names = [], []
+            if dp_replicate_size > 1:
+                param_mesh_shape.append(dp_replicate_size)
+                para_mesh_dim_names.append(f"{para_name}_replicate")
+            dp_shard_sp_size = device_mesh["dp_shard_sp"].size()
+            assert dp_shard_sp_size % para_size == 0, (
+                f"{para_name}_size({para_size}) must be a factor of dp_shard_sp_size({dp_shard_sp_size})"
+            )
+            para_fsdp_size = dp_shard_sp_size // para_size
+            param_mesh_shape.append(para_fsdp_size)
+            param_mesh_shape.append(para_size)
+            para_mesh_dim_names.append(f"{para_name}_fsdp")
+            para_mesh_dim_names.append(para_name)
 
-    _PARALLEL_STATE = ParallelState(
+            extra_parallel_fsdp_device_mesh[f"{para_name}"] = init_device_mesh(
+                device_type=device_type,
+                mesh_shape=param_mesh_shape,
+                mesh_dim_names=para_mesh_dim_names,
+            )
+
+    logger.info_rank0(f"Device mesh: {device_mesh}")
+    for para_name in extra_parallel_names:
+        logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
+
+    parallel_state = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
@@ -724,6 +807,48 @@ def init_parallel_state(
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         async_enabled=async_enabled,
     )
+
+    if _PARALLEL_STATE is None:
+        _PARALLEL_STATE = parallel_state
+
+    _PARALLEL_STATE_CACHE[cache_key] = parallel_state
+    if name is not None:
+        _PARALLEL_STATE_REGISTRY[name] = parallel_state
+    return parallel_state
+
+
+def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
+    """
+    Set the global parallel state to ``parallel_state``; returns the previous one.
+
+    The SP / DP / CP process-group getters in ``sequence_parallel.comm`` resolve
+    from whatever state is current here, so an Omni module's forward — scoped by
+    :func:`use_parallel_state` — automatically runs its collectives over its own
+    groups, even when sibling modules use a different SP size.
+    """
+    global _PARALLEL_STATE
+    old = _PARALLEL_STATE
+    _PARALLEL_STATE = parallel_state
+    return old
+
+
+@contextmanager
+def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
+    """
+    Temporarily make ``parallel_state`` the global parallel state, restoring on exit.
+
+    ``parallel_state`` may be a registered module name (``str``) or a
+    ``ParallelState`` object. The SP / DP / CP group getters resolve from the
+    current state, so a forward run inside this scope uses that state's own
+    groups — even when sibling Omni modules use a different SP size.
+    """
+    if isinstance(parallel_state, str):
+        parallel_state = get_parallel_state_by_name(parallel_state)
+    old = set_parallel_state(parallel_state)
+    try:
+        yield
+    finally:
+        set_parallel_state(old)
 
 
 def get_parallel_state() -> "ParallelState":

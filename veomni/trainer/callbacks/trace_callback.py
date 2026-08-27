@@ -37,14 +37,18 @@ if TYPE_CHECKING:
 
 
 class MoERouterMonitorCallback(Callback):
+    """Monitors MoE expert load distribution and logs heatmaps to wandb.
+
+    Activation is gated only by ``moe_load_balance_monitor_interval > 0``; the
+    monitor itself does not require wandb. Logging to wandb is gated by
+    ``wandb.enable`` and ``global_rank == 0``.
+    """
+
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         self.monitor = None
 
         args: "VeOmniArguments" = self.trainer.args
-        if not args.train.wandb.enable:
-            logger.info_rank0("MoE router monitor disabled (wandb not enabled).")
-            return
         if args.train.moe_load_balance_monitor_interval <= 0:
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
@@ -64,67 +68,103 @@ class MoERouterMonitorCallback(Callback):
                 "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
                 "MoE router monitor not activated."
             )
+            return
+
+        from ...utils.moe_monitor import MoERouterMonitor, set_active_monitor
+
+        # Process groups are read lazily in on_train_begin once the device
+        # mesh is guaranteed to be initialized.
+        self.monitor = MoERouterMonitor(num_experts=config.num_experts)
+        set_active_monitor(self.monitor)
+        ps = self.parallel_state
+        logger.info_rank0(
+            f"MoE router monitor created: num_experts={config.num_experts}, "
+            f"interval={args.train.moe_load_balance_monitor_interval}, "
+            f"ep_size={ps.ep_size if ps.ep_enabled else 1}"
+        )
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.monitor is None:
+            return
+        from ...utils.moe_monitor import attach_moe_router_monitor
+
+        # fsdp_group is the dp_sp mesh dim — exactly the set of ranks that
+        # hold distinct token slices. EP is intentionally not in this group;
+        # see MoERouterMonitor.__init__ docstring.
+        self.monitor.dp_group = self.parallel_state.fsdp_group
+
+        attached = attach_moe_router_monitor(self.trainer.model, self.monitor)
+        if attached == 0:
+            logger.warning_rank0(
+                "MoE router monitor: no recognized router modules found in the model. "
+                "Disabling monitor. To add support for a new router class, register an "
+                "extractor in veomni/utils/moe_monitor.py (see ROUTER_EXTRACTORS)."
+            )
+            from ...utils.moe_monitor import set_active_monitor
+
+            set_active_monitor(None)
+            self.monitor = None
+        else:
+            logger.info_rank0(f"MoE router monitor: attached to {attached} router module(s).")
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if (
-            self.monitor
-            and state.global_step % args.train.moe_load_balance_monitor_interval == 0
-            and args.train.global_rank == 0
-        ):
+        if self.monitor is None or state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+            return
+
+        # compute_metrics runs an all-reduce across EP/DP groups, so every rank
+        # must call it — but only rank 0 logs.
+        metrics = self.monitor.compute_metrics(current_step=state.global_step)
+        if not metrics or args.train.global_rank != 0:
+            return
+
+        # Two transports: wandb (image → wandb.Image) and TensorBoard (image →
+        # CHW tensor via ``add_image``). Skip only if BOTH are unavailable.
+        # ``tb_writer`` is set on rank 0 by ``TensorboardTraceCallback.on_train_begin``.
+        tb_writer = getattr(self.trainer, "tb_writer", None)
+        wandb_enabled = args.train.wandb.enable
+        if not wandb_enabled and tb_writer is None:
+            return
+
+        start, end = self.monitor._last_step_range
+
+        # ── TensorBoard ─────────────────────────────────────────────────────
+        if tb_writer is not None:
+            import numpy as np
+
+            for k, v in metrics.items():
+                if k.endswith("expert_load_heatmap"):
+                    if v is None:
+                        continue
+                    # PIL Image → CHW numpy for ``add_image``. Drop alpha if
+                    # present (matplotlib saves RGBA by default).
+                    arr = np.array(v)
+                    if arr.ndim == 3 and arr.shape[2] == 4:
+                        arr = arr[:, :, :3]
+                    if arr.ndim == 3:
+                        tb_writer.add_image(k, arr.transpose(2, 0, 1), state.global_step)
+                else:
+                    tb_writer.add_scalar(k, v, state.global_step)
+
+        # ── wandb ───────────────────────────────────────────────────────────
+        if wandb_enabled:
             import wandb
 
-            load_matrix = self.monitor.get_load_matrix(current_step=state.global_step)
-            num_layers = load_matrix.shape[0]
-            if num_layers == 0:
-                logger.warning_rank0(
-                    f"Step {state.global_step}: MoE router monitor has no recorded data. "
-                    "Check that router forward hooks are registered (e.g. PatchQwen3MoeTopKRouter)."
-                )
-                return
-            from ...utils.moe_monitor import MoERouterMonitor
+            wandb_metrics = {}
+            for k, v in metrics.items():
+                if k.endswith("expert_load_heatmap"):
+                    wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
+                else:
+                    wandb_metrics[k] = v
+            wandb.log(wandb_metrics, step=state.global_step)
 
-            image = self.monitor.create_wandb_image(load_matrix)
-            vio = MoERouterMonitor.compute_vio(load_matrix)
-            max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
-            tb_writer = getattr(self.trainer, "tb_writer", None)
-            if tb_writer is not None:
-            
-                for i in range(num_layers):
-                    tb_writer.add_scalar(f"moe/max_vio/layer_{i}", max_vio[i].item(), state.global_step)
-                    tb_writer.add_scalar(f"moe/min_vio/layer_{i}", min_vio[i].item(), state.global_step)
-                    tb_writer.add_scalar(f"moe/avg_vio/layer_{i}", avg_vio[i].item(), state.global_step)
-          
-                tb_writer.add_scalar("moe/max_vio/max", max_vio.max().item(), state.global_step)
-                tb_writer.add_scalar("moe/max_vio/avg", max_vio.mean().item(), state.global_step)
-                tb_writer.add_scalar("moe/avg_vio/max", avg_vio.max().item(), state.global_step)
-                tb_writer.add_scalar("moe/avg_vio/avg", avg_vio.mean().item(), state.global_step)
-        
-                heatmap = load_matrix.unsqueeze(0)  # (1, num_layers, num_experts)
-            
-                tb_writer.add_image("moe/expert_load_heatmap", heatmap, state.global_step)
-
-            metrics = {"moe/expert_load_heatmap": image}
-            for i in range(num_layers):
-                metrics[f"moe/max_vio/layer_{i}"] = max_vio[i].item()
-                metrics[f"moe/min_vio/layer_{i}"] = min_vio[i].item()
-                metrics[f"moe/avg_vio/layer_{i}"] = avg_vio[i].item()
-            metrics["moe/max_vio/max"] = max_vio.max().item()
-            metrics["moe/max_vio/avg"] = max_vio.mean().item()
-            metrics["moe/min_vio/max"] = min_vio.max().item()
-            metrics["moe/min_vio/avg"] = min_vio.mean().item()
-            metrics["moe/avg_vio/max"] = avg_vio.max().item()
-            metrics["moe/avg_vio/avg"] = avg_vio.mean().item()
-            wandb.log(metrics, step=state.global_step)
-
-            logger.info_rank0(
-                f"Step {state.global_step}: uploaded MoE load balance heatmap "
-                f"({num_layers} layers, {load_matrix.shape[1]} experts, "
-                f"steps {self.monitor._last_step_range[0]}-{self.monitor._last_step_range[1]}), "
-                f"max_vio: max={vio['max_vio'].max().item():.4f} avg={vio['max_vio'].mean().item():.4f}, "
-                f"min_vio: max={vio['min_vio'].max().item():.4f} avg={vio['min_vio'].mean().item():.4f}, "
-                f"avg_vio: max={vio['avg_vio'].max().item():.4f} avg={vio['avg_vio'].mean().item():.4f}."
-            )
+        logger.info_rank0(
+            f"Step {state.global_step}: uploaded MoE load balance heatmap "
+            f"(steps {start}-{end}), "
+            f"max_vio max={metrics['moe/max_vio/max']:.4f} avg={metrics['moe/max_vio/avg']:.4f}, "
+            f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
+            f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
+        )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:
@@ -265,6 +305,7 @@ class ProfileTraceCallback(Callback):
                 record_shapes=args.train.profile.record_shapes,
                 profile_memory=args.train.profile.profile_memory,
                 with_stack=args.train.profile.with_stack,
+                with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
                 prefix=args.train.profile.prefix,
                 warmup_steps=args.train.profile.warmup_steps,
@@ -304,6 +345,8 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
+        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -312,13 +355,14 @@ class EnvironMeterCallback(Callback):
             dataloader=trainer.train_dataloader,
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
+            parallel_state=self.parallel_state,
         )
        
         self._loss_window = deque(maxlen=100)
         self._tracemalloc_started = False
         self._tracemalloc_snapshot = None
 
-    def on_step_begin(self, state: TrainerState, micro_batches: List[List[Dict[str, Any]]] = None, **kwargs) -> None:
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
         self.start_time = time.time()
@@ -348,8 +392,7 @@ class EnvironMeterCallback(Callback):
 
         # gather training_step_info from all ranks
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
-            for k, v in step_train_metrics.items()
+            f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
         }
 
         # Channel loss: all_gather keys, unify, then all_reduce fixed-length tensors
@@ -507,7 +550,7 @@ class TqdmCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
-        self.data_loader_tqdm.set_postfix_str(postfix)
+        self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()
 
 

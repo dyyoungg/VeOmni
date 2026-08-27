@@ -326,34 +326,32 @@ class VLMTrainer:
             self.model = build_qwen3moe_omni_from_pretrained(
                 args.model.model_path,
                 init_device=args.train.init_device,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
                 modality_aware_routing=args.train.modality_aware_routing,
                 num_routing_modalities=args.train.num_routing_modalities,
+                ops_implementation=args.model.ops_implementation,
             )
         elif self.model_config.model_type == "llavaqwen2_omni":
             self.model = build_llavaqwen2_omni_from_pretrained(
                 args.model.model_path,
                 init_device=args.train.init_device,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
             )
 
         else:
             self.model = build_foundation_model(
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 init_device=args.train.init_device,
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model.config_path,
@@ -483,9 +481,8 @@ class VLMTrainer:
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
-            enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=args.train.enable_mixed_precision,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             enable_gradient_checkpointing_vit=args.train.gradient_checkpointing.enable_vit,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
@@ -901,7 +898,7 @@ class VLMTrainer:
             self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
             return
 
-        if args.train.remote_dataloader:
+        if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
             if dist.is_initialized():
                 rank = dist.get_rank()
             else:

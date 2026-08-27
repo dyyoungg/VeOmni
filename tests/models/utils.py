@@ -1,49 +1,75 @@
 import os
-from dataclasses import asdict, dataclass, fields, replace
-from typing import Callable, Dict, Optional
+from dataclasses import asdict, dataclass, fields
+from typing import Dict
 
 import torch
 from rich.console import Console
 from rich.table import Table
 from transformers import set_seed
 
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.dummy_dataset import build_dummy_dataset
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.ops import apply_ops_config
+from veomni.utils.device import is_sm90_or_above
+from veomni.utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
+
+
+_LIGER_KERNEL = "liger_kernel"
+_EAGER = "eager"
+# Only include the Liger-backed mode when the package is actually installed
+# (it's unavailable on the NPU CI runner); otherwise every parametrized case
+# would fail in OpsImplementationConfig.__post_init__ with a ValueError.
+_USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
+# NPU ships triton-ascend (not mainline ``triton``); the fused Triton
+# load-balancing-loss kernel at ``veomni/ops/kernels/load_balancing_loss/triton.py``
+# imports ``triton`` unconditionally, so fall back to the pure-PyTorch backend
+# when the mainline package is missing.
+_LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
+# Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
+# kernel is the only option; on GPU default to Triton (SM70+).
+_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
 
 
 @dataclass(frozen=True)
 class ModelMode:
     modeling_backend: str
     attn_implementation: str
-    sync_weight_func: Optional[Callable] = None
-    moe_implementation: str = "eager"  # 修正类型匹配
+    moe_implementation: str = "eager"
     use_liger_kernel: bool = False
 
     def __str__(self):
-        return f"{self.modeling_backend}_[attn-{self.attn_implementation}]_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]]"
+        return (
+            f"{self.modeling_backend}_[attn-{self.attn_implementation}]"
+            f"_[moe-{self.moe_implementation}]_[ligerkernel-{self.use_liger_kernel}]"
+        )
 
 
-# HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN × _USE_LIGER_KERNEL.
-# On NPU skip FA3.
+# HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN x _USE_LIGER_KERNEL.
+# FA3 modes are skipped on devices that can't run the Hopper kernel: NPU
+# (no FA3 port) and pre-SM90 CUDA cards (e.g. A100 sm80, L20 sm89). The
+# upstream FA3 kernel uses WGMMA/TMA which only exist on Hopper; the
+# Luosuu cu130 prebuilt wheel ships sm90-only binaries, so calling it on
+# sm89 raises CUDA "no kernel image is available for execution on the device".
 _HF_ATTN = ["flash_attention_2", "flash_attention_3"]
 _VEOMNI_ATTN = [
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
 ]
-_USE_LIGER_KERNEL = [True, False]
 
 
-def _skip_fa3_npu(attn_impl: str) -> bool:
-    """Skip FA3 on NPU."""
-    if not is_torch_npu_available():
+def _skip_fa3(attn_impl: str) -> bool:
+    """Skip FA3 modes on devices without a usable Hopper FA3 kernel."""
+    if attn_impl not in ("flash_attention_3", "veomni_flash_attention_3_with_sp"):
         return False
-    return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
+    if is_torch_npu_available():
+        return True
+    return not is_sm90_or_above()
 
 
 def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
     """Append VeOmni modes for case; every attn uses _USE_LIGER_KERNEL (True/False)."""
     for veomni_attn in _VEOMNI_ATTN:
-        if _skip_fa3_npu(veomni_attn):
+        if _skip_fa3(veomni_attn):
             continue
         for use_liger in _USE_LIGER_KERNEL:
             modes.append(
@@ -57,10 +83,10 @@ def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
 
 
 def _base_model_modes():
-    """Base (non-MoE) model modes; all use sync_weight_func=None by default."""
+    """Base (non-MoE) model modes."""
     modes = []
     for hf_attn in _HF_ATTN:
-        if _skip_fa3_npu(hf_attn):
+        if _skip_fa3(hf_attn):
             continue
         modes.append(ModelMode("hf", hf_attn))
     _append_veomni_modes(modes)
@@ -68,37 +94,25 @@ def _base_model_modes():
 
 
 def _moe_model_modes():
-    """MoE model modes: same attn variants with moe_implementation=fused."""
+    """MoE model modes: same attn variants with a fused MoE backend matching the hardware."""
     modes = []
     for hf_attn in _HF_ATTN:
-        if _skip_fa3_npu(hf_attn):
+        if _skip_fa3(hf_attn):
             continue
-    _append_veomni_modes(modes, moe_implementation="fused")
+    _append_veomni_modes(modes, moe_implementation=_FUSED_MOE_IMPL)
     return modes
 
 
-def prepare_model_modes(
-    is_moe: bool = False,
-    sync_weight_func: Optional[Callable] = None,
-):
+def prepare_model_modes(is_moe: bool = False):
     """
     Build model modes for patch tests.
 
     Args:
         is_moe: If True, include MoE-specific modes (e.g. fused MoE).
-        sync_weight_func: Optional callable(config, state_dict, model) used only for
-            VeOmni backend modes when HF/VeOmni state dict layouts differ. Will be
-            removed in a future version when layouts align; pass None for normal models.
     """
     base_modes = _base_model_modes()
     moe_modes = _moe_model_modes()
     final_models_modes = base_modes + moe_modes if is_moe else base_modes
-
-    if sync_weight_func is not None:
-        final_models_modes = [
-            replace(mode, sync_weight_func=sync_weight_func) if mode.modeling_backend == "veomni" else mode
-            for mode in final_models_modes
-        ]
 
     hf_model_modes = [m for m in final_models_modes if m.modeling_backend == "hf"]
     veomni_model_modes = [m for m in final_models_modes if m.modeling_backend == "veomni"]
@@ -108,6 +122,7 @@ def prepare_model_modes(
 MODEL_TO_DATASET = {
     "qwen3_vl": "qwen3vl",
     "qwen3_5": "qwen3vl",
+    "qwen3_5_moe": "qwen3vl",
     "qwen3_vl_moe": "qwen3vl",
     "qwen2_vl": "qwen2vl",
     "qwen2_5_vl": "qwen2vl",
@@ -156,23 +171,21 @@ def _to_feature_dict(example: list, token_ids_dict: dict) -> dict:
     return example
 
 
-def prepare_data(model_name: str, max_seq_len: int, model_config):
+def prepare_data(model_name: str, max_seq_len: int, model_config, num_samples: int = 2):
     """
-    Build a DummyDataLoader that yields raw features (list of 2 dicts).
+    Build a DummyDataLoader that yields ``num_samples`` raw features.
     MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
     """
+
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
-    dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
+    dataset = build_dummy_dataset(dataset_name, num_samples, max_seq_len)
 
     token_ids_dict = parse_token_id_from_config(model_config)
 
     class DummyDataLoader:
         def __iter__(self):
             set_seed(42)
-            features = [
-                _to_feature_dict(dataset[0], token_ids_dict),
-                _to_feature_dict(dataset[1], token_ids_dict),
-            ]
+            features = [_to_feature_dict(dataset[index], token_ids_dict) for index in range(num_samples)]
             yield features
 
     return DummyDataLoader()
@@ -183,7 +196,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
     first_mode = next(iter(output_dict.keys()))
 
     table = Table(title=f"Alignment Result: [bold magenta]{model_type} {value_key}[/bold magenta]")
-    mode_fields = [f.name for f in fields(first_mode) if f.name != "sync_weight_func"]
+    mode_fields = [f.name for f in fields(first_mode)]
 
     for field in mode_fields:
         table.add_column(field, style="cyan", justify="left")
@@ -198,7 +211,7 @@ def print_all_values(output_dict, value_key: str, model_type: str = ""):
             row_cells.append(str(mode_data[field]))
 
         val_obj = output.get(value_key, "N/A")
-        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}"  # 这里加上了.4f保留小数
+        val_str = f"{val_obj.item() if hasattr(val_obj, 'item') else val_obj:.8f}"
         row_cells.append(val_str)
 
         table.add_row(*row_cells)
@@ -221,26 +234,46 @@ def compare_multi_items(outputs_dict: Dict, rtol=0.01, atol=0.01):
                     rtol=rtol,
                     atol=atol,
                 )
-            except AssertionError:
+            except AssertionError as e:
                 print_all_values(outputs_dict, key)
-                raise AssertionError(f"{key} not match")
+                raise AssertionError(f"{key} not match") from e
 
 
 def apply_veomni_loss_unpatch():
-    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
-
-    from veomni.ops import fused_cross_entropy
-
-    fused_cross_entropy._cross_entropy = None
+    from transformers.loss.loss_utils import (
+        LOSS_MAPPING,
+        ForCausalLMLoss,
+        ForSequenceClassificationLoss,
+    )
 
     LOSS_MAPPING["ForCausalLM"] = ForCausalLMLoss
     LOSS_MAPPING["ForConditionalGeneration"] = ForCausalLMLoss
+    LOSS_MAPPING["ForSequenceClassification"] = ForSequenceClassificationLoss
 
 
 def apply_veomni_moe_unpatch():
-    from veomni.ops import fused_moe
+    from veomni.ops.kernels import moe
 
-    fused_moe._fused_moe_forward = None
+    moe._fused_moe_forward = None
+
+
+def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:
+    """Build an OpsImplementationConfig from a ModelMode for testing."""
+    liger_impl = _LIGER_KERNEL if model_mode.use_liger_kernel else _EAGER
+    # Linear-attention fields (rms_norm_gated/causal_conv1d/chunk_gated_delta_rule)
+    # are intentionally left at their production default ``"fla"``. Qwen3.5
+    # has no NPU backend for these ops, so the qwen3_5 / qwen3_5_moe
+    # parametrize cases in test_models_patch.py skip on NPU at the test
+    # level.
+    return OpsImplementationConfig(
+        attn_implementation=model_mode.attn_implementation,
+        moe_implementation=model_mode.moe_implementation,
+        cross_entropy_loss_implementation=liger_impl,
+        rms_norm_implementation=liger_impl,
+        swiglu_mlp_implementation=liger_impl,
+        rotary_pos_emb_implementation=liger_impl,
+        load_balancing_loss_implementation=_LOAD_BALANCING_LOSS_IMPL,
+    )
 
 
 def set_environ_param(model_mode: ModelMode):
@@ -251,7 +284,5 @@ def set_environ_param(model_mode: ModelMode):
     else:
         os.environ["MODELING_BACKEND"] = "hf"
 
-    if model_mode.use_liger_kernel:
-        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "1"
-    else:
-        os.environ["VEOMNI_USE_LIGER_KERNEL"] = "0"
+    ops_config = _build_ops_config_for_mode(model_mode)
+    apply_ops_config(ops_config)

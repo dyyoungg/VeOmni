@@ -7,13 +7,12 @@
 
 ## Motivation
 
-EP+FSDP1 is supported in VeOmni in the first day.
-However, with the [deprecation of FSDP1](https://docs.pytorch.org/tutorials/intermediate/FSDP1_tutorial.html), FSDP2 becomes a necessary upgrade, which also introduces several benefits besides maintainability:
+EP+FSDP1 was supported in VeOmni from day one, but FSDP1 has since been deprecated upstream and removed from VeOmni. VeOmni now uses FSDP2 exclusively, which brings several benefits beyond maintainability:
 
 * Flexibility of per-parameter sharding (along any dimension of the tensor)
 * Easier to configure prefetching to overlap communication and computation
 * Simpler to manipulate hooks (no complicated `FSDPExtension`)
-* Avoid use of annoying `FlattenParamter` in FSDP1 which has many side-effects.
+* Avoids the `FlattenParameter` machinery of FSDP1 and its side-effects.
 
 For more info, please look up the official [FSDP2 tutorial](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html).
 
@@ -37,7 +36,7 @@ This is to enable more flexible parallelism setup. Otherwise, if we also choose 
 
 Let's take Qwen3-MoE-30B-A3B model for example, which has 128 experts, hidden dim size of 2048, and intermediate size of 768. So, we can view expert weights as
 
-* Gate projection: [128, 768, 768]
+* Gate projection: [128, 768, 2048]
 * Up projection: [128, 768, 2048]
 * Down projection: [128, 2048, 768]
 

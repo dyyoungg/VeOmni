@@ -10,7 +10,12 @@ from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.utils import can_return_tuple
-from transformers import Qwen2ForCausalLM
+# Use the patchgen'd Qwen2 modeling module so its module-level OpSlots
+# (rms_norm / rotary_pos_emb / swiglu_mlp / cross_entropy_loss) are available
+# for binding via ``_bind_veomni_ops`` in ``auto.py``. Importing the vanilla
+# HF ``Qwen2ForCausalLM`` here would keep OpSlots absent and force eager
+# kernels regardless of ``ops_implementation``.
+from veomni.models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import Qwen2ForCausalLM
 
 from veomni.models.custom.llava_qwen2.configuration_llava_qwen2 import LlavaQwen2Config
 from veomni.models.custom.vision_encoder.modeling_qwen25_vision_encoder import BeeBeeVLVisionModel
@@ -339,9 +344,14 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
                 fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds + fake_audio_embeds
 
-    
+
         if sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(inputs_embeds, head_dim=2, seq_dim=1, group=sp_group)
+            # Position ids must match local seq chunk after scatter; slice to
+            # this SP rank's portion so RoPE encodes correct absolute positions.
+            sp_rank = dist.get_rank(sp_group)
+            chunk_size = position_ids.shape[-1] // parallel_state.sp_size
+            position_ids = position_ids[:, sp_rank * chunk_size : (sp_rank + 1) * chunk_size]
            
         with step_timer.measure("llm") if step_timer else contextlib.nullcontext():
             outputs = self.model(
@@ -364,7 +374,13 @@ class LlavaQwen2ForCausalLM(LlavaQwen2PreTrainedModel, GenerationMixin):
         logits = None
    
         if labels is not None and self.training:
-            loss, logits = self.loss_function(
+            # VeOmni's patched ``loss_function`` (installed by
+            # ``install_loss_mapping`` at build time) returns the 3-tuple
+            # ``(loss, logits, fused_linear_aux)``. The third slot carries a
+            # ``FusedLinearAuxOutput`` payload only on the ``return_log_probs``
+            # path (PPO / verl); it is ``None`` on the plain-loss training path
+            # we take here, so we discard it with ``_``.
+            loss, logits, _ = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.vocab_size,

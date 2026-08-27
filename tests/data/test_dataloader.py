@@ -1,10 +1,12 @@
 import types
 from functools import partial
+from typing import Literal
 
 import pytest
 from utils import DummyDataset, process_dummy_example
 
 from veomni.data import build_dataloader, build_dataset
+from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
 def _fake_ps(sp_size: int):
@@ -28,8 +30,14 @@ def dummy_dataset_ci():
 @pytest.mark.parametrize("dataset_name", ["iterable", "mapping"])
 @pytest.mark.parametrize("dyn_bsz", [True, False])
 @pytest.mark.parametrize("sp_size", [1, 2])
+@pytest.mark.parametrize("dyn_bsz_runtime", ["main", "worker"])
 def test_build_dataloader_dyn_bsz_sp_filling(
-    monkeypatch, dummy_dataset_ci, dataset_name: str, dyn_bsz: bool, sp_size: int
+    monkeypatch,
+    dummy_dataset_ci,
+    dataset_name: str,
+    dyn_bsz: bool,
+    sp_size: int,
+    dyn_bsz_runtime: Literal["main", "worker"],
 ):
     import veomni.data.data_collator as m_col
     import veomni.data.data_loader as m_dl
@@ -45,7 +53,10 @@ def test_build_dataloader_dyn_bsz_sp_filling(
     max_seq_len = 100
 
     if dyn_bsz:
-        dataloader_batch_size = 1
+        if dyn_bsz_runtime == "main":
+            dataloader_batch_size = 1
+        else:
+            dataloader_batch_size = global_batch_size // micro_batch_size
     else:
         dataloader_batch_size = global_batch_size
 
@@ -67,6 +78,7 @@ def test_build_dataloader_dyn_bsz_sp_filling(
         train_steps=1,
         num_workers=0,
         dyn_bsz=dyn_bsz,
+        dyn_bsz_runtime=dyn_bsz_runtime,
         dyn_bsz_buffer_size=1,
         drop_last=True,
         prefetch_factor=None,
@@ -83,3 +95,203 @@ def test_build_dataloader_dyn_bsz_sp_filling(
         assert len(micro_batches) == global_batch_size // micro_batch_size
         for micro_batch in micro_batches:
             assert len(micro_batch["id"]) == micro_batch_size
+
+
+@pytest.mark.parametrize("dyn_bsz_runtime", ["main", "worker"])
+def test_build_dataloader_dyn_bsz_count_mode(
+    monkeypatch, dummy_dataset_ci, dyn_bsz_runtime: Literal["main", "worker"]
+):
+    import veomni.data.data_collator as m_col
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_col, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1 if dyn_bsz_runtime == "main" else 2,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime=dyn_bsz_runtime,
+        dyn_bsz_count_mode="effective",
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+
+    if dyn_bsz_runtime == "main":
+        assert isinstance(dl, DynamicBatchSizeDataLoader)
+        assert isinstance(dl.batching_strategy, TextBatchingStrategy)
+        assert dl.batching_strategy.buffer._get_length_fn is m_ds.get_length_by_labels_fn
+        assert dl.batching_strategy.physical_token_cap == 48
+        assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+    else:
+        assert isinstance(dl.dataset, m_ds.DynamicBatchingSizeDataset)
+        assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn
+        assert dl.dataset.physical_token_cap == 48
+        assert dl.dataset.get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+
+
+def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_count_mode="effective",
+        dyn_bsz_physical_overflow_ratio=1.25,
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+
+    assert dl.batching_strategy.physical_token_cap == 40
+
+
+def test_build_dataloader_suppresses_persistent_workers_with_zero_workers(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        persistent_workers=True,
+        in_order=False,
+        seed=0,
+    )
+
+    assert dl._dataloader.persistent_workers is False
+    assert dl._dataloader.in_order is False
+
+
+def test_build_dataloader_forwards_worker_scheduling_kwargs(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    captured = {}
+
+    class FakeDistributedDataloader:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_dl, "DistributedDataloader", FakeDistributedDataloader)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=2,
+        dyn_bsz=False,
+        drop_last=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+        in_order=False,
+        seed=0,
+    )
+
+    assert captured["persistent_workers"] is True
+    assert captured["in_order"] is False
+
+
+def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="dyn_bsz_physical_overflow_ratio must be >= 1.0"):
+        build_dataloader(
+            "native",
+            dataset=dataset,
+            micro_batch_size=2,
+            global_batch_size=4,
+            dataloader_batch_size=1,
+            max_seq_len=16,
+            train_steps=1,
+            num_workers=0,
+            dyn_bsz=True,
+            dyn_bsz_runtime="main",
+            dyn_bsz_count_mode="effective",
+            dyn_bsz_physical_overflow_ratio=0.5,
+            dyn_bsz_buffer_size=1,
+            drop_last=True,
+            prefetch_factor=None,
+            seed=0,
+        )

@@ -12,17 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional
+from dataclasses import MISSING, dataclass, field, fields
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
+
+
+def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
+    """Copy an ``hdfs://`` path to a local cache and return the local path.
+
+    Non-HDFS paths (local filesystem, HF hub ids, hdfs-fuse mounts) are returned
+    unchanged. Concurrent processes on the same node are serialized by the file
+    lock inside ``copy_to_local``, so the download happens only once per node.
+    """
+    from ..utils.fs import copy_to_local, is_non_local
+
+    if path is None or not is_non_local(path):
+        return path
+
+    return copy_to_local(path.rstrip("/"), verbose=True)
 
 
 # ================================ Training Arguments ======================================
@@ -32,9 +47,12 @@ logger = logging.get_logger(__name__)
 #   ├── optimizer.*          → OptimizerConfig
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
+#   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   ├── torch_compile.*      → TorchCompileConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
+#   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
@@ -42,9 +60,14 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class OptimizerConfig:
-    """train.optimizer.* — Optimizer and learning-rate schedule."""
+    """train.optimizer.* — Optimizer and learning-rate schedule.
 
-    type: Literal["adamw", "anyprecision_adamw"] = field(
+    ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
+    and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
+    norms use AdamW.
+    """
+
+    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -87,6 +110,110 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
+    # ---- Muon-specific (only consulted when type == "muon") ---------------
+    muon_lr: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
+            )
+        },
+    )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Momentum factor for the Muon group."},
+    )
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum in Muon."},
+    )
+    muon_weight_decay: float = field(
+        default=0.0,
+        metadata={"help": "Decoupled weight decay for the Muon group."},
+    )
+    muon_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Number of Newton-Schulz iteration steps in Muon."},
+    )
+    muon_ns_coefficients: List[float] = field(
+        default_factory=lambda: [3.4445, -4.7750, 2.0315],
+        metadata={"help": "Quintic Newton-Schulz polynomial coefficients (a, b, c)."},
+    )
+    muon_eps: float = field(
+        default=1e-7,
+        metadata={"help": "Numerical-stability epsilon for the spectral-norm normalization in Muon."},
+    )
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = field(
+        default="match_rms_adamw",
+        metadata={
+            "help": (
+                "Per-matrix learning-rate adjustment used by Muon. "
+                "'original' follows Keller Jordan; 'match_rms_adamw' (default) "
+                "matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer."
+            )
+        },
+    )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
+    muon_expert_zero_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
+                "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
+                "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
+            )
+        },
     )
 
 
@@ -144,6 +271,10 @@ class ProfileConfig:
         default=True,
         metadata={"help": "Whether or not to record the stack traces."},
     )
+    with_modules: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to record module hierarchy in profiling traces."},
+    )
     rank0_only: bool = field(
         default=True,
         metadata={
@@ -162,6 +293,91 @@ class ProfileConfig:
         default=True,
         metadata={"help": "Print NCCL communication breakdown table after profiling."},
     )
+
+
+@dataclass
+class ChannelLossConfig:
+    """train.channel_loss.* — Per-channel causal-LM loss logging."""
+
+    enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detached per-channel cross-entropy logging. This is an observability-only "
+                "side channel and does not change the training objective."
+            )
+        },
+    )
+    interval: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Compute and log channel loss every N optimizer steps. The detached fused-loss "
+                "fallback recomputes the LM-head projection on sampled steps; use 1 to sample every step."
+            )
+        },
+    )
+    source_id_keys: List[str] = field(
+        default_factory=lambda: ["channel_id", "source_id", "dataset_id", "ds_idx"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as channel/source IDs. The first key found in each "
+                "micro-batch is used. Values should be one per packed sequence."
+            )
+        },
+    )
+    source_name_keys: List[str] = field(
+        default_factory=lambda: ["channel_name", "source_name", "dataset_name", "data_name"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as display names for channel/source IDs. Values should "
+                "align with source_id_keys when provided."
+            )
+        },
+    )
+    extra_strip_keys: List[str] = field(
+        default_factory=lambda: ["cur_token_num"],
+        metadata={
+            "help": (
+                "Extra metadata keys to remove from each micro-batch before model forward when "
+                "channel loss is enabled."
+            )
+        },
+    )
+    loss_metric_prefix: str = field(
+        default="channel_loss",
+        metadata={"help": "Metric prefix for per-channel average CE."},
+    )
+    weighted_loss_metric_prefix: str = field(
+        default="channel_loss_weighted",
+        metadata={"help": "Metric prefix for per-channel CE weighted by all logged tokens in the step."},
+    )
+    token_count_metric_prefix: str = field(
+        default="channel_tokens",
+        metadata={"help": "Metric prefix for per-channel supervised token counts."},
+    )
+    log_weighted_loss: bool = field(
+        default=True,
+        metadata={"help": "Log loss_sum / total_step_tokens for each channel."},
+    )
+    log_token_count: bool = field(
+        default=True,
+        metadata={"help": "Log supervised token count for each channel."},
+    )
+    strict: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Raise when enabled but a micro-batch has no configured source ID, or when "
+                "source metadata cannot be aligned with packed segments. Default False skips "
+                "micro-batches with missing or mismatched metadata."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.interval < 1:
+            raise ValueError("train.channel_loss.interval must be at least 1.")
 
 
 @dataclass
@@ -190,14 +406,58 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
+    early_stop: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. "
+                "PyTorch ignores this option when enable_reentrant=True."
+            )
+        },
+    )
+
+
+@dataclass
+class MixedPrecisionConfig:
+    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+
+    enable: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision training."},
+    )
+    param_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Dtype for the unsharded parameter."},
+    )
+    reduce_dtype: str = field(
+        default="float32",
+        metadata={"help": "Dtype for gradient reduction (i.e. reduce-scatter or all-reduce)."},
+    )
+    output_dtype: str = field(
+        default=None,
+        metadata={"help": "Dtype for casting floating-point forward outputs (FSDP2)."},
+    )
+    cast_forward_inputs: bool = field(
+        default=True,
+        metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
+    )
+
+    def __post_init__(self):
+        def _check_dtype(dtype: str):
+            if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
+                raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
+
+        _check_dtype(self.param_dtype)
+        _check_dtype(self.reduce_dtype)
+        _check_dtype(self.output_dtype)
 
 
 @dataclass
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
-        default="ddp",
+    fsdp_mode: Literal["ddp", "fsdp2"] = field(
+        default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
     reshard_after_forward: bool = field(
@@ -208,18 +468,28 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable reshard after backward for FSDP2."},
     )
-    full_shard: bool = field(
-        default=True,
-        metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},
-    )
     forward_prefetch: bool = field(
         default=True,
-        metadata={"help": "Enable forward prefetch for FSDP1."},
+        metadata={"help": "Enable forward prefetch."},
     )
     offload: bool = field(
         default=False,
-        metadata={"help": "Enable CPU offload for FSDP1."},
+        metadata={"help": "Enable CPU offload for FSDP2."},
     )
+    max_load_broadcast_size: float = field(
+        default=20.0,
+        metadata={
+            "help": "Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting."
+        },
+    )
+    mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+
+    def __post_init__(self):
+        if self.fsdp_mode not in ("ddp", "fsdp2"):
+            raise ValueError(
+                f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
+                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+            )
 
 
 @dataclass
@@ -294,7 +564,8 @@ class AcceleratorConfig:
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
 
     def __post_init__(self):
-        # configure extra parallelism to include expert parallelism
+        # although expert parallel and extra parallel are both provided in the arguments,
+        # the implementation is configuring extra parallelism to include expert parallelism
         self.extra_parallel_sizes.append(self.ep_size)
         self.extra_parallel_names.append("ep")
         self.extra_parallel_placement_innermost.append(self.ep_outside)
@@ -315,6 +586,23 @@ class CheckpointConfig:
     save_async: bool = field(
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
+    )
+    dcp_save_to_lowest_rank: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Route each replicated DCP shard to the lowest global rank that holds it, instead "
+                "of load-balancing writes across all replica holders. Useful on a non-shared "
+                "filesystem (each node writes to local disk): it concentrates the deduplicated copy "
+                "onto the lowest-ranked replica group instead of scattering writes across all "
+                "replicas. In the standard HSDP layout (FSDP shard within a node, replication "
+                "across nodes) that lowest replica group lives on one node, so that node holds a "
+                "complete checkpoint. Only affects replicated data (the FSDP/HSDP replicate dim); "
+                "unique expert/tensor/pipeline-parallel shards are never deduplicated and stay "
+                "distributed. Trades write parallelism for locality, so leave False when output_dir "
+                "is shared."
+            )
+        },
     )
     load_path: Optional[str] = field(
         default=None,
@@ -347,15 +635,41 @@ class CheckpointConfig:
     )
 
 @dataclass
+class TorchCompileConfig:
+    """train.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
+    )
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
+    )
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "train.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    )
+
+
+@dataclass
 class TrainingArguments:
     """train.* — Top-level training configuration."""
 
-    train_architecture: Literal["full", "lora"] = field(
-        default="full",
-        metadata={
-            "help": "Specifies the parameter update strategy for training the multi-modal model. 'full' for Standard SFT, lora for LoRA."
-        },
-    )
     dyn_bsz: bool = field(
         default=True,
         metadata={"help": "Enable dynamic batch size for padding-free training."},
@@ -388,20 +702,49 @@ class TrainingArguments:
         default=200,
         metadata={"help": "Initial number of tokens in a batch in warmup phase."},
     )
-    enable_mixed_precision: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision training."},
+    dyn_bsz_runtime: Literal["main", "worker"] = field(
+        default="main",
+        metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
-        default="cuda",
+    dyn_bsz_count_mode: Literal["total", "effective"] = field(
+        default="total",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
+            "help": (
+                "How dynamic batching counts tokens when packing a micro batch. "
+                "'total' (default, legacy) sums attention_mask; 'effective' sums "
+                "only loss-contributing tokens (labels != IGNORE_INDEX), which "
+                "balances effective tokens across DP ranks at the cost of allowing "
+                "controlled physical-token overflow."
+            )
+        },
+    )
+    dyn_bsz_physical_overflow_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": (
+                "Physical-token cap multiplier used when dyn_bsz_count_mode='effective'. "
+                "The cap is ceil(micro_batch_size * max_seq_len * ratio), so values "
+                "> 1.0 let effective-token batching differ from total-token batching "
+                "while still bounding prompt-heavy micro batches."
+            )
+        },
+    )
+    init_device: Literal["cuda", "meta", "npu"] = field(
+        default="meta",
+        metadata={
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
         default=True,
         metadata={
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+        },
+    )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
         },
     )
     enable_full_determinism: bool = field(
@@ -411,6 +754,15 @@ class TrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=200,
@@ -432,28 +784,37 @@ class TrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    enable_compile: bool = field(
-        default=False,
-        metadata={"help": "Enable torch compile."},
-    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
     moe_load_balance_monitor_interval: int = field(
         default=0,
-        metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires wandb.enable=True."},
+        metadata={
+            "help": (
+                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
+                "all-reduced across EP and DP groups so the heatmap is global. "
+                "Wandb logging is performed only when train.wandb.enable=True."
+            )
+        },
     )
 
     # sub-argument groups
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.dyn_bsz_physical_overflow_ratio < 1.0:
+            raise ValueError(
+                f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
@@ -477,6 +838,7 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
+        assert acc.cp_size == 1, "Context parallel size not supported yet."
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
@@ -508,18 +870,24 @@ class TrainingArguments:
             )
 
         # init method constraints
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
-            if self.broadcast_model_weights_from_rank0:
-                logger.warning_rank0(
-                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-                )
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
+            )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -535,11 +903,14 @@ class TrainingArguments:
         else:
             raise ValueError(f"`global_batch_size` should be a multiple of {self.micro_batch_size * acc.dp_size}.")
 
-        if self.gradient_accumulation_steps > 1 and acc.fsdp_config.offload:
-            raise ValueError("Gradient accumulation is not supported with FSDP offload.")
-
         # dataloader batch size
-        self.dataloader_batch_size = 1 if self.dyn_bsz else self.global_batch_size // acc.dp_size
+        if self.dyn_bsz:
+            if self.dyn_bsz_runtime == "main":
+                self.dataloader_batch_size = 1
+            else:
+                self.dataloader_batch_size = self.global_batch_size // acc.dp_size // self.micro_batch_size
+        else:
+            self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
         ckpt = self.checkpoint
@@ -552,6 +923,15 @@ class TrainingArguments:
                 is_local_rank0=self.local_rank == 0,
                 ckpt_manager=ckpt.manager,
             )
+
+        if ckpt.load_path:
+            load_path = Path(os.path.normpath(os.path.abspath(ckpt.load_path)))
+            output_dir = Path(os.path.normpath(os.path.abspath(ckpt.output_dir)))
+
+            try:
+                load_path.relative_to(output_dir)
+            except ValueError:
+                logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
         # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
@@ -583,9 +963,76 @@ class TrainingArguments:
 #
 
 
+# NPU compatibility tables for ``_validate_implementations``. ``"eager"`` is
+# always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
+# NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
+#
+# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
+# alone do not capture per-model and per-hardware compatibility. The NPU
+# default-normalization step runs before this allow-list validation.
+_NPU_ALLOWED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
+    "swiglu_mlp_implementation": frozenset(),
+    "load_balancing_loss_implementation": frozenset({"triton"}),
+    "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
+    "moe_implementation": frozenset({"fused_npu"}),
+}
+
+_NPU_REQUIRED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
+    "cross_entropy_loss_implementation": frozenset({"npu"}),
+    "moe_implementation": frozenset({"fused_npu"}),
+}
+
+_NPU_DEFAULT_FALLBACK: Dict[str, str] = {
+    "rms_norm_implementation": "npu",
+    "rotary_pos_emb_implementation": "npu",
+    "rotary_pos_emb_vision_implementation": "npu",
+    "swiglu_mlp_implementation": "eager",
+    "load_balancing_loss_implementation": "eager",
+    "cross_entropy_loss_implementation": "npu",
+    "moe_implementation": "fused_npu",
+}
+
+
 @dataclass
 class OpsImplementationConfig:
-    """model.ops_implementation.* — Attention / MoE kernel implementation."""
+    """model.ops_implementation.* — kernel backend selection per op.
+
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
+    are automatically mapped to NPU-compatible or eager implementations;
+    explicit non-default overrides are validated and unsupported values raise.
+    Per-op fields are ``str`` so third-party backends can register without
+    changing this dataclass.
+
+    NPU validation runs at two times:
+
+    - **Config-parse time** (``__post_init__``) for ops registered in the
+      legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
+      model-agnostic allow-list.
+    - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
+      for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
+      ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
+      patched modeling module, so config-parse-time validation would force
+      every NPU user to override them even when training non-Qwen3.5 models.
+      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      kernel's ``HardwareRequirement`` raises only when the requested value has
+      no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
+      is documented in the field metadata.
+
+    Backends: ``"eager"`` (HF reference, always available),
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
+    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    backend; on NPU, values equal to the dataclass default are normalized to
+    ``"eager"`` before registry binding.
+    """
 
     attn_implementation: Optional[
         Literal[
@@ -594,18 +1041,115 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
+            "magi_attention",
             "native-sparse",
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation to use."},
+        metadata={"help": "Attention implementation."},
     )
-    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = field(
-        default="fused",
+    moe_implementation: str = field(
+        default="fused_triton",
         metadata={
-            "help": "MoE implementation to use. "
-            "'eager' for reference loop, 'fused' for Triton group-gemm, "
-            "'fused_quack' for Quack CUTLASS/CuTe kernels (SM90+)."
+            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
+            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
+            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
+            "incompatible non-default overrides raise. Legacy 'fused' "
+            "auto-resolves to fused_quack/fused_npu with a deprecation warning."
+        },
+    )
+    cross_entropy_loss_implementation: str = field(
+        default="liger_kernel",
+        metadata={
+            "help": "Cross-entropy loss. 'liger_kernel' (default, GPU; fused linear+CE — "
+            "requires VeOmni-patched modeling that passes hidden_states=/weights= to "
+            "self.loss_function; unpatched HF models raise) | 'chunk_loss' (chunked "
+            "F.linear+CE, hardware-agnostic) | 'npu' (chunk_loss + torch_npu gate) | "
+            "'eager' (PyTorch F.cross_entropy)."
+        },
+    )
+    rms_norm_implementation: str = field(
+        default="liger_kernel",
+        metadata={
+            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' | "
+            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
+        },
+    )
+    swiglu_mlp_implementation: str = field(
+        default="liger_kernel",
+        metadata={
+            "help": "SwiGLU MLP. 'liger_kernel' (default, GPU) | 'eager'. No NPU backend — NPU users must set 'eager'."
+        },
+    )
+    rotary_pos_emb_implementation: str = field(
+        default="liger_kernel",
+        metadata={
+            "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
+        },
+    )
+    rotary_pos_emb_vision_implementation: str = field(
+        default="eager",
+        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+    )
+    load_balancing_loss_implementation: str = field(
+        default="triton",
+        metadata={
+            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
+            "On NPU, config normalization maps the default 'triton' value to 'eager'."
+        },
+    )
+    rms_norm_gated_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
+            "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
+            "'npu' uses the VeOmni NPUFusedRMSNormGated."
+        },
+    )
+    causal_conv1d_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
+            "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
+            "because no torch fallback handles cu_seqlens. "
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
+            "matching backend raises at OpSlot bind time."
+        },
+    )
+    chunk_gated_delta_rule_implementation: str = field(
+        default="fla",
+        metadata={
+            "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
+            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
+            "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
+            "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
+            "cu_seqlens; varlen training therefore raises at runtime. "
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
+            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
+        },
+    )
+    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
+    )
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+    )
+    mhc_implementation: Literal["eager", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
 
@@ -615,11 +1159,101 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
+                "magi_attention": "veomni_magi_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
+
+        # Legacy alias: ``moe_implementation='fused'`` resolves to a
+        # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on
+        # Ascend. Kept for back-compat with pre-#678 YAMLs; warn so users
+        # migrate to the explicit name.
+        if self.moe_implementation == "fused":
+            from ..utils.import_utils import is_torch_npu_available
+
+            resolved = "fused_npu" if is_torch_npu_available() else "fused_quack"
+            logger.warning_rank0(
+                f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
+                f"Set moe_implementation='{resolved}' explicitly to silence this warning."
+            )
+            self.moe_implementation = resolved
+
+        self._apply_npu_default_fallback()
+        self._validate_implementations()
+
+    def _apply_npu_default_fallback(self):
+        """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
+
+        When running on NPU, fields still at their GPU default are automatically
+        swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
+        user overrides (non-default values) are left untouched and will be
+        caught by ``_validate_implementations`` if unsupported.
+        """
+        from ..utils.import_utils import is_torch_npu_available
+
+        if not is_torch_npu_available():
+            return
+
+        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
+        for field_name, npu_value in _NPU_DEFAULT_FALLBACK.items():
+            if field_name not in gpu_defaults:
+                continue
+            current = getattr(self, field_name)
+            if current == gpu_defaults[field_name]:
+                setattr(self, field_name, npu_value)
+                logger.info_rank0(
+                    f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
+                )
+
+    def _validate_implementations(self):
+        """Fail fast on hardware/op mismatch at config-parse time.
+
+        Only checks things cheaper to catch here than at bind time. Package
+        availability (liger / torch_npu) and per-model backend compatibility
+        are validated by the resolution sites (``apply_per_model_patches`` /
+        ``apply_global_ops`` / ``install_loss_mapping`` /
+        ``KERNEL_REGISTRY.resolve``) — not duplicated here.
+        """
+        from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
+        from ..ops.config.registry import list_ops
+        from ..utils.import_utils import is_package_available, is_torch_npu_available
+
+        # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
+        # otherwise a future op addition silently bypasses NPU validation.
+        registered_fields = {op.config_field for op in list_ops()}
+        missing = registered_fields - _NPU_ALLOWED.keys()
+        assert not missing, (
+            f"NPU allow-list missing entries for registered ops: {sorted(missing)}. "
+            f"Add them to _NPU_ALLOWED in arguments_types.py."
+        )
+
+        on_npu = is_torch_npu_available()
+
+        for field_name, npu_ok in _NPU_ALLOWED.items():
+            value = getattr(self, field_name)
+            if value == "eager":
+                continue
+            if on_npu and value not in npu_ok:
+                allowed = sorted(npu_ok | {"eager"})
+                raise ValueError(
+                    f"{field_name}={value!r} is not supported on Ascend NPU. "
+                    f"Set to one of {allowed}; 'eager' is the universal fallback "
+                    f"for ops with no NPU kernel for the current model."
+                )
+            if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
+                raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+
+        # The Triton load-balancing-loss kernel imports ``triton`` at module
+        # top — surface a missing package here with an actionable message
+        # instead of a noisy ImportError at apply_global_ops time.
+        if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
+            raise ValueError(
+                "load_balancing_loss_implementation='triton' requires the 'triton' package "
+                "on CUDA. Install it or set the field to 'eager'."
+            )
 
 
 @dataclass
@@ -634,6 +1268,10 @@ class ModelArguments:
         default="",
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
+    model_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config to overwrite foundation model config."},
+    )
     tokenizer_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
@@ -644,39 +1282,25 @@ class ModelArguments:
             "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
         },
     )
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config."},
-    )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config and weights."},
-    )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={"help": "Use encoder to encode input images or use decoder.encoder to encode input images."},
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={"help": "Use encoder to encode output images or use decoder.encoder to encode output images."},
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
-    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
+    )
+    lora_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for lora."},
     )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
+
+        # Download HDFS-hosted paths to a local cache before resolving defaults so
+        # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
 
         if self.config_path is None:
             self.config_path = self.model_path
@@ -690,42 +1314,16 @@ class ModelArguments:
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
 
-        # Parse fqn_to_index_mapping from safetensor index json
+        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
         self.fqn_to_index_mapping = None
         if self.safetensor_idx_path is not None:
-            with open(self.safetensor_idx_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
         if self.fqn_to_index_mapping is None:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
-
-        suppoerted_encoder_types = ["image", "video", "audio"]
-        for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
-                raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
-                )
-
-            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if encoder_args.get("config_path") is None:
-                encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if decoder_args.get("config_path") is None and decoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 # ================================ Data Arguments ======================================
@@ -748,9 +1346,21 @@ class DataloaderConfig:
         default=2,
         metadata={"help": "Number of workers to load data."},
     )
+    worker_num_threads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
+    )
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
     )
     drop_last: bool = field(
         default=True,
@@ -760,11 +1370,17 @@ class DataloaderConfig:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
+    use_background_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
+    )
 
 
 @dataclass
 class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
+
+    supports_torch_compile = True
 
     train_path: str = field(
         default="",
@@ -784,7 +1400,7 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )
@@ -837,6 +1453,8 @@ class DataArguments:
                 self.text_keys = "messages"
             elif self.data_type == "classification":
                 self.text_keys = "text"
+            elif self.data_type == "dpo":
+                self.text_keys = "chosen"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 
@@ -866,6 +1484,24 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.torch_compile.enable:
+            if not getattr(self.data, "supports_torch_compile", True):
+                raise ValueError(
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
+                )
+            if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
+                    f"got data.data_type={self.data.data_type!r}."
+                )
+            if not self.train.dyn_bsz or not self.train.pad_to_length:
+                raise ValueError(
+                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
+                    "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
+                )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
@@ -928,5 +1564,7 @@ class InferArguments:
     )
 
     def __post_init__(self):
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path

@@ -18,11 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.registry import Registry
-
-
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 
 if TYPE_CHECKING:
@@ -32,6 +28,18 @@ if TYPE_CHECKING:
 
 
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
+
+
+def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
+    candidates = (token,) if fallback_token is None else (token, fallback_token)
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    for candidate in candidates:
+        token_id = tokenizer.convert_tokens_to_ids(candidate)
+        if token_id is not None and token_id != unk_token_id:
+            return token_id
+
+    token_names = " or ".join(candidates)
+    raise ValueError(f"Cannot find token ({token_names}) in tokenizer vocab.")
 
 
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
@@ -107,6 +115,78 @@ def process_conversation_example(
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("dpo")
+def process_dpo_example(
+    example: Dict[str, Any],
+    chat_template: "ChatTemplate" = None,
+    tokenizer: "PreTrainedTokenizer" = None,
+    max_seq_len: int = 2048,
+    **kwargs,
+) -> List[Dict[str, "torch.Tensor"]]:
+    """Process a DPO preference pair into a single flat sample.
+
+    Chosen and rejected sequences are concatenated into one 1-D tensor with
+    ``position_ids`` that reset at the boundary so that flash-attention treats
+    them as two independent sequences.  This format is directly compatible with
+    ``MainCollator`` (packing + SP) — no DPO-specific collator is needed.
+
+    Supported input formats:
+      1. Conversation: {"chosen": [messages...], "rejected": [messages...]}
+      2. Plaintext with prompt: {"prompt": str, "chosen": str, "rejected": str}
+
+    Returns:
+        A list with one dict.  Each value is a 1-D tensor of length
+        ``len_chosen + len_rejected``.  Keys: ``input_ids``, ``attention_mask``,
+        ``labels``, ``position_ids``.
+    """
+    chosen_raw = example["chosen"]
+    rejected_raw = example["rejected"]
+
+    if isinstance(chosen_raw, list):
+        assert chat_template is not None, "chat_template is required for conversation-format DPO data"
+        chosen_tok = chat_template.encode_messages(chosen_raw, max_seq_len=max_seq_len)
+        rejected_tok = chat_template.encode_messages(rejected_raw, max_seq_len=max_seq_len)
+    else:
+        assert tokenizer is not None, "tokenizer is required for plaintext-format DPO data"
+        prompt = example.get("prompt", "")
+        chosen_text = prompt + chosen_raw
+        rejected_text = prompt + rejected_raw
+
+        chosen_ids = tokenizer.encode(chosen_text, add_special_tokens=True)[:max_seq_len]
+        rejected_ids = tokenizer.encode(rejected_text, add_special_tokens=True)[:max_seq_len]
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True) if prompt else []
+        prompt_len = len(prompt_ids)
+
+        chosen_tok = {
+            "input_ids": chosen_ids,
+            "attention_mask": [1] * len(chosen_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + chosen_ids[prompt_len:],
+        }
+        rejected_tok = {
+            "input_ids": rejected_ids,
+            "attention_mask": [1] * len(rejected_ids),
+            "labels": [IGNORE_INDEX] * prompt_len + rejected_ids[prompt_len:],
+        }
+
+    def _to_tensor(v):
+        return v if isinstance(v, torch.Tensor) else torch.tensor(v)
+
+    c_ids = _to_tensor(chosen_tok["input_ids"])
+    r_ids = _to_tensor(rejected_tok["input_ids"])
+    c_len = c_ids.shape[-1]
+    r_len = r_ids.shape[-1]
+
+    result = {
+        "input_ids": torch.cat([c_ids, r_ids]),
+        "attention_mask": torch.cat(
+            [_to_tensor(chosen_tok["attention_mask"]), _to_tensor(rejected_tok["attention_mask"])]
+        ),
+        "labels": torch.cat([_to_tensor(chosen_tok["labels"]), _to_tensor(rejected_tok["labels"])]),
+        "position_ids": torch.cat([torch.arange(c_len, dtype=torch.int64), torch.arange(r_len, dtype=torch.int64)]),
+    }
+    return [result]
 
 
 @DATA_TRANSFORM_REGISTRY.register("classification")
@@ -207,7 +287,6 @@ def _process_sample_qwen_vl_base(
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    use_mm_token_type_ids: bool = False,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -272,21 +351,31 @@ def _process_sample_qwen_vl_base(
         "attention_mask": attention_mask.unsqueeze(0),
     }
 
-    if use_mm_token_type_ids:
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        mm_token_type_ids[tokenized_example["image_mask"]] = 1
-        mm_token_type_ids[tokenized_example["video_mask"]] = 2
-        tokenized_example["mm_token_type_ids"] = mm_token_type_ids
-        position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[tokenized_example["image_mask"]] = 1
+    mm_token_type_ids[tokenized_example["video_mask"]] = 2
+    tokenized_example["mm_token_type_ids"] = mm_token_type_ids
+    position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
 
-    tokenized_example["position_ids"] = position_id_func(**position_id_func_kwargs)["position_ids"]
-    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
+    position_id_returns = position_id_func(**position_id_func_kwargs)
+    # Squeeze position_ids to match the per-sample (no batch dim) convention
+    # used everywhere else in this dict.
+    position_id_returns["position_ids"] = position_id_returns["position_ids"].squeeze().clone()
+    # Only position_ids is propagated into the training feature dict. The
+    # rope_deltas position_id_func also returns is generation-only (KV-cache
+    # decode); the training forward always receives a precomputed
+    # position_ids and never derives or reads rope_deltas.
+    tokenized_example["position_ids"] = position_id_returns["position_ids"]
 
     # Final cleanup
     tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
+    # image_inputs / video_inputs carry the HF processor's CPU `image_grid_thw`
+    # / `video_grid_thw` tensors; the collator packs them (DataCollateInfo
+    # pack_dim=0) and the model's metadata_collate_func hook derives the ViT
+    # metadata from them. No per-sample `.tolist()` sidecar needed here.
 
     return [tokenized_example]
 
@@ -296,6 +385,7 @@ def _process_sample_qwen_vl_base(
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_vl_moe")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_5")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_5_moe")
 def process_sample_qwen_vl(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
@@ -312,7 +402,6 @@ def process_sample_qwen_vl(
         processor,
         chat_template,
         position_id_func,
-        use_mm_token_type_ids=_is_transformers_v5,
         **kwargs,
     )
 
@@ -338,16 +427,9 @@ def process_sample_qwen_omni(
 
     def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
         tokenizer = getattr(processor, "tokenizer", processor)
-        vocab = tokenizer.get_vocab()
-        image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
-        video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
-        audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
-        if image_token_id is None:
-            raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
-        if video_token_id is None:
-            raise ValueError("Cannot find video token (<|video_pad|> or <|VIDEO|>) in tokenizer vocab.")
-        if audio_token_id is None:
-            raise ValueError("Cannot find audio token (<|audio_pad|> or <|AUDIO|>) in tokenizer vocab.")
+        image_token_id = _get_exact_token_id(tokenizer, "<|image_pad|>", "<|IMAGE|>")
+        video_token_id = _get_exact_token_id(tokenizer, "<|video_pad|>", "<|VIDEO|>")
+        audio_token_id = _get_exact_token_id(tokenizer, "<|audio_pad|>", "<|AUDIO|>")
         return image_token_id, video_token_id, audio_token_id
 
     image_token_id, video_token_id, audio_token_id = get_omni_token_ids(processor)
@@ -437,16 +519,20 @@ def process_sample_qwen_omni(
     input_ids[video_mask] = VIDEO_INPUT_INDEX
     input_ids[audio_mask] = AUDIO_INPUT_INDEX
 
-    model_inputs["position_ids"] = position_id_func(
+    position_id_returns = position_id_func(
         input_ids=input_ids.unsqueeze(0),
         image_grid_thw=model_inputs.get("image_grid_thw", None),
         video_grid_thw=model_inputs.get("video_grid_thw", None),
         attention_mask=model_inputs["attention_mask"],
         audio_seqlens=audio_feature_lengths,
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
-    )["position_ids"]
+    )
+    position_id_returns["position_ids"] = position_id_returns["position_ids"].clone()
+    # Only position_ids is propagated — rope_deltas is generation-only; see
+    # _process_sample_qwen_vl_base for the rationale. grid_thw tensors flow
+    # through model_inputs and are packed by the collator.
+    model_inputs["position_ids"] = position_id_returns["position_ids"]
 
-    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
     model_inputs["image_mask"] = image_mask
     model_inputs["video_mask"] = video_mask
     model_inputs["audio_mask"] = audio_mask
@@ -456,11 +542,8 @@ def process_sample_qwen_omni(
 
     labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
     tokenizer = getattr(processor, "tokenizer", processor)
-    vocab = tokenizer.get_vocab()
-    user_token_id = vocab.get("user")
-    assistant_token_id = vocab.get("assistant")
-    if user_token_id is None or assistant_token_id is None:
-        raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
+    user_token_id = _get_exact_token_id(tokenizer, "user")
+    assistant_token_id = _get_exact_token_id(tokenizer, "assistant")
     user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
     assistant_start_index = torch.where(input_ids == assistant_token_id)[0].tolist()
     user_start_index.append(len(input_ids) + 1)

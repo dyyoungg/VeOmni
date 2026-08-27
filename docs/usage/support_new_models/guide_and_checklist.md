@@ -1,11 +1,20 @@
 # Support New Models — Guide and Checklist
 
-**TLDR:** VeOmni patches HuggingFace models at runtime to add FSDP, Sequence Parallelism (SP), Expert Parallelism (EP), and fused kernels. This guide walks you through the integration steps with checklists per model type. For worked examples, see:
+**TLDR:** VeOmni layers FSDP, Sequence Parallelism (SP), Expert Parallelism (EP), and fused kernels on top of HuggingFace models. This guide walks you through the integration steps with checklists per model type. For worked examples, see:
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
 
-> **Scope note:** This guide currently targets the **transformers v4** integration/patchgen flow.
-> **TODO:** Add a dedicated **transformers v5** section, since modeling code patchgen requires a slightly different approach.
+> **Scope note:** VeOmni now pins `transformers==5.9.0` and ships
+> patchgen-generated modeling files under
+> `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
+> flow this document was originally written for has been retired. The high-level
+> checklists (registration, parallel plan, multimodal data transform, trainer
+> wiring, tests) still apply, but the modeling-patch steps below should be
+> read as describing what the *generated* file does, with the actual edits
+> happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
+> instructions on the patchgen flow, see
+> [the patchgen design guide](../../design/patchgen.md) and
+> the `veomni-migrate-transformers-v5` agent skill.
 
 ---
 
@@ -121,7 +130,7 @@ def get_parallel_plan():
         "model.layers.*.mlp.experts.up_proj":   Shard(0),
         "model.layers.*.mlp.experts.down_proj": Shard(0),
     }
-    return ParallelPlan(ep_plan=ep_plan)
+    return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 ```
 
 > **Finding correct paths:** run `for name, _ in model.named_parameters(): print(name)` on the unpatched HF model.
@@ -134,7 +143,7 @@ Two common issues:
 
 ### Step 7: Write the Data Transform Function
 
-Add `process_sample_your_model()` to [veomni/data/multimodal/data_transform.py](../../../veomni/data/multimodal/data_transform.py). See the example docs for the full function signature and steps.
+Add `process_sample_your_model()` to [veomni/data/data_transform.py](../../../veomni/data/data_transform.py). See the example docs for the full function signature and steps.
 
 ### Step 8: Hook into the Trainer
 
@@ -210,6 +219,7 @@ For implementation details of each patch, refer to the example docs.
 - [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
 - [ ] `pytest.param` in `test_cases` in `tests/models/test_models_patch.py` (Level 1)
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
+- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
 
 ---
 
@@ -244,7 +254,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
 from veomni.ops import fused_moe_forward
-from veomni.ops.fused_cross_entropy import ForCausalLMLoss
+from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids

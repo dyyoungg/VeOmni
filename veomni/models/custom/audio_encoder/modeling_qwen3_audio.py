@@ -22,6 +22,9 @@ from transformers.modeling_outputs import BaseModelOutput
 
 from flash_attn import flash_attn_varlen_func
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -428,6 +431,20 @@ class Qwen3AudioEncoder(PreTrainedModel):
             padded_embed.reshape(-1, padded_embed.shape[-1]), 0, valid_indices
         )
 
+        # Ulysses SP: slice hidden_states before transformer layers so each rank
+        # only computes a portion. Extend cu_seqlens for the SP-padding tail.
+        sp_enabled = self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled
+        if sp_enabled:
+            unpadded_hidden_len = hidden_states.shape[0]
+            hidden_states = slice_input_tensor(
+                hidden_states, dim=0, group=get_parallel_state().ulysses_group, padding=True
+            )
+            # The slice may pad; add a cu_seqlens entry for the padded tail so
+            # varlen attention treats it as an independent (zero-length) sequence.
+            pad_seq_len = hidden_states.shape[0] * get_parallel_state().sp_size - unpadded_hidden_len
+            if pad_seq_len > 0:
+                cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
+
         # Transformer layers
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
@@ -437,6 +454,13 @@ class Qwen3AudioEncoder(PreTrainedModel):
             else:
                 layer_outputs = layer(hidden_states, cu_seqlens, max_seqlen=max_seqlen)
             hidden_states = layer_outputs[0]
+
+        # Ulysses SP: gather back to full sequence after transformer layers
+        if sp_enabled:
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().ulysses_group)
+            sp_padding_size = hidden_states.shape[0] - unpadded_hidden_len
+            if sp_padding_size > 0:
+                hidden_states = hidden_states[:unpadded_hidden_len]
 
         hidden_states = self.ln_post(hidden_states)
 

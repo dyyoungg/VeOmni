@@ -10,7 +10,9 @@ from transformers import AutoConfig
 from flash_attn import flash_attn_varlen_func
 import math
 
-from veomni.models.transformers.qwen2_5vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel
+from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+    Qwen2_5_VisionTransformerPretrainedModel,
+)
 from veomni.models.custom.llava_qwen3moe.projector import build_image_projector
 from veomni.models.custom.llava_qwen3moe.base import BaseEncoderModelMixin, BaseEncoderConfigMixin
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLVisionConfig

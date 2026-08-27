@@ -373,9 +373,14 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
                 fake_audio_embeds = fake_audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds + fake_audio_embeds
 
-    
+
         if sp_enabled:
             inputs_embeds = gather_heads_scatter_seq(inputs_embeds, head_dim=2, seq_dim=1, group=sp_group)
+            # Position ids must match local seq chunk after scatter; slice to
+            # this SP rank's portion so RoPE encodes correct absolute positions.
+            sp_rank = dist.get_rank(sp_group)
+            chunk_size = position_ids.shape[-1] // parallel_state.sp_size
+            position_ids = position_ids[:, sp_rank * chunk_size : (sp_rank + 1) * chunk_size]
 
         # Build modality_ids for modality-aware routing (0=text, 1=vision, 2=audio)
         if getattr(self.omni_config, "modality_aware_routing", False):
@@ -410,7 +415,13 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
         logits = None
    
         if labels is not None and self.training:
-            loss, logits = self.loss_function(
+            # VeOmni's patched ``loss_function`` (installed by
+            # ``install_loss_mapping`` at build time) returns the 3-tuple
+            # ``(loss, logits, fused_linear_aux)``. The third slot carries a
+            # ``FusedLinearAuxOutput`` payload only on the ``return_log_probs``
+            # path (PPO / verl); it is ``None`` on the plain-loss training path
+            # we take here, so we discard it with ``_``.
+            loss, logits, _ = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.vocab_size,
@@ -483,8 +494,30 @@ class LlavaQwen3MoeForCausalLM(Qwen3MoeOmniPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
-    
 
+
+# ---------------------------------------------------------------------------
+# Runtime checkpoint tensor converter registration.
+#
+# ``LlavaQwen3MoeForCausalLM`` composes (not inherits) ``Qwen3MoeForCausalLM``
+# via ``self.model = foundation_llm.model``, so the per-expert HF-format
+# converter registered on ``Qwen3MoeForCausalLM`` in
+# ``veomni.models.transformers.qwen3_moe.__init__`` does NOT reach this
+# wrapper's class. Register a composite converter directly on the wrapper
+# that handles all three on-disk expert schemas the loader might see:
+#   1) legacy 3D-fused (pre-transformers-v5 VeOmni ckpts)
+#   2) per-expert HF (``experts.{j}.gate_proj.weight``, from
+#      :func:`export_weights` or stock HF repos)
+#   3) v5 native ``experts.gate_up_proj`` (pass-through — no code needed)
+# See ``checkpoint_tensor_converter.py`` for the tensor-level contract.
+# ---------------------------------------------------------------------------
+from veomni.models.custom.llava_qwen3moe.checkpoint_tensor_converter import (
+    create_llava_qwen3moe_checkpoint_tensor_converter,
+)
+
+LlavaQwen3MoeForCausalLM._create_checkpoint_tensor_converter = staticmethod(
+    create_llava_qwen3moe_checkpoint_tensor_converter
+)
 
 
 if __name__ == "__main__":

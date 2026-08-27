@@ -19,8 +19,6 @@ import traceback
 from collections import deque
 from typing import Any, Callable, Dict, Generator, Iterator, Optional
 
-from torch.utils.data import IterableDataset
-
 from ..utils import logging
 
 
@@ -31,45 +29,82 @@ logger = logging.get_logger(__name__)
 class DynBszBuffer:
     """
     A buffer to store samples for dynamic batch size.
+
+    Args:
+        get_length_fn: optional callable returning the per-sample token count used to
+            decide when a micro batch is ready. Defaults to ``attention_mask.sum()``
+            (i.e. total tokens). Pass a callable counting only ``labels != IGNORE_INDEX``
+            to balance by effective (loss-contributing) tokens.
+        get_physical_length_fn: optional callable returning the physical per-sample
+            token count used as a hard cap while selecting a micro batch.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+        get_physical_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+    ):
         self._buffer = []
         self._buffer_sample_lens = []
+        self._buffer_physical_lens = []
         self.del_idxs = []
         self.cur_idx = 0
         self.all_token_cnt = 0
+        self.all_physical_token_cnt = 0
+        self._get_length_fn = get_length_fn
+        self._get_physical_length_fn = get_physical_length_fn
 
     def append(self, item: Dict[str, Any]):
         """
         Append a sample to the buffer.
         Args:
             item: a sample to append to the buffer.
-                The sample should be a dict with the following keys:
-                    - input_ids: torch.Tensor of shape (seq_len, )
-                    - attention_mask: torch.Tensor of shape (seq_len, )
+                The sample should be a dict containing an ``attention_mask`` tensor
+                whose ``.sum()`` gives the number of valid tokens for batching.
         """
         self._buffer.append(item)
-        self._buffer_sample_lens.append(item["attention_mask"].sum())
-        self.all_token_cnt += self._buffer_sample_lens[-1]
+        if self._get_length_fn is not None:
+            length = self._get_length_fn(item)
+        else:
+            if "attention_mask" not in item:
+                raise KeyError("Expected 'attention_mask' in item")
+            length = int(item["attention_mask"].sum())
+        if self._get_physical_length_fn is not None:
+            physical_length = self._get_physical_length_fn(item)
+        else:
+            physical_length = length
+        self._buffer_sample_lens.append(length)
+        self._buffer_physical_lens.append(physical_length)
+        self.all_token_cnt += length
+        self.all_physical_token_cnt += physical_length
 
-    def get_samples(self, n_token_per_iter: int, force: bool = True):
+    def get_samples(self, n_token_per_iter: int, force: bool = True, physical_token_cap: Optional[int] = None):
         """
         get samples from the buffer.
         Args:
             n_token_per_iter: the number of tokens to get.
             force: if True, the first sample will be returned even if it is not full.
+            This can emit one sample that exceeds ``physical_token_cap`` by itself,
+            but the cap still prevents adding more samples to that micro batch.
         Returns:
             samples: a list of samples.
         """
         cum_seq_len = 0
+        cum_physical_len = 0
         samples = []
         while self.cur_idx < len(self._buffer) and cum_seq_len < n_token_per_iter:
             seq_len = self._buffer_sample_lens[self.cur_idx]
+            physical_seq_len = self._buffer_physical_lens[self.cur_idx]
+            fits_effective_budget = seq_len <= n_token_per_iter - cum_seq_len
+            fits_physical_cap = physical_token_cap is None or (
+                physical_seq_len <= physical_token_cap - cum_physical_len
+            )
+            first_forced_sample = force is True and cum_seq_len == 0
             if self.cur_idx not in self.del_idxs and (
-                (force is True and cum_seq_len == 0) or (seq_len <= n_token_per_iter - cum_seq_len)
+                first_forced_sample or (fits_effective_budget and fits_physical_cap)
             ):
                 cum_seq_len += seq_len
+                cum_physical_len += physical_seq_len
                 samples.append(self._buffer[self.cur_idx])
                 self.del_idxs.append(self.cur_idx)
             self.cur_idx += 1
@@ -85,10 +120,14 @@ class DynBszBuffer:
         """
         self.cur_idx = 0
         self.all_token_cnt -= sum([self._buffer_sample_lens[idx] for idx in self.del_idxs])
+        self.all_physical_token_cnt -= sum([self._buffer_physical_lens[idx] for idx in self.del_idxs])
         buffer_len = len(self._buffer)
         self._buffer = [self._buffer[idx] for idx in range(buffer_len) if idx not in self.del_idxs]
         self._buffer_sample_lens = [
             self._buffer_sample_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
+        ]
+        self._buffer_physical_lens = [
+            self._buffer_physical_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
         ]
         self.del_idxs = []
 
@@ -130,6 +169,11 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         bsz_warmup_steps: the number of steps to warm up the batch size.
         bsz_warmup_init_mbtoken: the initial number of tokens to get for each request.
         buffer_size: the size of the buffer.
+        get_length_fn: optional per-sample length callable; see ``DynBszBuffer``.
+        physical_token_cap: optional hard cap on the total physical tokens selected
+            into each micro batch.
+        get_physical_length_fn: optional per-sample physical length callable; see
+            ``DynBszBuffer``.
     """
 
     def __init__(
@@ -138,6 +182,9 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         buffer_size: int = 500,
         bsz_warmup_steps: int = 0,
         bsz_warmup_init_mbtoken: int = 200,
+        get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+        physical_token_cap: Optional[int] = None,
+        get_physical_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
     ) -> None:
         super().__init__()
         self._step = 0
@@ -148,13 +195,21 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             assert self.bsz_warmup_init_mbtoken > 0
 
         self.buffer_size = buffer_size  # minimum samples in buffer
-        self.buffer = DynBszBuffer()
+        self.physical_token_cap = physical_token_cap
+        self.get_physical_length_fn = get_physical_length_fn
+        self.buffer = DynBszBuffer(get_length_fn=get_length_fn, get_physical_length_fn=get_physical_length_fn)
 
     def is_ready_for_micro_batch(self) -> bool:
-        return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
+        effective_ready = len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
+        physical_ready = (
+            len(self.buffer) >= self.buffer_size
+            and self.physical_token_cap is not None
+            and self.buffer.all_physical_token_cnt >= self.physical_token_cap
+        )
+        return effective_ready or physical_ready
 
     def put_item(self, item: Dict[str, Any]):
-        if len(item["input_ids"]) == 1:
+        if item["input_ids"].shape[-1] <= 1:
             print("WARNING: EMPTY STRING.")
             return
         self.buffer.append(item)
@@ -179,305 +234,12 @@ class TextBatchingStrategy(BaseBatchingStrategy):
 
         self._step = step
         cur_token_micro_bsz = self.get_cur_token_micro_bsz()
-        samples = self.buffer.get_samples(cur_token_micro_bsz)
+        samples = self.buffer.get_samples(cur_token_micro_bsz, physical_token_cap=self.physical_token_cap)
         self.buffer.flush()  # remove the selected samples.
         return samples
 
     def empty(self) -> bool:
         return len(self.buffer) == 0
-
-
-class DynamicBatchingSizeDataset(IterableDataset):
-    """Dynamic batching dataset that yields micro batches based on token count.
-
-    Unlike ``DynamicBatchSizeDataLoader``, which constructs micro batches in the
-    main process after fetching from a plain DataLoader, ``DynamicBatchingSizeDataset``
-    performs batching inside each DataLoader worker process.
-    It is also compatible with ``StatefulDataLoader``'s per-worker ``state_dict()`` /
-    ``load_state_dict()`` mechanism, enabling exact checkpoint / resume for dynamic-batching workloads.
-
-    Internally each worker maintains a sample buffer.  A micro batch is emitted once
-    the buffer holds at least ``ready_for_micro_batch_threshold`` samples **and** their
-    combined token count reaches ``micro_batch_seq_length``.  When the upstream dataset
-    is exhausted, remaining buffer contents are drained and emitted as final batches
-    regardless of the threshold.
-
-    Attributes:
-        dataset: The upstream iterable dataset to read samples from.
-        ready_for_micro_batch_threshold: Minimum number of samples that must be in the
-            buffer before a microbatch can be formed.
-        micro_batch_seq_length: Target total token count per micro batch (soft upper
-            bound; may be exceeded by a single overlong sample when
-            ``force_generate_long_sequence`` is True).
-        get_length_fn: Function that returns the token count of a single sample.
-        save_by_idx: Whether to checkpoint the buffer as sample indices (smaller checkpoint size)
-            rather than full sample tensors.
-        force_generate_long_sequence: If True, a sample whose length alone exceeds
-            ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
-            being silently discarded. This is not supported yet.
-    """
-
-    def __init__(
-        self,
-        dataset: IterableDataset,
-        micro_batch_seq_length: int,
-        ready_for_micro_batch_threshold: int,
-        dynamic_batching_collate_fn: Callable,
-        save_by_idx: bool = True,
-        get_length_fn: Optional[Callable] = len,
-        force_generate_long_sequence: bool = False,
-    ) -> None:
-        """Initialize the DynamicBatchingSizeDataset.
-
-        Args:
-            dataset: The underlying iterable dataset to batch from.
-            micro_batch_seq_length: Target total token count per micro batch.
-            ready_for_micro_batch_threshold: Minimum number of samples required in
-                buffer before attempting to create a batch.
-            save_by_idx: If True, saves sample indices for checkpoint resumption.
-                Requires dataset to have get_item method and output_refetch_idx attribute.
-            get_length_fn: Function to compute the length (token count) of a sample.
-                Defaults to len.
-            force_generate_long_sequence: If True, a sample whose length alone exceeds
-                ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
-                being silently discarded. This is not supported yet.
-
-        Raises:
-            ValueError: If ``save_by_idx`` is True but ``dataset`` does not expose the
-                ``get_item()`` method and ``output_refetch_idx`` attribute required to
-                reconstruct the buffer from indices on resume.
-        """
-        self.dataset = dataset
-        self.dynamic_batching_collate_fn = dynamic_batching_collate_fn
-        self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold
-        self.micro_batch_seq_length = micro_batch_seq_length
-        self.get_length_fn = get_length_fn
-        self.save_by_idx = save_by_idx
-        self._data_iter = None
-
-        if force_generate_long_sequence:
-            raise ValueError("force_generate_long_sequence is not supported yet.")
-
-        self.force_generate_long_sequence = force_generate_long_sequence
-
-        if self.save_by_idx and not (
-            hasattr(self.dataset, "get_item") and hasattr(self.dataset, "output_refetch_idx")
-        ):
-            raise ValueError(
-                "save_by_idx is True, but dataset does not have get_item method or output_refetch_idx attribute to resume samples in buffers based on idx"
-            )
-        self.dataset.output_refetch_idx = self.save_by_idx
-
-        self._buffer = []
-        self._buffer_of_refetch_idx = []
-        self._buffer_token_count = 0
-
-    def __iter__(self):
-        """Iterate over the dataset and yield dynamically batched micro batches.
-
-        Buffers samples from the underlying dataset and yields micro batches when
-        the buffer contains enough samples and tokens. Each yielded batch is collated
-        using the dynamic_batching_collate_fn.
-
-        Yields:
-            Collated micro batch when buffer conditions are met.
-
-        Raises:
-            Exception: Re-raises any exception other than StopIteration encountered
-                during iteration.
-        """
-        self._data_iter = iter(self.dataset)
-
-        while True:
-            try:
-                if (
-                    len(self._buffer) >= self.ready_for_micro_batch_threshold
-                    and self._buffer_token_count >= self.micro_batch_seq_length
-                ):
-                    micro_batch = self._get_micro_batch()
-                    micro_batch = self.dynamic_batching_collate_fn(micro_batch)
-                    if micro_batch is not None:
-                        yield micro_batch
-                    else:
-                        logging.warn("dynamic_batching_collate_fn returned None, skip this micro_batch")
-
-                item = next(self._data_iter)
-                if self.save_by_idx:
-                    item, refetch_idx = item[0], item[1]
-
-                length = self.get_length_fn(item)
-                if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
-                    # TODO: record the count of discarded long examples for monitoring
-                    logger.warning(
-                        f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
-                    )
-                    continue
-
-                self._buffer.append((item, length))
-                if self.save_by_idx:
-                    self._buffer_of_refetch_idx.append(refetch_idx)
-
-                self._buffer_token_count += self._buffer[-1][1]
-
-            except Exception as e:
-                if isinstance(e, StopIteration):
-                    while len(self._buffer) > 0:
-                        micro_batch = self._get_micro_batch()
-                        micro_batch = self.dynamic_batching_collate_fn(micro_batch)
-                        if micro_batch is not None:
-                            yield micro_batch
-                        else:
-                            logging.warn("dynamic_batching_collate_fn returned None, skip this micro_batch")
-                    return
-                else:
-                    logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
-                    raise
-
-    def _get_micro_batch(self):
-        """Construct a micro batch from buffered samples using a greedy first-fit strategy.
-
-        Iterates the buffer in order and greedily adds each sample whose length fits
-        within the remaining token budget (``micro_batch_seq_length - seq_length``).
-        Samples that do not fit are left in the buffer for subsequent batches.
-
-        Special case: when the buffer's first sample alone exceeds
-        ``micro_batch_seq_length`` and ``force_generate_long_sequence`` is True, that
-        sample is taken unconditionally (``seq_length == 0`` guard) so that the dataset
-        never stalls on an overlong sequence.
-
-        Returns:
-            list: Non-empty list of samples forming the micro batch.
-
-        Raises:
-            AssertionError: If no sample could be selected (should never happen under
-                normal operation).
-        """
-        micro_batch = []
-        seq_length = 0
-        indices_to_remove_from_buffer = []
-
-        for idx, item in enumerate(self._buffer):
-            sample, length = item[0], item[1]
-
-            if length + seq_length > self.micro_batch_seq_length:
-                if seq_length > 0:
-                    continue
-                elif not self.force_generate_long_sequence:
-                    # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
-                    continue
-
-            micro_batch.append(sample)
-            seq_length += length
-            self._buffer_token_count -= length
-            indices_to_remove_from_buffer.append(idx)
-
-            if seq_length >= self.micro_batch_seq_length:
-                break
-
-        # Remove selected items from buffer (iterate backwards to maintain indices)
-        for idx in reversed(indices_to_remove_from_buffer):
-            del self._buffer[idx]
-            if self.save_by_idx:
-                del self._buffer_of_refetch_idx[idx]
-
-        assert len(micro_batch) > 0
-        return micro_batch
-
-    def state_dict(self):
-        """Get the state dictionary for checkpointing.
-
-        Saves the current buffer state and token count. If save_by_idx is True,
-        only saves sample indices; otherwise saves the full buffer contents.
-        Also saves the upstream dataset state if available.
-
-        Returns:
-            dict: State dictionary containing:
-                - save_by_idx: Whether indices are saved instead of samples.
-                - buffer_token_count: Total token count in the buffer.
-                - buffer: Buffered samples or their indices.
-                - dynamic_batch_upstream_dataset_state: Upstream dataset state (if available).
-        """
-        state = {
-            "save_by_idx": self.save_by_idx,
-            # Make sure we store an integer instead of any tensor
-            "buffer_token_count": int(self._buffer_token_count),
-        }
-
-        # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
-        # so we try to not include extra calculations here.
-        if self.save_by_idx:
-            state["buffer"] = copy.deepcopy(self._buffer_of_refetch_idx)
-        else:
-            # deepcopy buffer so that it can be transfered through multiple processes
-            state["buffer"] = copy.deepcopy(self._buffer)
-
-        if hasattr(self.dataset, "state_dict"):
-            state["dynamic_batch_upstream_dataset_state"] = self.dataset.state_dict()
-
-        return state
-
-    def load_state_dict(self, state_dict):
-        """Load state from a checkpoint.
-
-        Restores the buffer and token count from a saved state. Handles both
-        index-based and full-sample buffer restoration based on the saved state.
-        Also restores the upstream dataset state if available.
-
-        Args:
-            state_dict: State dictionary from a previous checkpoint, containing:
-                - save_by_idx: Whether the saved buffer contains indices.
-                - buffer: Saved buffer (samples or indices).
-                - buffer_token_count: Saved token count.
-                - dynamic_batch_upstream_dataset_state: Upstream dataset state (optional).
-
-        Raises:
-            AssertionError: If the restored ``buffer_token_count`` does not match the
-                sum of token lengths recomputed from the reconstructed buffer.
-            ValueError: If ``save_by_idx`` is True on the current instance but the
-                checkpoint buffer holds some full samples instead of indices (incompatible
-                checkpoint format).
-        """
-        # prev_save_by_idx does not have to be equal to self.save_by_idx, however, we still need to resume the buffer according to it.
-        prev_save_by_idx = state_dict["save_by_idx"]
-        if prev_save_by_idx:
-            self._buffer = []
-            self._buffer_of_refetch_idx = []
-            for idx in state_dict["buffer"]:
-                item = self.dataset.get_item(idx)
-                length = self.get_length_fn(item)
-                self._buffer.append((item, length))
-                if self.save_by_idx:
-                    self._buffer_of_refetch_idx.append(idx)
-        else:
-            self._buffer = state_dict["buffer"]
-            if self.save_by_idx and len(self._buffer) > 0:
-                raise ValueError("save_by_idx is True, but previous buffer contains valid samples instead of indices")
-            self._buffer_of_refetch_idx = []
-
-        self._buffer_token_count = state_dict["buffer_token_count"]
-        # Verify buffer_token_count matches the sum of token lengths
-        assert self._buffer_token_count == sum([item[1] for item in self._buffer]), (
-            "buffer_token_count does not match the sum of token lengths in buffer"
-        )
-        assert self._buffer_token_count == sum(self.get_length_fn(item[0]) for item in self._buffer), (
-            "buffer_token_count does not match the sum of lengths computed from samples in buffer"
-        )
-        del state_dict["buffer"]
-
-        if "dynamic_batch_upstream_dataset_state" in state_dict:
-            self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
-
-    def set_epoch(self, epoch: int):
-        """Set the epoch for the upstream dataset.
-
-        Passes the epoch to the upstream dataset if it supports set_epoch.
-        Has no direct effect on dynamic batching itself.
-
-        Args:
-            epoch: The epoch number to set.
-        """
-        if hasattr(self.dataset, "set_epoch"):
-            self.dataset.set_epoch(epoch)
 
 
 class DynamicBatchSizeDataLoader:

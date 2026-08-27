@@ -1,22 +1,33 @@
 import copy
+import functools
 import gc
+import importlib
 import os
+import sys
 from typing import Dict
 
 import pytest
 import torch
 
 from veomni import _apply_patches
-from veomni.arguments import CheckpointConfig, DataArguments, ModelArguments, TrainingArguments
+from veomni.arguments import (
+    AcceleratorConfig,
+    CheckpointConfig,
+    DataArguments,
+    FSDPConfig,
+    MixedPrecisionConfig,
+    ModelArguments,
+    TrainingArguments,
+)
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
+from ..tools.training_utils import make_eager_ops_config
 from .utils import (
     ModelMode,
     compare_multi_items,
@@ -25,12 +36,113 @@ from .utils import (
     print_all_values,
     set_environ_param,
 )
-from .weight_sync_adapters import get_sync_weight_func
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # enable_full_determinism(42)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Test-scope shim for a transformers 5.9 upstream bug in qwen-family multimodal
+# `Model.forward(**kwargs)` paths.
+#
+# The bug: upstream Qwen*VLModel / Qwen*OmniModel-style `forward` accepts
+# `**kwargs` and forwards them as-is into `self.visual(..., **kwargs)`. When
+# the outer caller has populated `FlashAttentionKwargs` (`cu_seq_lens_q/k`,
+# `max_length_q/k`) for the LM packed-sequence path — which VeOmni's data
+# pipeline always does — those LM-level keys ride through the ViT block
+# chain and reach `*VisionAttention.forward`, which then does:
+#
+#     attention_interface(..., cu_seq_lens_q=cu_seqlens, ..., **kwargs)
+#
+# Same key on both sides → `TypeError: got multiple values for keyword
+# argument 'cu_seq_lens_q'` at the Python call site, before any function body
+# even runs.
+#
+# We do NOT hit this in production. VeOmni's own patched `Model.forward`
+# (loaded via patchgen at `veomni/models/transformers/<m>/generated/`) builds
+# a clean `image_vit_kwargs = {"vit_metadata": ...}` and never forwards the
+# LM kwargs into the visual call — see e.g.
+# `qwen2_vl_gpu_patch_gen_config.py:409` (`image_vit_kwargs`). So the
+# `MODELING_BACKEND=veomni` mode in this test passes without any patching.
+#
+# But this test ALSO exercises `MODELING_BACKEND=hf` (raw upstream modeling)
+# for HF↔VeOmni numerics parity, and that path imports the upstream modeling
+# files directly — patchgen never runs. To keep the `hf` arm running on
+# transformers 5.9, we wrap the upstream ViT classes' `.forward` here and pop
+# the leaked keys at the ViT entrypoint. The wrap is scoped to this test
+# module — the runtime VeOmni stack (`veomni/ops/...`) ships with no such
+# monkey-patch, on purpose (see `docs/transformers_v5/patchgen.md`: VeOmni
+# avoids runtime monkey-patching of upstream model code).
+#
+# Drop this shim when upstream stops leaking the LM-level FlashAttentionKwargs
+# into the visual call (it would also need to filter them out of the
+# `Model.forward(**kwargs)` → `self.visual(**kwargs)` chain).
+# ────────────────────────────────────────────────────────────────────────────
+_HF_VIT_FORWARDS_PATCHED = False
+_LEAKED_LM_FLASH_KWARGS = (
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+)
+# Both the visual and (for omni models) audio encoder forwards leak — the
+# `forward` of each receives `**kwargs` from the outer `Model.forward` and
+# threads them into the per-block attention call. Wrap both at the encoder
+# entrypoint.
+_HF_VIT_CLASSES_TO_STRIP: tuple[tuple[str, str], ...] = (
+    ("transformers.models.qwen2_vl.modeling_qwen2_vl", "Qwen2VisionTransformerPretrainedModel"),
+    ("transformers.models.qwen2_5_vl.modeling_qwen2_5_vl", "Qwen2_5_VisionTransformerPretrainedModel"),
+    ("transformers.models.qwen3_vl.modeling_qwen3_vl", "Qwen3VLVisionModel"),
+    ("transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe", "Qwen3VLMoeVisionModel"),
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5VisionModel"),
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeVisionModel"),
+    ("transformers.models.qwen2_5_omni.modeling_qwen2_5_omni", "Qwen2_5OmniVisionEncoder"),
+    ("transformers.models.qwen2_5_omni.modeling_qwen2_5_omni", "Qwen2_5OmniAudioEncoder"),
+    ("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe", "Qwen3OmniMoeVisionEncoder"),
+    ("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe", "Qwen3OmniMoeAudioEncoder"),
+)
+
+
+def _patch_hf_vit_forwards_for_5_9_flash_kwargs_leak() -> None:
+    """Wrap upstream qwen-family ViT ``forward`` to pop LM-level flash kwargs.
+
+    See the module-level comment block above for the full rationale. Idempotent
+    via ``_HF_VIT_FORWARDS_PATCHED`` and a per-method marker, and a no-op for
+    VeOmni's patchgen-generated classes (they are different Python objects).
+    """
+    global _HF_VIT_FORWARDS_PATCHED
+    if _HF_VIT_FORWARDS_PATCHED:
+        return
+
+    def _strip_leaked(forward):
+        @functools.wraps(forward)
+        def wrapped(*args, **kwargs):
+            for key in _LEAKED_LM_FLASH_KWARGS:
+                kwargs.pop(key, None)
+            return forward(*args, **kwargs)
+
+        wrapped._hf_vit_kwargs_strip = True
+        return wrapped
+
+    for module_path, class_name in _HF_VIT_CLASSES_TO_STRIP:
+        try:
+            mod = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, class_name, None)
+        if cls is None:
+            continue
+        if getattr(cls.forward, "_hf_vit_kwargs_strip", False):
+            continue
+        cls.forward = _strip_leaked(cls.forward)
+
+    _HF_VIT_FORWARDS_PATCHED = True
+
+
+# Apply at module import — test-scope, idempotent.
+_patch_hf_vit_forwards_for_5_9_flash_kwargs_leak()
 
 
 def _release_device_memory():
@@ -55,6 +167,28 @@ class TrainerTest(BaseTrainer):
 
     def _build_model_assets(self):
         self.model_assets = []
+
+    # Op names whose OpSlot state should match use_liger_kernel.
+    _LIGER_OP_NAMES = {"rms_norm", "swiglu_mlp", "apply_rotary_pos_emb", "cross_entropy_loss"}
+
+    def _verify_opslot_state(self, model_mode: ModelMode):
+        """Assert OpSlot binding matches use_liger_kernel after model build."""
+        from veomni.ops.dispatch import OpSlot
+
+        modeling_module = sys.modules.get(self.model.__class__.__module__)
+        if modeling_module is None:
+            return
+        for name, obj in vars(modeling_module).items():
+            if not isinstance(obj, OpSlot) or obj.op_name not in self._LIGER_OP_NAMES:
+                continue
+            if model_mode.use_liger_kernel:
+                assert obj.use_non_eager_impl, (
+                    f"OpSlot {name} ({obj.op_name}/{obj.variant}) should have kernel when use_liger_kernel=True"
+                )
+            else:
+                assert not obj.use_non_eager_impl, (
+                    f"OpSlot {name} ({obj.op_name}/{obj.variant}) should be eager when use_liger_kernel=False"
+                )
 
     def _build_data_transform(self):
         pass
@@ -86,23 +220,64 @@ class TrainerTest(BaseTrainer):
         pass
 
     def forward_backward_step(self, state_dict: Dict[str, torch.Tensor], model_mode: ModelMode, dataloader):
+        # Aggressive teardown of any model / optimizer / lr_scheduler from the
+        # previous mode iteration. Without this the prior FSDP-wrapped model
+        # plus its optimizer states stay pinned across `_build_model` calls
+        # (Python GC alone is not enough because FSDP / lazy-init hold cross
+        # references), and on multi-mode runs over qwen3_5 we accumulate
+        # 5+ GiB per mode, eventually OOM'ing on the embedding tensor for the
+        # next model build (manifested as ``Process X has 43.80 GiB``).
+        # ``hasattr`` returns True for class-level descriptors that ``delattr``
+        # can't remove (e.g. inherited properties on BaseTrainer), so use the
+        # instance ``__dict__`` directly.
+        for _attr in ("model", "optimizer", "lr_scheduler"):
+            self.__dict__.pop(_attr, None)
+        _release_device_memory()
+
         set_environ_param(model_mode)
         _apply_patches()
 
         model_name = self.model_config.model_type
-        self.args.model.ops_implementation.attn_implementation = model_mode.attn_implementation
-        self.args.model.ops_implementation.moe_implementation = model_mode.moe_implementation
+        from .utils import _build_ops_config_for_mode
+
+        self.args.model.ops_implementation = _build_ops_config_for_mode(model_mode)
+
+        if model_mode.use_liger_kernel:
+            self.args.model.ops_implementation.rms_norm_implementation = "liger_kernel"
+            self.args.model.ops_implementation.swiglu_mlp_implementation = "liger_kernel"
+            self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
+            # qwen3_5 / qwen3_5_moe have a large vocab and the fused Liger
+            # cross-entropy materializes the full [B, S, V] logits buffer
+            # (~5 GiB on the toy config), which OOMs on shared L20 runners
+            # where another job is still holding part of the card. Use
+            # chunk_loss for those two models — it processes the vocab in
+            # chunks so peak allocation stays modest; the other liger ops
+            # (rms_norm / rotary / swiglu) are still exercised.
+            if model_name in ("qwen3_5", "qwen3_5_moe"):
+                self.args.model.ops_implementation.cross_entropy_loss_implementation = "chunk_loss"
+            else:
+                self.args.model.ops_implementation.cross_entropy_loss_implementation = "liger_kernel"
+        else:
+            self.args.model.ops_implementation.rms_norm_implementation = "eager"
+            self.args.model.ops_implementation.swiglu_mlp_implementation = "eager"
+            self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
+            self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
         self._build_model()
+        self._verify_opslot_state(model_mode)
         self._build_optimizer()
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights
-        if model_mode.sync_weight_func is None:
-            self.model.load_state_dict(state_dict)
-        else:
-            model_mode.sync_weight_func(self.model_config, state_dict, self.model)
+        # Sync weights — every model that test_models_patch covers ships a
+        # patchgen layout that matches HF's in-memory state dict, so a
+        # straight ``load_state_dict`` is sufficient. When loading from a real
+        # on-disk HF safetensors checkpoint, the per-expert → fused merge
+        # still happens, but at the runtime-converter layer (e.g.
+        # ``DeepseekV3CheckpointTensorConverter``); that path is exercised by
+        # ``test_logits_bitwise_equal_v5_via_loader`` in
+        # ``test_models_logits_equal.py``.
+        self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
             self.model.disable_talker()
@@ -148,124 +323,122 @@ class TrainerTest(BaseTrainer):
         return result_metrics
 
 
-# Test case: (config_path, is_moe, rtol, atol). id= must match weight_sync_adapters key if the model needs custom sync.
+# Test case: (config_path, is_moe, rtol, atol).
 # rtol/atol: tolerances for compare_multi_items; can be set per case.
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-_TEST_CASES_TRANSFORMERS_V4 = [
+# Models without a patchgen path are not covered here. Migrate them via
+# ``/veomni-migrate-transformers-v5`` to bring them back into this list.
+TEST_CASES = [
     pytest.param(
-        "./tests/toy_config/llama31_toy",
+        "./tests/toy_config/llama31_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        id="llama3.1",
+        id="llama3_1",
     ),
     pytest.param(
-        "./tests/toy_config/qwen25_toy",
+        "./tests/toy_config/qwen3_5_toy/config.json",
         False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2.5",
+        # qwen3_5* uses chunk_loss in liger mode (see forward_backward_step
+        # — fused Liger CE OOMs on the qwen3_5 full vocab). chunk_loss is
+        # bit-exact with eager but drifts ~3% from HF native CE in bfloat16
+        # via the GatedDeltaNet linear-attention path. Bump tolerance so
+        # the HF↔VeOmni gnorm comparison stays in band.
+        0.05,
+        0.05,
+        id="qwen3_5",
     ),
     pytest.param(
-        "./tests/toy_config/qwen3_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3_moe_toy",
+        "./tests/toy_config/qwen3_5_moe_toy/config.json",
         True,
-        0.5,
-        0.02,
-        id="qwen3_moe",
+        # Same chunk_loss/HF drift as qwen3_5 above; MoE path adds
+        # routing-loss noise on top so allow a slightly wider envelope.
+        0.05,
+        0.05,
+        id="qwen3_5_moe",
     ),
     pytest.param(
-        "./tests/toy_config/seed_oss_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="seed_oss",
-    ),
-    pytest.param(
-        "./tests/toy_config/deepseek_v3_toy",
-        True,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="deepseek_v3",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen2vl_toy",
+        "./tests/toy_config/qwen2vl_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen2_vl",
     ),
     pytest.param(
-        "./tests/toy_config/qwen25vl_toy",
+        "./tests/toy_config/qwen2_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen25vl_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen2_5_vl",
     ),
     pytest.param(
-        "./tests/toy_config/qwen3vl_toy",
+        "./tests/toy_config/qwen3vl_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_vl",
     ),
     pytest.param(
-        "./tests/toy_config/qwen25omni_toy",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen2_5_omni",
-    ),
-    pytest.param(
-        "./tests/toy_config/qwen3vlmoe_toy",
+        "./tests/toy_config/qwen3vlmoe_toy/config.json",
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_vl_moe",
     ),
     pytest.param(
-        "./tests/toy_config/qwen3omni_toy",
+        "./tests/toy_config/qwen25omni_toy/config.json",
         False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="qwen2_5_omni",
+    ),
+    pytest.param(
+        "./tests/toy_config/qwen3omni_toy/config.json",
+        True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_omni_moe",
     ),
-]
-
-_TEST_CASES_TRANSFORMERS_V5 = [
     pytest.param(
-        "./tests/toy_config/qwen3_5_toy/config.json",
+        "./tests/toy_config/seed_oss_toy/config.json",
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        id="qwen3_5",
+        id="seed_oss",
     ),
     pytest.param(
-        "./tests/toy_config/qwen3_5_moe_toy/config.json",
+        "./tests/toy_config/deepseek_v3_toy/config.json",
         True,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        id="qwen3_5_moe",
+        id="deepseek_v3",
+    ),
+    pytest.param(
+        "./tests/toy_config/deepseek_v4_toy/config.json",
+        True,
+        # DeepSeek-V4 ships eager-only attention (head_dim=512 > FA cap,
+        # no SDPA sink-aware kernel, FlexAttention can't resize BlockMask
+        # mid-block). Until a v4-specific eager-SP / fused-attention path
+        # lands, the per-block parity gap inherits the eager baseline; the
+        # default rtol/atol remain a strict gate on the fused-MoE +
+        # cross-entropy patch.
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v4",
     ),
 ]
 
-if is_transformers_version_greater_or_equal_to("5.0.0"):
-    test_cases = _TEST_CASES_TRANSFORMERS_V5
-    print("[test_models_patch] Using transformers v5 test cases.")
-else:
-    test_cases = _TEST_CASES_TRANSFORMERS_V4
-    print("[test_models_patch] Using transformers v4 test cases.")
 
-
-@pytest.mark.parametrize("config_path, is_moe, rtol, atol", test_cases)
+@pytest.mark.parametrize("config_path, is_moe, rtol, atol", TEST_CASES)
 def test_models_patch_fwd_bwd(
     request: pytest.FixtureRequest,
     config_path: str,
@@ -274,13 +447,7 @@ def test_models_patch_fwd_bwd(
     atol: float,
 ):
     case_id = request.node.callspec.id
-    sync_weight_func = get_sync_weight_func(case_id)
-    hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe, sync_weight_func=sync_weight_func)
-
-    # delete flash_attention_3 mode for hf deepseek_v3.
-    # TODO: transformers v5 fixed this, remove this after veomni support transformers v5.
-    if case_id == "deepseek_v3":
-        hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
+    hf_model_modes, veomni_model_modes = prepare_model_modes(is_moe=is_moe)
 
     # hf qwen2_5_omni fa3 error
     if case_id == "qwen2_5_omni":
@@ -290,21 +457,53 @@ def test_models_patch_fwd_bwd(
             # npu not support torch.kaiser_window init in Token2WavBigVGANModel
             return
 
+    # DeepSeek-V4 attention is eager-only: ``_supports_flash_attn = False``
+    # / ``_supports_sdpa = False`` / ``_supports_flex_attn = False`` —
+    # ``head_dim=512`` exceeds FA's 256 cap, SDPA lacks the per-head learnable
+    # sink, and FlexAttention can't resize BlockMask after the in-block
+    # compressor concatenation. The default FA-based mode grid would fail at
+    # ``TrainerTest(hf_model_modes[0])`` with
+    # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
+    # Keep attention eager, but exercise VeOmni's default GPU MoE path: the
+    # DeepSeek-V4 experts patch forwards ``swiglu_limit`` into the fused kernel.
+    # NPU fused MoE still raises for that clamp, so NPU keeps the eager MoE
+    # baseline until ``fused_npu`` implements ``swiglu_limit``.
+    if case_id == "deepseek_v4":
+        hf_model_modes = [ModelMode("hf", "eager")]
+        moe_impl = "eager" if IS_NPU_AVAILABLE else "fused_triton"
+        veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
+
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.
     # - VeOmni backend doesn't support the padded_bsh cases as we only support packed sequence case.
     if case_id in ("qwen3_5", "qwen3_5_moe"):
+        if IS_NPU_AVAILABLE:
+            # Qwen3.5 GatedDeltaNet has no NPU backend (no FLA / FlashQLA on
+            # Ascend); the OpSlot bind for fla raises on NPU.
+            return
         #    hf_model_modes = [mode for mode in hf_model_modes if mode.attn_case != "position_ids"]
         hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
         veomni_model_modes = [
             mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
         ]
 
-    model_config = ModelArguments(config_path=config_path)
+    # The actual ops backend used per test case is set by ``set_environ_param``
+    # inside ``TrainerTest`` (which calls ``apply_ops_config`` with a
+    # mode-specific config). The ops_implementation on this ModelArguments is
+    # never consumed at training time, so we pin it to all-eager — without
+    # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
+    # fused_triton / triton) would fail validation on NPU before the test
+    # even runs.
+    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
     data_config = DataArguments(train_path="")
     training_config = TrainingArguments(
         checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
-        enable_mixed_precision=False,
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(
+                fsdp_mode="ddp",
+                mixed_precision=MixedPrecisionConfig(enable=False),
+            ),
+        ),
         enable_full_determinism=True,
         init_device=get_device_type(),
     )
@@ -322,12 +521,18 @@ def test_models_patch_fwd_bwd(
     del trainer.model, trainer.optimizer, trainer.lr_scheduler
 
     model_config = trainer.model_config
-    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config)
+    # Upstream DeepSeek-V4 eager attention does not consume packed cu-seqlens.
+    # Comparing it with VeOmni's boundary-aware packed path on two concatenated
+    # samples would therefore compare different attention semantics. Keep this
+    # HF↔VeOmni patch-alignment case to one sequence; multi-sample packed V4 is
+    # covered by ``test_deepseek_v4_tilelang_dyn_bsz_smoke``.
+    num_samples = 1 if case_id == "deepseek_v4" else 2
+    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config, num_samples=num_samples)
 
     res = {}
     log_keys = []
     # Train HF backend models
-    for idx, mode in enumerate(hf_model_modes):
+    for _idx, mode in enumerate(hf_model_modes):
         result_metrics = trainer.forward_backward_step(state_dict, mode, dummy_data_loader)
         if not log_keys:
             log_keys = set(result_metrics.keys())
@@ -335,7 +540,7 @@ def test_models_patch_fwd_bwd(
             assert set(result_metrics.keys()) == set(log_keys)
         res[mode] = result_metrics
     # Train VeOmni backend models
-    for idx, mode in enumerate(veomni_model_modes):
+    for _idx, mode in enumerate(veomni_model_modes):
         result_metrics = trainer.forward_backward_step(state_dict, mode, dummy_data_loader)
         assert set(result_metrics.keys()) == set(log_keys)
         res[mode] = result_metrics

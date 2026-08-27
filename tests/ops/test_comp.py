@@ -30,7 +30,7 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
 
     device = self.pos_embed.weight.device
     dtype = self.pos_embed.weight.dtype
-    for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+    for _t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=True):
         h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, dtype=torch.float64)
         w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, dtype=torch.float64)
 
@@ -88,9 +88,13 @@ def fast_pos_embed_interpolate_ref(self, grid_thw):
 def rot_pos_emb_ref(self, grid_thw):
     merge_size = self.spatial_merge_size
 
-    max_hw = int(grid_thw[:, 1:].max().item())
-    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-    device = freq_table.device
+    # transformers 5.9 replaced the upstream ``rotary_pos_emb(seqlen: int) -> (seqlen, dim//2)``
+    # freq-table lookup with ``rotary_pos_emb(position_ids: Tensor) -> (pos_ids * inv_freq).flatten(1)``.
+    # The math is identical (``freq_table[pos_ids].flatten(1)`` == direct broadcast),
+    # so the reference just hands the full pos_ids tensor in; what makes this the
+    # "reference" path versus the optimized ``rot_pos_emb`` under test is the per-grid
+    # arange/expand pos_ids build (no lru_cached ``rot_pos_ids``).
+    device = self.rotary_pos_emb.inv_freq.device
 
     total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
     pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
@@ -120,9 +124,7 @@ def rot_pos_emb_ref(self, grid_thw):
         pos_ids[offset : offset + num_tokens] = coords
         offset += num_tokens
 
-    embeddings = freq_table[pos_ids]  # lookup rotary embeddings
-    embeddings = embeddings.flatten(1)
-    return embeddings
+    return self.rotary_pos_emb(pos_ids)
 
 
 def compare(args, model, grid_thw, ref_fn, test_fn):
@@ -161,10 +163,26 @@ def compare(args, model, grid_thw, ref_fn, test_fn):
 
 
 def main(args):
-    # Initialize the model and get the visual
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    # Initialize the model and get the visual. Pin every per-op field to
+    # eager so the benchmark builds without liger / triton / fla.
+    eager_ops = OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
     dummy_model = build_foundation_model(
         config_path=args.config_path,
         init_device=args.device,
+        ops_implementation=eager_ops,
     ).model.visual
 
     dummy_model.pos_embed.weight = torch.nn.Parameter(torch.randn_like(dummy_model.pos_embed.weight))

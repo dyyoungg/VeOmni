@@ -3,6 +3,8 @@ name: Check Patchgen Drift
 on:
   pull_request:
     paths:
+      - ".github/workflows/check_patchgen.yml"
+      - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
@@ -11,6 +13,8 @@ on:
     branches:
       - main
     paths:
+      - ".github/workflows/check_patchgen.yml"
+      - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
@@ -30,7 +34,24 @@ jobs:
           python-version: "3.11"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          # Pin a concrete uv inside the pyproject required-version range
+          # (>=0.9.8,<0.13). This job runs on ubuntu-latest (not a prebuilt
+          # image), so without a pin setup-uv floats to the newest uv and would
+          # fail the required-version check the moment uv ships a release above
+          # the range ceiling. Keep this in sync with the docker/ uv pin.
+          version: "0.11.16"
+
+      - name: Sync patchgen environment
+        run: |
+          # Patchgen is CPU-only. These MagiAttention packages build CUDA
+          # extensions during sync but are not needed for drift checks.
+          uv sync --extra gpu --dev \
+            --no-install-package magi-attention \
+            --no-install-package create-block-mask-cuda \
+            --no-install-package flash-attn-cute \
+            --no-install-package magi-to-hstu-cuda
 
       - name: Check patchgen drift
-        run: uv run --no-group transformers-stable --extra transformers5-exp --extra gpu --dev python -m veomni.patchgen.check_patchgen
+        run: uv run --no-sync patchgen --check

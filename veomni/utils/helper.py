@@ -78,6 +78,9 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
     from transformers import PretrainedConfig
 
+    from ..distributed.parallel_state import ParallelState
+    from ..lora import VeOmniLoraConfig
+
 
 logger = logging.get_logger(__name__)
 
@@ -87,11 +90,21 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
-        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        tail_padding_length = micro_batch.get("tail_padding_length")
+        seqlens = valid_seqlens_from_cu_seqlens(
+            micro_batch["cu_seq_lens_q"],
+            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+        ).tolist()
         return seqlens
     elif "seq_lens" in micro_batch:
         seqlens = micro_batch["seq_lens"].tolist()
         return seqlens
+
+    elif "chosen_attention_mask" in micro_batch:
+        # DPO preference pair — report combined chosen + rejected length
+        chosen_len = micro_batch["chosen_attention_mask"].sum().item()
+        rejected_len = micro_batch["rejected_attention_mask"].sum().item()
+        return [chosen_len + rejected_len]
     else:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
@@ -122,6 +135,29 @@ def _compute_audio_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     return audio_seqlens
 
 
+
+
+def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    if "latents" not in micro_batch:
+        return []
+    dit_latents_seqlens = []
+    for latents in micro_batch["latents"]:
+        latent_shape = latents.shape
+        if len(latent_shape) == 3:
+            B, seq_len, _C = latent_shape
+            dit_latents_seqlens.append(B * seq_len)
+            continue
+        if len(latent_shape) == 5:
+            B = latent_shape[0]
+        else:
+            B = 1
+        C, T, H, W = latent_shape[-4:]
+        T_out = int((T - 1) / 1 + 1)
+        H_out = int((H - 2) / 2 + 1)
+        W_out = int((W - 2) / 2 + 1)
+        seqlens = B * T_out * H_out * W_out
+        dit_latents_seqlens.append(seqlens)
+    return dit_latents_seqlens
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -158,12 +194,15 @@ class EnvironMeter:
         data_path: str = "",
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
+        parallel_state: Optional["ParallelState"] = None,
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
+
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
         self.consume_chunks = 0
@@ -178,13 +217,19 @@ class EnvironMeter:
                     "`dataloader` and `data_path` is required for `EnvironMeter` with multi-source dataloader."
                 )
 
-            self.multisource_tracker = MultiSourceInfoTracker(dataloader=dataloader, data_path=data_path)
+            self.multisource_tracker = MultiSourceInfoTracker(
+                dataloader=dataloader, data_path=data_path, parallel_state=self.parallel_state
+            )
 
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
             self.estimate_flops = FlopsCounter(config).estimate_flops
+            self.supports_lora_flops = False
         else:
-            self.estimate_flops = VeomniFlopsCounter(config).estimate_flops
+            flops_counter = VeomniFlopsCounter(config)
+            self.estimate_flops = flops_counter.estimate_flops
+            self.supports_lora_flops = True
+        self._warned_unsupported_lora_flops = False
 
         if self.gc_steps > 0:
             gc.disable()
@@ -240,7 +285,7 @@ class EnvironMeter:
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
-            group=get_parallel_state().dp_group,
+            group=self.parallel_state.dp_group,
         )
         # all_reduce breakdown components (each is per-rank TFLOPs, sum across DP)
         if flops_breakdown:
@@ -252,11 +297,11 @@ class EnvironMeter:
             flops_breakdown = {k: v for k, v in zip(keys, breakdown_reduced)}
 
         flops_promised = flops_promised * self.world_size
-        mfu = flops_achieved / flops_promised
+        mfu = flops_achieved / flops_promised if flops_promised else 0
 
         # calculate average effective len and tokens per second
-        avg_effective_len = batch_tokens / self.global_batch_size
-        avg_sample_seq_len = batch_tokens / real_global_batch_size
+        avg_effective_len = batch_tokens / self.global_batch_size if self.global_batch_size else 0
+        avg_sample_seq_len = batch_tokens / real_global_batch_size if real_global_batch_size else 0
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
@@ -370,11 +415,17 @@ class MultiSourceCounterItem:
 
 class MultiSourceInfoTracker:
     """
-    Tracks the statistics about the MultiSourceDataset.
+    Tracks the statistics about the weighted multi-source dataset.
     """
 
-    def __init__(self, dataloader: Optional["DataLoader"], data_path: str) -> None:
+    def __init__(
+        self,
+        dataloader: Optional["DataLoader"],
+        data_path: str,
+        parallel_state: Optional["ParallelState"] = None,
+    ) -> None:
         self.dataloader = dataloader
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.accumulate_counter = dict()
         self.batch_idx = 0
         self.multisource_config = parse_multisource_config(data_path)
@@ -390,14 +441,14 @@ class MultiSourceInfoTracker:
 
     def step(self, batch_ds_idx: List[int], batch_seqlens: List[int]) -> Dict[str, Any]:
         """
-        Computes the statistics about the MultiSourceDataset. It should be called at every rank to update dataloader.
+        Computes the statistics about the weighted multi-source dataset. It should be called at every rank to update dataloader.
         """
         counter = defaultdict(MultiSourceCounterItem)
         for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
             counter[ds_idx].increment(seq_len, 1)
 
-        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(get_parallel_state().dp_size)]
-        dist.all_gather_object(counter_list, counter, group=get_parallel_state().dp_group)
+        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(self.parallel_state.dp_size)]
+        dist.all_gather_object(counter_list, counter, group=self.parallel_state.dp_group)
 
         global_counter = defaultdict(MultiSourceCounterItem)
         for counter in counter_list:
@@ -413,7 +464,7 @@ class MultiSourceInfoTracker:
         global_comsumed_samples = sum([item.num_samples for item in self.accumulate_counter.values()])
 
         if hasattr(self.dataloader, "update_consumed_tokens") and (
-            not get_parallel_state().tp_enabled or get_parallel_state().tp_rank == 0
+            not self.parallel_state.tp_enabled or self.parallel_state.tp_rank == 0
         ):  # update at every dp rank
             if self.boundary_type == "token":
                 self.dataloader.update_consumed_tokens((self.batch_idx, global_consumed_tokens))
@@ -422,7 +473,7 @@ class MultiSourceInfoTracker:
 
         self.batch_idx += 1
         multisource_info = {}
-        for ds_idx, item in self.accumulate_counter.items():
+        for ds_idx, _item in self.accumulate_counter.items():
             multisource_info.update(
                 {
                     "multi_source/global_consumed_tokens": global_consumed_tokens,
@@ -548,13 +599,16 @@ def print_device_mem_info(prompt: str = "VRAM usage") -> None:
     """
     Logs VRAM info.
     """
-    memory_allocated = get_torch_device().memory_allocated() / (1024**3)
-    max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**3)
-    logger.info_rank0(f"{prompt}: cur {memory_allocated:.2f}GB, max {max_memory_allocated:.2f}GB.")
+    if get_device_type() == "cpu":
+        print_cpu_memory_info()
+    else:
+        memory_allocated = get_torch_device().memory_allocated() / (1024**3)
+        max_memory_allocated = get_torch_device().max_memory_allocated() / (1024**3)
+        logger.info_rank0(f"{prompt}: cur {memory_allocated:.2f}GB, max {max_memory_allocated:.2f}GB.")
 
 
 def print_cpu_memory_info():
-    cpu_usage = psutil.cpu_percent(interval=1)  # 1 秒间隔
+    cpu_usage = psutil.cpu_percent(interval=1)  # sampling for 1 sec
     logger.info_rank0(f"CPU Usage: {cpu_usage}%")
 
     memory_info = psutil.virtual_memory()
@@ -622,7 +676,7 @@ def unwrap_model(model: "nn.Module") -> "nn.Module":
     Taken from: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/modeling_utils.py#L4808
     """
     if hasattr(model, "module"):
-        return unwrap_model(getattr(model, "module"))
+        return unwrap_model(model.module)
     else:
         return model
 
@@ -630,8 +684,13 @@ def unwrap_model(model: "nn.Module") -> "nn.Module":
 def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: bool = True) -> None:
     """
     Logs a single example to screen.
+
+    Nested dicts (e.g. ``multimodal_metadata`` from ``PackingCollator``)
+    are expanded one level so inner tensor shapes/devices stay visible
+    instead of being collapsed into a single dict-repr line.
     """
-    for key, value in example.items():
+
+    def _log(key: str, value: Any) -> None:
         if isinstance(value, torch.Tensor):
             if print_tensor:
                 logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
@@ -639,6 +698,13 @@ def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: b
                 logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
         else:
             logger.info(f"[rank {rank}]: {key}'s value: {value}")
+
+    for key, value in example.items():
+        if isinstance(value, dict):
+            for inner_key, inner_value in value.items():
+                _log(f"{key}[{inner_key!r}]", inner_value)
+        else:
+            _log(key, value)
 
 
 def dict2device(input_dict: dict):
@@ -696,6 +762,7 @@ def create_profiler(
     record_shapes: bool,
     profile_memory: bool,
     with_stack: bool,
+    with_modules: bool,
     global_rank: int,
     prefix: str = "",
     warmup_steps: int = 2,
@@ -797,11 +864,11 @@ def create_profiler(
         on_trace_ready=handler_fn,
         record_shapes=record_shapes,
         profile_memory=profile_memory,
-        with_modules=True,
+        with_modules=with_modules,
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if IS_CUDA_AVAILABLE and profile_memory:
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler

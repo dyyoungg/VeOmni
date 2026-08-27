@@ -16,18 +16,17 @@ from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_vl")
 def register_qwen2_vl_model_config():
-    from .configuration_qwen2_vl import Qwen2VLConfig, apply_veomni_qwen2vl_patch
-
-    apply_veomni_qwen2vl_patch()
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
 
     return Qwen2VLConfig
 
 
 @MODELING_REGISTRY.register("qwen2_vl")
 def register_qwen2_vl_modeling(architecture: str):
-    from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel, apply_veomni_qwen2vl_patch
-
-    apply_veomni_qwen2vl_patch()
+    from .generated.patched_modeling_qwen2_vl_gpu import (
+        Qwen2VLForConditionalGeneration,
+        Qwen2VLModel,
+    )
 
     if "ForConditionalGeneration" in architecture:
         return Qwen2VLForConditionalGeneration

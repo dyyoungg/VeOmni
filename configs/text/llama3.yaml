@@ -16,9 +16,9 @@ train:
   accelerator:
     ulysses_size: 1
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-      offload: false
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
     offload:
       enable_activation: false
   gradient_checkpointing:
@@ -34,7 +34,6 @@ train:
     lr_decay_ratio: 1.0
     weight_decay: 0.01
     max_grad_norm: 1.0
-  enable_mixed_precision: false
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
