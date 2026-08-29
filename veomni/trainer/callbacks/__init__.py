@@ -23,6 +23,7 @@ from .channel_loss_callback import ChannelLossCallback, ChannelLossComputer
 from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
 from .trace_callback import (
+    RESERVED_TRAINING_METRIC_NAMES,
     EnvironMeterCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
@@ -51,4 +52,5 @@ __all__ = [
     "VideoTqdmCallback",
     "TensorboardTraceCallback",
     "ComponentTimingCallback"
+    "RESERVED_TRAINING_METRIC_NAMES",
 ]
