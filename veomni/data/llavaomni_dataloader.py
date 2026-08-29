@@ -202,6 +202,23 @@ def Qwen25VLcollatorFunc(batch_data, tokenizer):
         "video_downsample_ratios": safe_cat(collected_tensors["video_downsample_ratios"]),
     }
 
+    # Pre-computed 3D M-RoPE position IDs (from _flush_pack_buffer)
+    position_ids_list = [d["position_ids"] for d in batch_data if d.get("position_ids") is not None]
+    if position_ids_list:
+        if len(position_ids_list) == 1:
+            # bs=1 packing: [3, seq_len] -> [3, 1, seq_len]
+            batch_inputs["position_ids"] = position_ids_list[0].unsqueeze(1)
+        else:
+            # Multi-sample batch: pad and stack [3, seq_len_i] -> [3, batch, max_seq_len]
+            max_len = max(p.shape[-1] for p in position_ids_list)
+            padded = []
+            for p in position_ids_list:
+                if p.shape[-1] < max_len:
+                    pad = torch.zeros(3, max_len - p.shape[-1], dtype=p.dtype)
+                    p = torch.cat([p, pad], dim=-1)
+                padded.append(p)
+            batch_inputs["position_ids"] = torch.stack(padded, dim=1)  # [3, batch, max_seq_len]
+
     # packing
     if len(batch_data) == 1:
         attn_len = batch_data[0]["attention_mask_len"]
@@ -859,10 +876,10 @@ class OmniDataloader(BaseDataLoader):
         if not self._validate_truncation(packed_ids, packed_counts):
             print("WARNING: Packed batch failed validation. Dropping.")
             return
- 
+
         def _safe_cat(lst):
             return torch.cat(lst, dim=0).clone() if lst else None
- 
+
         packed_resources = {
             "image_thw":            _safe_cat(self.new_images_thw),
             "image_pixels":         _safe_cat(self.new_images_list),
@@ -873,15 +890,25 @@ class OmniDataloader(BaseDataLoader):
             "image_downsample_ratios": _safe_cat(self.new_image_downsample_ratios),
             "video_downsample_ratios": _safe_cat(self.new_video_downsample_ratios),
         }
+
+        # Pre-compute 3D M-RoPE position IDs on CPU to avoid GPU gaps during forward
+        if getattr(self.model_args, "use_3d_rope", False):
+            position_ids = self._compute_packed_position_ids(
+                packed_ids, list(self.attention_mask_len), packed_resources
+            )
+        else:
+            position_ids = None
+
         self._enqueue_packed_result(
             packed_ids, packed_labels,
             list(self.attention_mask_len),
             packed_resources,
             channel_ids=list(self.channel_id_list),
+            position_ids=position_ids,
         )
 
     def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources,
-                               channel_ids=None) -> None:
+                               channel_ids=None, position_ids=None) -> None:
         self.result_queue.put({
             "input_ids":            input_ids,
             "labels":               labels,
@@ -895,7 +922,57 @@ class OmniDataloader(BaseDataLoader):
             "video_downsample_ratios": resources.get("video_downsample_ratios"),
             "attention_mask_len":   attn_mask_len,
             "channel_ids":          channel_ids or [],
+            "position_ids":         position_ids,
         })
+
+    def _compute_packed_position_ids(self, packed_ids, attention_mask_len, packed_resources):
+        """Pre-compute 3D M-RoPE position IDs on CPU for packed sequences.
+
+        Called from _flush_pack_buffer so the GPU forward path receives ready-made
+        position_ids without any Python-loop overhead during training.
+
+        For text-only sequences (no vision tokens), uses a fast-path that avoids
+        the token-by-token Python loop entirely.
+        """
+        has_vision = (
+            packed_resources.get("image_thw") is not None or
+            packed_resources.get("video_thw") is not None
+        )
+
+        if not has_vision:
+            # Fast path: pure text/audio — each sub-sequence gets independent arange
+            total_len = packed_ids.shape[0]
+            pos_1d = torch.zeros(total_len, dtype=torch.long)
+            offset = 0
+            for sub_len in attention_mask_len:
+                pos_1d[offset : offset + sub_len] = torch.arange(sub_len, dtype=torch.long)
+                offset += sub_len
+            # Expand to [3, seq_len] — all dims identical for text
+            return pos_1d.unsqueeze(0).expand(3, -1).contiguous()
+
+        from veomni.models.custom.llava_qwen35.modeling_llava_qwen35_omni import _compute_3d_rope_positions
+
+        spatial_merge_size = getattr(self.model_args, "spatial_merge_size", 2)
+        default_ratio = getattr(self.model_args, "mm_downsample_ratio", 16)
+
+        # packed_ids is 1-D; expand to [1, seq_len] for the batch-oriented API
+        input_ids_2d = packed_ids.unsqueeze(0)
+        seq_lens = [attention_mask_len]  # one batch row with multiple sub-seqs
+
+        position_ids = _compute_3d_rope_positions(
+            input_ids=input_ids_2d,
+            image_grid_thw=packed_resources.get("image_thw"),
+            video_grid_thw=packed_resources.get("video_thw"),
+            image_downsample_ratios=packed_resources.get("image_downsample_ratios"),
+            video_downsample_ratios=packed_resources.get("video_downsample_ratios"),
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            spatial_merge_size=spatial_merge_size,
+            default_downsample_ratio=default_ratio,
+            seq_lens=seq_lens,
+        )
+        # Return [3, seq_len] (squeeze batch dim since packing is always bs=1)
+        return position_ids.squeeze(1)
 
     def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
                                channel_id: str = "other"):
@@ -1176,24 +1253,31 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
 
     def build_inputs_qwen2(self, prompt_list: List[Dict], system_prompt:str="You are a helpful assistant."):
         prompt = ""
-     
-        if self.model_args.model_arc in ["qwen2",'qwen3']:
-            user_format = "\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
-            assistant_format = "{content}<|im_end|>" 
-        else:
-            raise NotImplementedError(f"Unsupported model_arc: {self.model_args.model_arc!r}")
+        arc = self.model_args.model_arc
+        templates = _CHAT_TEMPLATES.get(arc)
+        if templates is None:
+            raise NotImplementedError(f"Unsupported model_arc: {arc!r}")
+        user_format = templates["user_format"].replace("{}", "{content}")
+        asst_prefix = templates["assistant_prefix"]
+        asst_content_format = templates["assistant_content"].replace("{}", "{content}")
+        query_format = templates["query_format"].replace("{}", "{content}")
 
-        for message in prompt_list:
+        for i, message in enumerate(prompt_list):
             content = message["value"]
             if 'role' in message:
                 role = 'role'
             elif 'from' in message:
                 role = 'from'
-                
-            if message[role].lower() in ['human',"user"]:
-                prompt += user_format.format(content=content)
+
+            if message[role].lower() in ['human', "user"]:
+                # Last user turn uses query_format (includes generation_prefix for eval)
+                is_last = (i == len(prompt_list) - 1)
+                if is_last:
+                    prompt += query_format.format(content=content)
+                else:
+                    prompt += user_format.format(content=content)
             elif message[role].lower() in ["assistant", "gpt"]:
-                prompt += assistant_format.format(content=content)
+                prompt += asst_prefix + asst_content_format.format(content=content)
             else:
                 pass
         return self.tokenizer(prompt)["input_ids"]
@@ -1222,28 +1306,32 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 question_tokens = self.build_inputs_token(question, input_type="query_format", return_tensor=False)
             else:
                 question_tokens, audio_list = self._build_mixed_audio_tokens(sample_data, question, category)
-                if not question_tokens: 
+                if not question_tokens:
                     return None
-            
+
             is_generation_task = "generate" in category
-            
+
             if is_generation_task:
                 subtitle_tokens = question_tokens
                 label_tokens = [IGNORE_INDEX] * len(question_tokens)
             else:
+                # question_tokens already includes think block; answer ends at the option letter
+                # Eval callback reads labels[-1] as the target option token id
                 no_loss_txt = 'My best option: ('
                 with_loss_txt = f"{chr(ord('A') + answer_idx)}"
-                mask_len = len(self.tokenizer(no_loss_txt)['input_ids'])
-                answer_tokens = self.tokenizer(no_loss_txt + with_loss_txt)['input_ids']
-                
+                full_answer = no_loss_txt + with_loss_txt
+                answer_tokens = self.tokenizer(full_answer, add_special_tokens=False)['input_ids']
+                # Mask no_loss prefix, label the answer letter token
+                no_loss_tokens = self.tokenizer(no_loss_txt, add_special_tokens=False)['input_ids']
+                mask_len = len(no_loss_tokens)
+
                 subtitle_tokens = question_tokens + answer_tokens
-                label_tokens = [IGNORE_INDEX] * len(question_tokens) + [IGNORE_INDEX] * mask_len + answer_tokens[-(len(answer_tokens) - mask_len):]
+                label_tokens = [IGNORE_INDEX] * len(question_tokens) + [IGNORE_INDEX] * mask_len + answer_tokens[mask_len:]
         else:
             # 纯文本
-            question_tokens = self.build_inputs_qwen2(question, system_prompt=system_prompt) 
+            question_tokens = self.build_inputs_qwen2(question, system_prompt=system_prompt)
             label_tokens = [IGNORE_INDEX] * len(question_tokens)
-            text_with_loss = answer
-            answer_tokens = self.tokenizer(text_with_loss)['input_ids']
+            answer_tokens = self.tokenizer(answer)['input_ids']
             subtitle_tokens = question_tokens + answer_tokens
             label_tokens += answer_tokens
 
@@ -1300,6 +1388,26 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             elif visual_mode == "video":
                 video_downsample_ratios = torch.full((thw.shape[0],), downsample_ratio, dtype=torch.float32)
 
+        # Compute 3D M-RoPE position IDs when enabled
+        position_ids = None
+        if getattr(self.model_args, "use_3d_rope", False):
+            from veomni.models.custom.llava_qwen35.modeling_llava_qwen35_omni import _compute_3d_rope_positions
+            spatial_merge_size = getattr(self.model_args, "spatial_merge_size", 2)
+            input_ids_tensor = input_ids.clone().detach().unsqueeze(0) if isinstance(input_ids, torch.Tensor) else torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+            position_ids = _compute_3d_rope_positions(
+                input_ids=input_ids_tensor,
+                image_grid_thw=thw if visual_mode == "image" else None,
+                video_grid_thw=thw if visual_mode == "video" else None,
+                image_downsample_ratios=image_downsample_ratios,
+                video_downsample_ratios=video_downsample_ratios,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+                spatial_merge_size=spatial_merge_size,
+                default_downsample_ratio=downsample_ratio,
+            )
+            # [3, 1, seq_len] -> [3, seq_len]
+            position_ids = position_ids.squeeze(1)
+
         return self._build_return_dict(
             input_ids=input_ids,
             labels=labels,
@@ -1312,6 +1420,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             audio_features_lens=raw_audio_len,
             image_downsample_ratios=image_downsample_ratios,
             video_downsample_ratios=video_downsample_ratios,
+            position_ids=position_ids,
             options_num=len(sample_data.get("candidates", [])),
             raw_data=sample_data
         )
@@ -1320,19 +1429,24 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
     # 可复用的辅助方法拆分
     # ==========================================
     def _build_audio_query_tokens(self, query: str) -> List[int]:
+        templates = _CHAT_TEMPLATES[self.model_args.model_arc]
+        gen_prefix = templates["generation_prefix"].lstrip("\n")
         if self.model_args.use_audio_start_end_token:
-            prompt = f"<|im_start|>user\n{DEFAULT_AUDIO_START_TOKEN}<audio>{DEFAULT_AUDIO_END_TOKEN}{query}<|im_end|>\n<|im_start|>assistant\n"
+            prompt = f"<|im_start|>user\n{DEFAULT_AUDIO_START_TOKEN}<audio>{DEFAULT_AUDIO_END_TOKEN}{query}<|im_end|>\n{gen_prefix}"
         else:
-            prompt = f"<|im_start|>user\n<audio>{query}<|im_end|>\n<|im_start|>assistant\n"
+            prompt = f"<|im_start|>user\n<audio>{query}<|im_end|>\n{gen_prefix}"
         return tokenizer_audio_token(prompt=prompt, tokenizer=self.tokenizer, audio_token_index=AUDIO_TOKEN_INDEX, return_tensors=None)
 
     def _build_mixed_audio_tokens(self, sample_data: Dict, question: str, category: str) -> Tuple[List[int], List]:
+        templates = _CHAT_TEMPLATES[self.model_args.model_arc]
+        # Always use generation_prefix (includes think block for qwen35)
+        gen_prefix = templates["generation_prefix"].lstrip("\n")
         audio_str = f"{DEFAULT_AUDIO_START_TOKEN}{DEFAULT_AUDIO_TOKEN}{DEFAULT_AUDIO_END_TOKEN}" if self.model_args.use_audio_start_end_token else DEFAULT_AUDIO_TOKEN
-        
+
         if category == "mvbench_audio":
-            cur_text = f"\n<|im_start|>user\n{audio_str}<|im_end|>\n<|im_start|>assistant\n"
+            cur_text = f"\n<|im_start|>user\n{audio_str}<|im_end|>\n{gen_prefix}"
         else:
-            cur_text = f"\n<|im_start|>user\n{audio_str}{question}<|im_end|>\n<|im_start|>assistant\n"
+            cur_text = f"\n<|im_start|>user\n{audio_str}{question}<|im_end|>\n{gen_prefix}"
             
         question_tokens = []
         audio_chunks = cur_text.split(DEFAULT_AUDIO_TOKEN)
@@ -1438,6 +1552,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
             "pixel_values": None, "image_grid_thw": None,
             "pixel_values_video": None, "video_grid_thw": None,
             "audio_ground_truth_text": None, "options_num": torch.tensor([0], dtype=torch.long),
+            "position_ids": None,
             "raw_data": None
         }
         base.update(kwargs)

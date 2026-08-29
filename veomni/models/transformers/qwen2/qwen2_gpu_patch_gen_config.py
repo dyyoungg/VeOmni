@@ -138,6 +138,11 @@ def qwen2_model_forward_patched(
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> BaseModelOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+        cache in the correct position and to infer the complete sequence length.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -213,6 +218,11 @@ def qwen2forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
+        cache in the correct position and to infer the complete sequence length.
+    """
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,

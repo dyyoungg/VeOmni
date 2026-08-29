@@ -48,6 +48,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, build_tokenizer
 from veomni.models.custom.llava_qwen3moe.auto import build_qwen3moe_omni_from_pretrained
 from veomni.models.custom.llava_qwen2.auto import build_llavaqwen2_omni_from_pretrained
+from veomni.models.custom.llava_qwen35.auto import build_qwen35_omni_from_pretrained
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.trainer.callbacks import (
     CheckpointerCallback,
@@ -237,6 +238,10 @@ class VLMMModelArguments(ModelArguments):
     audio_projector_type: Optional[str] = field(default="conv_channel_upscale") # avgpool, channel_upscale
     audio_encoder_type: Optional[str] = field(default="whisper")
     qwen3_audio_n_window: Optional[int] = field(default=50)
+    use_3d_rope: bool = field(
+            default=False,
+            metadata={"help": "Enable 3D M-RoPE position IDs pre-computation in the dataloader (for Qwen3.5-based models)."},
+    )
 
 @dataclass
 class VeOmniVLMArguments(VeOmniArguments):
@@ -342,6 +347,15 @@ class VLMTrainer:
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
                 ops_implementation=args.model.ops_implementation,
             )
+        elif self.model_config.model_type == "llavaqwen35_omni":
+            self.model = build_qwen35_omni_from_pretrained(
+                args.model.model_path,
+                init_device=args.train.init_device,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+                encoder_data_balance=args.model.encoder_data_balance,
+                encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
+            )
 
         else:
             self.model = build_foundation_model(
@@ -365,7 +379,7 @@ class VLMTrainer:
         self.model.omni_config.video_token_id = video_token_id
         self.model.omni_config.audio_token_id = audio_token_id
         logger.info_rank0(f"image pad token {image_token_id}, video pad token: {video_token_id}, audio pad token:{audio_token_id}")
-        if self.model_config.model_type == "llavaqwen3moe_omni":
+        if self.model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen35_omni"):
             self.model.config.output_router_logits = self.args.train.output_router_logits
             self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
             self.model.omni_config.mm_balance_coef = self.args.train.mm_balance_coef
@@ -392,7 +406,7 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.args
         model_config = self.model_config
 
-        if model_config.model_type in ("llavaqwen3moe_omni","llavaqwen2_omni"):
+        if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni", "llavaqwen35_omni"):
             if args.train.freeze_vit:
                 self.model.image_encoder.requires_grad_(False)
                 self.model.image_encoder.freeze_vit = True
@@ -789,7 +803,7 @@ class VLMTrainer:
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in micro_batch.items()
         }
-        if getattr(self, "LOG_SAMPLE", True):
+        if getattr(self, "LOG_SAMPLE", False):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
         return micro_batch
@@ -1071,8 +1085,9 @@ class VLMTrainer:
 
     def train(self):
         args: VeOmniArguments = self.args
-    
+
         self.on_train_begin()
+
         self.train_dataloader.launch()
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps

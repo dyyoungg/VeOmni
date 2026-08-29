@@ -107,6 +107,7 @@ class VeomniFlopsCounter:
             "qwen3_5_text": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "llavaqwen3moe_omni": self._estimate_llavaqwen3moeOmni_flops,
+            "llavaqwen35_omni": self._estimate_llavaqwen35_omni_flops,
             "llavaqwen2_omni": self._estimate_llavaqwen2_omni_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
@@ -1491,6 +1492,113 @@ class VeomniFlopsCounter:
             "vit": vit_tflops,
             "audio": audio_tflops,
             # 原始workload（TFLOP/step），不除delta_time，用于区分是计算量变了还是速度变了
+            "workload_total": flops_all / 1e12,
+        }
+
+        return flops_achieved, flops_breakdown
+
+    def _estimate_llavaqwen35_omni_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
+        """
+        Estimate FLOPs for LlavaQwen35 Omni model.
+
+        LLM: Qwen3.5 hybrid attention (full + GatedDeltaNet) with dense or MoE MLP.
+        ViT + Audio: same as llavaqwen3moe_omni (BeeBee ViT + Qwen3 audio encoder).
+        """
+        llm_config = getattr(self.config, "foundation_config", self.config)
+        freeze_vit = kwargs.get("freeze_vit", True)
+        freeze_audio = kwargs.get("freeze_audio", True)
+        freeze_llm = kwargs.get("freeze_llm", False)
+        gradient_checkpointing = kwargs.get("gradient_checkpointing", True)
+
+        hidden_size = llm_config.hidden_size
+        vocab_size = llm_config.vocab_size
+        num_hidden_layers = llm_config.num_hidden_layers
+
+        # === LLM: hybrid attention linear projection params ===
+        attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
+            self._compute_hybrid_attn_params(llm_config)
+        )
+
+        # === LLM: MLP params (dense or MoE) ===
+        is_moe = hasattr(llm_config, "num_experts")
+        if is_moe:
+            moe_gata_N = hidden_size * llm_config.num_experts
+            moe_expertmlp_N = hidden_size * llm_config.moe_intermediate_size * llm_config.num_experts_per_tok * 3
+            moe_sharedexpertmlp_N = hidden_size * llm_config.shared_expert_intermediate_size * 3
+            moe_sharedexpert_gate_N = hidden_size
+            mlp_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N + moe_sharedexpert_gate_N) * num_hidden_layers
+        else:
+            mlp_N = hidden_size * llm_config.intermediate_size * 3 * num_hidden_layers
+
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
+
+        # FLOPs factors
+        if gradient_checkpointing:
+            linear_factor = 6 if freeze_llm else 8
+            attn_dot_factor = 16
+        else:
+            linear_factor = 4 if freeze_llm else 6
+            attn_dot_factor = 12
+
+        # Linear FLOPs (attn projections + MLP + lm_head)
+        dense_N = mlp_N + attn_linear_N
+        dense_flops = linear_factor * dense_N * tokens_sum
+        # lm_head not under GC
+        emb_factor = 2 if freeze_llm else 6
+        lm_head_flops = emb_factor * lm_head_N * tokens_sum
+        dense_flops += lm_head_flops
+
+        # Quadratic attention FLOPs (only full attention layers)
+        seqlen_square_sum = sum(s * s for s in batch_seqlens)
+        attn_qkv_flops = attn_dot_factor * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
+
+        # GatedDeltaNet recurrence FLOPs
+        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(llm_config, tokens_sum, num_linear_attn_layers)
+
+        # === ViT FLOPs ===
+        images_seqlens = kwargs.get("images_seqlens", None)
+        gradient_checkpointing_vit = kwargs.get("gradient_checkpointing_vit", gradient_checkpointing)
+        if images_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            image_config = getattr(self.config.encoder_config, "image_config", None)
+            if image_config is not None:
+                freeze_projector = kwargs.get("freeze_projector", False)
+                vit_flops = self._estimate_beebee_vit_flop(
+                    images_seqlens, image_config,
+                    freeze_vit=freeze_vit, freeze_projector=freeze_projector,
+                    gradient_checkpointing=gradient_checkpointing_vit
+                )
+            else:
+                vit_flops = 0
+        else:
+            vit_flops = 0
+
+        # === Audio FLOPs ===
+        audio_seqlens = kwargs.get("audio_seqlens", None)
+        if audio_seqlens is not None and getattr(self.config, "encoder_config", None) is not None:
+            audio_config = getattr(self.config.encoder_config, "audio_config", None)
+            if audio_config is not None:
+                freeze_audio_projector = kwargs.get("freeze_audio_projector", False)
+                audio_flops = self._estimate_audio_flops(
+                    audio_seqlens, audio_config,
+                    freeze_audio=freeze_audio,
+                    freeze_audio_projector=freeze_audio_projector,
+                    gradient_checkpointing=gradient_checkpointing,
+                )
+            else:
+                audio_flops = 0
+        else:
+            audio_flops = 0
+
+        flops_all = dense_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops + audio_flops
+        flops_achieved = flops_all / delta_time / 1e12
+
+        llm_flops = (dense_flops + attn_qkv_flops + gdn_recurrence_flops) / delta_time / 1e12
+        vit_tflops = vit_flops / delta_time / 1e12
+        audio_tflops = audio_flops / delta_time / 1e12
+        flops_breakdown = {
+            "llm": llm_flops,
+            "vit": vit_tflops,
+            "audio": audio_tflops,
             "workload_total": flops_all / 1e12,
         }
 

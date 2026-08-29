@@ -84,9 +84,9 @@ train:
     save_epochs: 1
     save_total_limit: 1
     manager: dcp
-    save_hf_weights: false
+    save_hf_weights: true
     save_async: true
-    hf_save_steps: 20
+    hf_save_steps: 0
 
   wandb:
     enable: false

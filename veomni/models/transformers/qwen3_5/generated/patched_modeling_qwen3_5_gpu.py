@@ -49,17 +49,11 @@
 # ==============================================================================
 
 import itertools
+import warnings
 from collections.abc import Callable
-
-# Additional imports for patches
-from copy import copy
 from dataclasses import dataclass
-from functools import partial
-from types import SimpleNamespace
 from typing import Any, Optional
-
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
@@ -69,38 +63,29 @@ from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernelized_func
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    BaseModelOutputWithPooling,
-    CausalLMOutputWithPast,
-    ModelOutput,
-    SequenceClassifierOutputWithPast,
-)
+from transformers.modeling_layers import GenericForSequenceClassification, GenericForTokenClassification, GradientCheckpointingLayer
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast, ModelOutput, SequenceClassifierOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from transformers.utils.generic import (
-    accepts_precomputed_kwargs,
-    is_flash_attention_requested,
-    maybe_autocast,
-    merge_with_config_defaults,
-)
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
+from transformers.utils.generic import accepts_precomputed_kwargs, is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
+from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 from transformers.utils.output_capturing import capture_outputs
+from transformers.vision_utils import get_vision_bilinear_indices_and_weights, get_vision_cu_seqlens, get_vision_position_ids
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
+# Additional imports for patches
+from copy import copy
+from functools import partial
+from types import SimpleNamespace
+import torch.distributed as dist
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
-from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
-
+from veomni.distributed.sequence_parallel.ulysses import gather_seq_scatter_heads, gather_heads_scatter_seq
+from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
+from veomni.utils.model_outputs import FusedLinearAuxOutput, FusedLinearAuxOutputMixin, CausalLMOutputWithLogProbs
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
 # Additional import blocks for patches
 # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
@@ -128,8 +113,6 @@ fused_recurrent_gated_delta_rule = None
 # backend (eager / fla / flash_qla) is picked from
 # OpsImplementationConfig instead of "is the library importable".
 from veomni.ops.dispatch import OpSlot
-
-
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
@@ -142,7 +125,6 @@ _VEOMNI_VISION_ATTENTION_PATCHED = True
 # ======================================================================
 # [HELPERS] Module-level helpers injected via config.add_helper
 # ======================================================================
-
 
 def mm_token_type_ids_from_input_ids(input_ids, config):
     # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
@@ -158,7 +140,6 @@ def mm_token_type_ids_from_input_ids(input_ids, config):
     mm_token_type_ids[input_ids == config.video_token_id] = 2
     return mm_token_type_ids
 
-
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
@@ -169,7 +150,6 @@ def get_position_id(main_func, self, **kwargs):
         )
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
 
 def collate_multimodal_metadata(batch, sp_pad):
     """Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT.
@@ -224,7 +204,6 @@ def collate_multimodal_metadata(batch, sp_pad):
 
     if md:
         batch["multimodal_metadata"] = md
-
 
 # ================================================================
 # Helper: _Qwen3_5FakeForPosID  (emitted into the generated file via
@@ -638,10 +617,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         use_precomputed_states = (
-            cache_params is not None
-            and cache_params.has_previous_state
-            and seq_len == 1
-            and cache_position is not None
+            cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
         )
 
         # getting projected states from cache if it exists
@@ -830,7 +806,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output = self.out_proj(core_attn_out)
         return output
 
-    def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
+    def _get_local_conv1d_weight(
+        self, ulysses_rank: int, local_key_dim: int, local_value_dim: int
+    ) -> torch.Tensor:
         # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
         w_full = self.conv1d.weight.squeeze(1)
         assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
@@ -1099,9 +1077,11 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         # Token Mixer
         if self.layer_type == "linear_attention":
             # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
+            # Only pass cache if it's a proper linear attention cache (has conv_states), not DynamicCache from eval
+            linear_cache = past_key_values if past_key_values is not None and hasattr(past_key_values, 'conv_states') else None
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
-                cache_params=past_key_values,
+                cache_params=linear_cache,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
                 cu_seq_lens_q=linear_attn_cu_seq_lens_q,
@@ -1292,9 +1272,7 @@ class Qwen3_5VisionAttention(nn.Module):
             kwargs.pop("vision_max_seqlen", None)
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
+            splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
 
             attn_outputs = [
                 attention_interface(
@@ -1828,7 +1806,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             past_key_values=past_key_values,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
         """
         Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
 
@@ -1842,9 +1820,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
         cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
         only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-        a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-        ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-        than reading ``cache_position[0]``, so no sync.
+        a 1-token decode step). We detect cached forward by checking whether past_key_values has
+        previous state (i.e. already contains cached keys/values from prior steps).
 
         The all-ones short-circuit is the one we drop: returning the all-ones mask makes
         ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
@@ -1853,9 +1830,9 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         """
         if attention_mask is None:
             return None
-        # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-        # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-        if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
+        # Cached forward (decode / continuation): shapes wouldn't line up in
+        # apply_mask_to_padding_states, and upstream returns None here.
+        if past_key_values is not None and past_key_values.has_previous_state():
             return None
         return attention_mask
 
@@ -2536,7 +2513,6 @@ class Qwen3_5CausalLMOutputWithPast(ModelOutput):
 # ======================================================================
 # [HELPERS AFTER] Qwen3_5CausalLMOutputWithPast
 # ======================================================================
-
 
 # Surface ``Qwen3_5CausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs while preserving ``rope_deltas``.

@@ -518,7 +518,7 @@ def qwen3_5_gated_deltanet_forward_patched(
     "Qwen3_5TextModel._update_linear_attn_mask",
     description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
-def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_position):
+def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, past_key_values):
     """
     Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
 
@@ -532,9 +532,8 @@ def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_posit
     ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
     cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
     only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-    a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-    ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-    than reading ``cache_position[0]``, so no sync.
+    a 1-token decode step). We detect cached forward by checking whether past_key_values has
+    previous state (i.e. already contains cached keys/values from prior steps).
 
     The all-ones short-circuit is the one we drop: returning the all-ones mask makes
     ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
@@ -543,9 +542,9 @@ def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_posit
     """
     if attention_mask is None:
         return None
-    # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-    # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-    if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
+    # Cached forward (decode / continuation): shapes wouldn't line up in
+    # apply_mask_to_padding_states, and upstream returns None here.
+    if past_key_values is not None and past_key_values.has_previous_state():
         return None
     return attention_mask
 
@@ -579,9 +578,11 @@ def qwen3_5_decoder_layer_forward_patched(
     # Token Mixer
     if self.layer_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
+        # Only pass cache if it's a proper linear attention cache (has conv_states), not DynamicCache from eval
+        linear_cache = past_key_values if past_key_values is not None and hasattr(past_key_values, 'conv_states') else None
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
-            cache_params=past_key_values,
+            cache_params=linear_cache,
             cache_position=cache_position,
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,

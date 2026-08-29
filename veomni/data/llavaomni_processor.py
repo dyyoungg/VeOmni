@@ -1179,11 +1179,13 @@ class OmniSampleProcessor:
     def process_conversations(self, sample_data: Dict):
         """Tokenise a conversation dict into (input_ids, labels, audio_count)."""
         arc = self.model_args.model_arc
-        if arc in ("qwen2", "qwen3"):
-            user_fmt = "\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
-            asst_fmt = "{content}<|im_end|>"
-        else:
+        templates = _CHAT_TEMPLATES.get(arc)
+        if templates is None:
             raise NotImplementedError(f"Unsupported model_arc: {arc!r}")
+        user_fmt = templates["user_format"].replace("{}", "{content}")
+        asst_prefix = templates["assistant_prefix"]
+        asst_content_fmt = templates["assistant_content"].replace("{}", "{content}") # no think data
+        asst_reasoning_fmt = templates.get("assistant_content_reasoning") # think data
 
         assert not self.tokenizer.add_bos_token
         img_pat = r"(\n<image>)|(<image>\n)|(<image>)"
@@ -1230,14 +1232,27 @@ class OmniSampleProcessor:
                 if not is_human:
                     if has_video and "chatgpt-videos" in sample_data.get("video", ""):
                         value = value.split("\n")[0]
-                
-                cur_text = user_fmt.format(content=value) if is_human else asst_fmt.format(content=value)
-                
-                split_pattern = f"(<image>|{re.escape(audio_token_str)})"
-                parts = re.split(split_pattern, cur_text)
-                
+
+                if is_human:
+                    cur_text = user_fmt.format(content=value)
+                else:
+                    reasoning = c.get("reasoning_content", "")
+                    if reasoning and asst_reasoning_fmt:
+                        cur_text = asst_reasoning_fmt.format(reasoning=reasoning, content=value)
+                    else:
+                        cur_text = asst_content_fmt.format(content=value)
+
                 cur_turn_tokens = []
                 cur_turn_labels = []
+
+                # For assistant: add prefix tokens (masked) first
+                if not is_human:
+                    prefix_toks = self.tokenizer(asst_prefix)["input_ids"]
+                    cur_turn_tokens.extend(prefix_toks)
+                    cur_turn_labels.extend([IGNORE_INDEX] * len(prefix_toks))
+
+                split_pattern = f"(<image>|{re.escape(audio_token_str)})"
+                parts = re.split(split_pattern, cur_text)
                 
                 for part in parts:
                     if not part:
@@ -1322,35 +1337,43 @@ class OmniSampleProcessor:
                         value = value.split("\n")[0]
                     if has_image:
                         value = re.sub(img_pat, "", value)
-                    cur_text = asst_fmt.format(content=value)
+                    reasoning = c.get("reasoning_content", "")
+                    if reasoning and asst_reasoning_fmt:
+                        content_text = asst_reasoning_fmt.format(reasoning=reasoning, content=value)
+                    else:
+                        content_text = asst_content_fmt.format(content=value)
+                    # Tokenize prefix (masked) and content (labeled) separately
+                    prefix_tokens = self.tokenizer(asst_prefix)["input_ids"]
+                    content_tokens = self.tokenizer(content_text)["input_ids"]
+                    cur_tokens = prefix_tokens + content_tokens
 
                     if c.get("infer"):
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
                         text_tokens += cur_tokens
                         label_tokens += [IGNORE_INDEX] * len(cur_tokens)
-                        
+
                     elif c.get("first_token"):
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
                         text_tokens += cur_tokens
                         new_labels = [IGNORE_INDEX] * len(cur_tokens)
                         new_labels[:2] = cur_tokens[:2]
                         label_tokens += new_labels
                     elif "ignore_bracket" in sample_data:
                         bracket_pattern = re.compile(r"([\(\（][^\)\）]*[\)\）])")
-                        b_parts = bracket_pattern.split(cur_text)
+                        b_parts = bracket_pattern.split(content_text)
+                        text_tokens += prefix_tokens
+                        label_tokens += [IGNORE_INDEX] * len(prefix_tokens)
                         for part in b_parts:
                             if not part:
                                 continue
                             part_tokens = self.tokenizer(part)["input_ids"]
-                            text_tokens += part_tokens  # 同步追加 text token
+                            text_tokens += part_tokens
                             if part.startswith(("(", "（")) and part.endswith((")", "）")):
                                 label_tokens += [IGNORE_INDEX] * len(part_tokens)
                             else:
                                 label_tokens += part_tokens
                     else:
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
                         text_tokens += cur_tokens
-                        label_tokens += cur_tokens
+                        # Mask asst_prefix, label content
+                        label_tokens += [IGNORE_INDEX] * len(prefix_tokens) + content_tokens
 
         assert len(label_tokens) == len(text_tokens), (
             f"{sample_data} label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"
@@ -1668,6 +1691,8 @@ class LongVideoProcessor(OmniSampleProcessor):
         system_prompt = sample_data.get("system_prompt", "You are a helpful assistant.")
         if self.model_args.model_arc in ['qwen2', 'qwen3']:
             sys_text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n生成该视频的字幕<|im_end|>\n<|im_start|>assistant\n"
+        elif self.model_args.model_arc in ['qwen35']:
+            sys_text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n生成该视频的字幕<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
         else:
             sys_text = "Human: 生成该视频的字幕 Assistant:"
             
