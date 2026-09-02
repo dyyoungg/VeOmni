@@ -594,7 +594,7 @@ class TqdmCallback(Callback):
 class VideoTqdmCallback(Callback):
     def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        self.epoch_total = self.trainer.init_data_size
+        self.epoch_total = self.trainer.init_data_size * args.train.num_train_epochs
         self._last_video_trained_num = self.trainer.start_step  # 恢复训练时的偏移
         self.data_loader_tqdm = trange(
             self.epoch_total,

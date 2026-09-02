@@ -561,6 +561,7 @@ class VLMTrainer:
             dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
         if args.train.remote_dataloader:
             self.init_data_size = len(self.train_dataloader.data_list)
+
         elif hasattr(self.train_dataloader, "num_train_epochs"):
             # Ulysses PrefetchingPackedLoader: data_list is single-epoch per DP rank.
             # Total samples across all epochs = per_rank * dp_world_size * num_epochs.
@@ -570,7 +571,6 @@ class VLMTrainer:
                 * self.train_dataloader.num_train_epochs
             )
         else:
-            # OmniDataloader: data_list already contains num_epochs copies
             self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
 
         # Fake data mode: use max_steps to control training loop length.
@@ -586,7 +586,7 @@ class VLMTrainer:
         self.start_step = 0
         self.video_trained_num = 0  
         self.train_steps = self.init_data_size * args.train.num_train_epochs
-        print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
+        print("dp world size", dp_world_size, "Total initial data size", self.init_data_size, "train step", self.train_steps)
         
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
@@ -898,7 +898,7 @@ class VLMTrainer:
                 self.model.set_reshard_after_backward(True)
 
 
-    def _sync_video_trained_num(self) -> bool:
+    def _sync_video_trained_num(self, epoch) -> bool:
         """Sync consumed/remaining data count across ranks and update video_trained_num.
 
         Returns True if training should stop (data exhausted on any rank).
@@ -910,7 +910,7 @@ class VLMTrainer:
         if getattr(args.train, "use_fake_data", False):
             self.video_trained_num = self.state.global_step
             self.state.video_trained_num = self.video_trained_num
-            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
             return
 
         if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
@@ -928,9 +928,9 @@ class VLMTrainer:
             if dist.is_initialized():
                 dist.broadcast(data_tensor, src=0)
             
-            self.video_trained_num = int(data_tensor.item())
-            self.state.video_trained_num = self.video_trained_num
-            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+            video_trained_num = int(data_tensor.item())
+            self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
+            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
             
         else:
             if hasattr(self.train_dataloader, "samples_consumed"):
@@ -944,9 +944,9 @@ class VLMTrainer:
                     ps = get_parallel_state()
                     dp_group = ps.dp_group if ps is not None else None
                     dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
-                self.video_trained_num = int(consumed_tensor.item())
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = int(consumed_tensor.item())
+                self.state.video_trained_num = video_trained_num + epoch* self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
 
             elif hasattr(self.train_dataloader, "data_queue"):
                 remain_data = self.train_dataloader.data_queue.qsize()
@@ -962,18 +962,18 @@ class VLMTrainer:
                 if get_parallel_state() is not None:
                     self._data_tensor_out = self._data_tensor_out // get_parallel_state().sp_size
 
-                self.video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
+                self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
 
             else:
                 remain_data = len(self.train_dataloader.data_list)
                 logger.warning(
                     "dataloader has no attr data_queue or samples_consumed, defaulting to len(data_list)"
                 )
-                self.video_trained_num = self.init_data_size - remain_data
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = self.init_data_size - remain_data
+                self.state.video_trained_num = video_trained_num + epoch *self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
  
     
     def _collect_modality_stats(self, micro_batches: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -1012,6 +1012,7 @@ class VLMTrainer:
 
     def train_step(
         self,
+        epoch,
         micro_batches: Any,
     ) -> Dict[str, float]:
         args = self.args
@@ -1054,18 +1055,18 @@ class VLMTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        self._sync_video_trained_num()
+        self._sync_video_trained_num(epoch)
 
         warmup_steps = int(
             self.train_steps * args.train.optimizer.lr_warmup_ratio
         )
-        if warmup_steps > 0 and self.video_trained_num < warmup_steps:
-            self.lr_scheduler.step(epoch=self.video_trained_num)
+        if warmup_steps > 0 and self.state.video_trained_num < warmup_steps:
+            self.lr_scheduler.step(epoch=self.state.video_trained_num)
 
         else:
             decay_ratio = getattr(args.train.optimizer, "lr_decay_ratio", 1.0)
-            if self.video_trained_num / max(self.init_data_size, 1) <= decay_ratio:
-                self.lr_scheduler.step(epoch=max(self.video_trained_num, warmup_steps))
+            if self.state.video_trained_num/ max(self.train_steps, 1) <= decay_ratio:
+                self.lr_scheduler.step(epoch=max(self.state.video_trained_num, warmup_steps))
 
         self.state.global_step += 1
         self.current_step += 1
@@ -1086,8 +1087,9 @@ class VLMTrainer:
 
     def train(self):
         args: VeOmniArguments = self.args
-
-        self.on_train_begin()
+        self.state.start_epoch = 0 # resume will use
+        self.state.start_step = 0
+        self.on_train_begin() # resume will update start epoch and start step
 
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps
@@ -1095,7 +1097,7 @@ class VLMTrainer:
         self.state.num_train_epochs = args.train.num_train_epochs
         self.state.is_local_process_zero = (args.train.local_rank == 0)
         self.state.is_world_process_zero = (args.train.global_rank == 0)
-
+        self.start_step = self.state.start_step
 
 
         logger.info(
@@ -1106,7 +1108,7 @@ class VLMTrainer:
             f"Train epochs: {args.train.num_train_epochs}."
         )
         
-        for epoch in range(args.train.num_train_epochs):
+        for epoch in range(self.state.start_epoch, args.train.num_train_epochs):
             
             if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
                 self.train_dataloader.remote_data_index.value = 0
@@ -1143,7 +1145,7 @@ class VLMTrainer:
                 if not should_continue:
                     logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping cleanly.")
                     break
-                self.train_step(micro_batches)
+                self.train_step(epoch, micro_batches)
 
 
             self.start_step = 0
