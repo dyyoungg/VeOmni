@@ -585,7 +585,7 @@ class VLMTrainer:
        
         self.start_step = 0
         self.video_trained_num = 0  
-        self.train_steps = self.init_data_size
+        self.train_steps = self.init_data_size * args.train.num_train_epochs
         print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
         
         self.lr_scheduler = build_lr_scheduler(
