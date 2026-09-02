@@ -1089,7 +1089,6 @@ class VLMTrainer:
 
         self.on_train_begin()
 
-        self.train_dataloader.launch()
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps
         self.state.video_trained_num = 0
@@ -1108,8 +1107,10 @@ class VLMTrainer:
         )
         
         for epoch in range(args.train.num_train_epochs):
-            if not self.train_dataloader.is_launched:
-                self.train_dataloader.launch()
+            
+            if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
+                self.train_dataloader.remote_data_index.value = 0
+            self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)
             self.current_epoch = epoch
             if hasattr(self.train_dataloader, "set_epoch"):
@@ -1150,7 +1151,6 @@ class VLMTrainer:
             dist.barrier()
             self.train_dataloader.close()
 
-            self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
         self.on_train_end()
