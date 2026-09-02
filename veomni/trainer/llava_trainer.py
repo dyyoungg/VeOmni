@@ -549,6 +549,7 @@ class VLMTrainer:
             param_groups=param_groups,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
+            optimizer_config=args.train.optimizer,
         )
 
     def _build_lr_scheduler(self):
