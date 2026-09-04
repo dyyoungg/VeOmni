@@ -25,6 +25,7 @@ import torch.distributed as dist
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
 from ...utils.dist_utils import all_reduce
+from ...utils.device import get_torch_device
 from ...utils.logging import get_logger
 from .base import Callback, TrainerState
 
@@ -650,27 +651,25 @@ class VideoTqdmCallback(Callback):
 class StepTimer:
     def __init__(self):
         self.events = {}
+        self._device_mod = get_torch_device()
 
     @contextlib.contextmanager
     def measure(self, name):
-      
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = self._device_mod.Event(enable_timing=True)
+        end = self._device_mod.Event(enable_timing=True)
         start.record()
         yield
-      
         end.record()
         if name not in self.events:
             self.events[name] = []
         self.events[name].append((start, end))
 
     def get_and_reset(self) -> Dict[str, float]:
-       
-        torch.cuda.synchronize()
+        self._device_mod.synchronize()
         timings = {}
         for name, evts in self.events.items():
             total_ms = sum(s.elapsed_time(e) for s, e in evts)
-            timings[name] = total_ms / 1000.0  # 转换为秒
+            timings[name] = total_ms / 1000.0
         self.events.clear()
         return timings
 

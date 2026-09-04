@@ -68,6 +68,10 @@ def get_device_flops(unit="T"):
         flops = 2250e12
     elif "BW1000_H" in device_name:
         flops = 480e12
+    elif "Graphics Device" in device_name: # pro 5000
+        flops = 251.8e12
+    elif "MTT S5000" in device_name:
+        flops = 460e12
     flops_unit = unit_convert(flops, unit)
     return flops_unit
 

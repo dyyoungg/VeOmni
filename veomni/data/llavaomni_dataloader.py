@@ -50,6 +50,7 @@ from veomni.data.multimodal.image_utils import  tokenizer_audio_token
 from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, LongVideoProcessor, ProactiveVideoProcessor
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils import helper
+from veomni.utils.device import get_device_type
 
 try:
     from baidubce.bce_client_configuration import BceClientConfiguration
@@ -1093,7 +1094,7 @@ class OmniDataloader(BaseDataLoader):
         
 
     def fetch_data_loop(self) -> None:
-        device = torch.device(f"cuda:{self.local_rank}")
+        device = torch.device(f"{get_device_type()}:{self.local_rank}")
         while not self.end_signal:
             batch_data = []
             batch_count = 0

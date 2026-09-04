@@ -46,6 +46,12 @@ _VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_4_with_sp": "flash_attention_4",
 }
 
+_HUB_KERNEL_TO_VEOMNI = {
+    "kernels-community/flash-attn2": "veomni_flash_attention_2_with_sp",
+    "kernels-community/flash-attn3": "veomni_flash_attention_3_with_sp",
+    "kernels-community/flash-attn4": "veomni_flash_attention_4_with_sp",
+}
+
 
 def _is_veomni_custom_flash_attention(implementation: str | None) -> bool:
     return implementation in _VEOMNI_FLASH_ATTN_IMPL_MAPPING
@@ -139,6 +145,9 @@ def patch_transformers_hub_kernel_loader_for_veomni():
         """
         if _is_veomni_custom_flash_attention(attn_implementation):
             return _load_veomni_local_flash_kernel(attn_implementation)
+
+        if attn_implementation in _HUB_KERNEL_TO_VEOMNI:
+            return _load_veomni_local_flash_kernel(_HUB_KERNEL_TO_VEOMNI[attn_implementation])
 
         if is_transformers_version_greater_or_equal_to("5.3.0"):
             return _original_load_and_register_attn_kernel(

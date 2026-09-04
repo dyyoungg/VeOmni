@@ -509,8 +509,10 @@ def build_optimizer(
         raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     if optimizer_type == "adamw":
+        if fused and not torch.cuda.is_available():
+            logger.info_rank0("fused Adam is not supported on this device, falling back to foreach Adam.")
+            fused = False
         foreach = not fused
-        fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)

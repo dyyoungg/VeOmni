@@ -17,6 +17,10 @@
 from typing import Any
 
 import torch
+try:
+    import torch_musa  # noqa: F401 - registers torch.musa and MCCL
+except ImportError:
+    torch_musa = None
 
 from . import logging
 from .import_utils import is_torch_mlu_available, is_torch_npu_available
@@ -27,6 +31,7 @@ logger = logging.get_logger(__name__)
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
 IS_NPU_AVAILABLE = is_torch_npu_available()
+IS_MUSA_AVAILABLE = hasattr(torch, "musa") and torch.musa.is_available()
 IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:
@@ -43,6 +48,8 @@ def get_device_type() -> str:
         device = "npu"
     elif IS_MLU_AVAILABLE:
         device = "mlu"
+    elif IS_MUSA_AVAILABLE:
+        device = "musa"
     else:
         device = "cpu"
 
@@ -84,6 +91,8 @@ def get_dist_comm_backend() -> str:
         return "hccl"
     elif IS_MLU_AVAILABLE:
         return "cncl"
+    elif IS_MUSA_AVAILABLE:
+        return "mccl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
@@ -101,6 +110,8 @@ def stream_synchronize() -> None:
         torch.npu.current_stream().synchronize()
     elif IS_MLU_AVAILABLE:
         torch.mlu.current_stream().synchronize()
+    elif IS_MUSA_AVAILABLE:
+        torch.musa.current_stream().synchronize()
     else:
         synchronize()
 
