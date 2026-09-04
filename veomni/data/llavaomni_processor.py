@@ -1221,7 +1221,7 @@ class OmniSampleProcessor:
             else:
                 is_human = (turn_idx % 2 == 0)
 
-            value = c.get("value", c.get("content", ""))
+            value = str(c.get("value", c.get("content", "")))
             if interleaved:
                 # ---------------- 图文交错模式 ----------------
                 try:

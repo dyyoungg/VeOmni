@@ -1087,9 +1087,9 @@ class VLMTrainer:
 
     def train(self):
         args: VeOmniArguments = self.args
-        self.state.start_epoch = 0 # resume will use
+        self.state.start_epoch = 0
         self.state.start_step = 0
-        self.on_train_begin() # resume will update start epoch and start step
+        self.on_train_begin()
 
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps
@@ -1111,12 +1111,13 @@ class VLMTrainer:
         for epoch in range(self.state.start_epoch, args.train.num_train_epochs):
             
             if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
-                self.train_dataloader.remote_data_index.value = 0
+                # Keep checkpoint-restored counter on mid-epoch resume
+                if not (epoch == self.state.start_epoch and self.start_step > 0):
+                    self.train_dataloader.remote_data_index.value = 0
+            self.train_dataloader.set_epoch(epoch)
             self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)
             self.current_epoch = epoch
-            if hasattr(self.train_dataloader, "set_epoch"):
-                self.train_dataloader.set_epoch(epoch)
 
             self.state.epoch = float(epoch)
 

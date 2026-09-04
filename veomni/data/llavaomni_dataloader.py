@@ -711,7 +711,7 @@ class OmniDataloader(BaseDataLoader):
                     # logger.error(f"ask data error: {e!r}")
                     time.sleep(3)
                     continue
-                if data_index >= len(self.data_list) - 1:
+                if data_index >= len(self.data_list):
                     print(f"rank {dist.get_rank()}, data index: {data_index}")
                     if hasattr(self, 'new_input_ids') and len(self.new_input_ids) > 0:
                         self._flush_pack_buffer()
@@ -722,6 +722,7 @@ class OmniDataloader(BaseDataLoader):
                     continue
                 file_path = None
                 try:
+                    data_index = self.map_data_index(data_index)
                     data_item = self.data_list[data_index]
                     is_multi_file = hasattr(data_item, "__len__") and not isinstance(data_item, (str, bytes))
                     

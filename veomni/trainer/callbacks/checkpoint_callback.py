@@ -92,8 +92,8 @@ class CheckpointerCallback(Callback):
 
         extra = state["extra_state"]
         self.trainer.state.global_step = extra["global_step"]
-        self.trainer.start_epoch       = extra["start_epoch"]   # 直接用，不做计算
-        self.trainer.start_step        = extra["start_step"]    # 直接用，不做计算
+        self.trainer.state.start_epoch = extra["start_epoch"]
+        self.trainer.state.start_step  = extra["start_step"]
 
         self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
@@ -111,7 +111,7 @@ class CheckpointerCallback(Callback):
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
-        if self.trainer.start_step == 0:
+        if self.trainer.state.start_step == 0:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
 
