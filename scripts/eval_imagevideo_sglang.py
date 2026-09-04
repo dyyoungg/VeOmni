@@ -59,7 +59,13 @@ def get_video_frames(video_path, total_sample_frames, start_time=None, end_time=
     
     if os.path.exists(video_path):
         video_file = video_path
-        target_input = video_path 
+        target_input = video_path
+    elif video_path.startswith("s3://"):
+        video_bytes = cepthclient.Get(video_path)
+        target_input = f"/dev/shm/{uuid.uuid4().hex}.mp4"
+        with open(target_input, "wb") as f:
+            f.write(video_bytes)
+        video_file = target_input
     else:
         print('video path does not exist', video_path)
         return [], 0
@@ -76,15 +82,7 @@ def get_video_frames(video_path, total_sample_frames, start_time=None, end_time=
                 return frames
         return None
         
-    if isinstance(video_file, bytes):
-        video_io = io.BytesIO(video_file)
-
-    elif "s3://" in video_path:
-        video_bytes = cepthclient.Get(video_path)
-        video_io = io.BytesIO(video_bytes)
-
-    elif isinstance(video_file, str):
-        video_io = video_file
+    video_io = video_file
         
     is_gif = (format == "gif") or video_path.lower().endswith('.gif')
     if is_gif:
