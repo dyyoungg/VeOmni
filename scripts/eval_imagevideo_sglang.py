@@ -478,15 +478,23 @@ def writer_logic(result_queue, output_path, total_tasks, pbar):
 
 
 def main(args, urls_list):
-    dataset_name_or_path = args.dataset_name if args.dataset_name else args.dataset_path
-    dataset_type_lower = dataset_name_or_path.lower()
-    
-    if os.path.exists(dataset_name_or_path):
-        target_path = dataset_name_or_path
-    elif dataset_type_lower in BENCHMARKS:
-        target_path = BENCHMARKS[dataset_type_lower]
+    # dataset_path 优先；否则 dataset_name 查预定义表；都没给则报错
+    if args.dataset_path:
+        if not os.path.exists(args.dataset_path):
+            raise FileNotFoundError(f"Custom dataset path not found: {args.dataset_path}")
+        target_path = args.dataset_path
+        if not args.dataset_name:
+            args.dataset_name = os.path.splitext(os.path.basename(target_path))[0]
+    elif args.dataset_name:
+        key = args.dataset_name.lower() if args.dataset_name.lower() in BENCHMARKS else args.dataset_name
+        if key not in BENCHMARKS:
+            raise ValueError(
+                f"'{args.dataset_name}' is not in predefined BENCHMARKS. "
+                f"Available: {list(BENCHMARKS.keys())}. Or use --dataset_path for a custom file."
+            )
+        target_path = BENCHMARKS[key]
     else:
-        raise ValueError(f"Dataset path not found, and '{dataset_name_or_path}' is not in predefined BENCHMARKS dict.")
+        raise ValueError("Must specify either --dataset_name or --dataset_path.")
 
     raw_data = read_json(target_path)
     
@@ -574,9 +582,9 @@ if __name__ == "__main__":
     parser.add_argument("--urls", type=str, nargs="+", default=["127.0.0.1"], help="后端服务的 IP 或域名列表，空格分隔")
     parser.add_argument("--workers_per_url", type=int, default=1, help="每个 URL 绑定的并发线程数 (并发度)")
     
-    # 路径与数据相关
-    parser.add_argument("--dataset_name", type=str, default="ocr", help="视频数据集中的名字/类别", choices=["ocr", "chartqa", "mvbench", "videommmu"])
-    parser.add_argument("--dataset_path", type=str, default="", help="指定本地路径")
+    # 路径与数据相关（二选一：dataset_name 走预定义路径，dataset_path 走自定义 JSON）
+    parser.add_argument("--dataset_name", type=str, default="", help="预定义数据集名称，可选: " + ", ".join(BENCHMARKS.keys()))
+    parser.add_argument("--dataset_path", type=str, default="", help="自定义 JSON/JSONL 文件路径，优先级高于 dataset_name")
     
     parser.add_argument("--save_dir", type=str, default="./data")
     parser.add_argument("--save_jsonl_path", type=str, default="")
