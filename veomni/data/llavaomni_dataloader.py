@@ -70,7 +70,7 @@ except Exception:
     global_config = None
     BosClient = None
 
-AOSS_FILE = "/mnt/afs/yangdeyu/aoss_ydy_game.conf"
+AOSS_FILE = os.environ.get("AOSS_FILE", "/mnt/afs/yangdeyu/aoss_ydy_game.conf")
 logger = helper.create_logger(__name__)
 
 

@@ -3,20 +3,20 @@
 # Usage: torchrun --nproc_per_node 8 tasks/train_llavaomni.py configs/multimodal/llavaomni/fake_data_benchmark.yaml
 
 model:
-  model_path: /mnt/afs/share/llava_qwen2_14B-qwen25encoder-st2-veomni-down16-audiodown8    # 替换为实际模型路径
-  config_path: /mnt/afs/share/llava_qwen2_14B-qwen25encoder-st2-veomni-down16-audiodown8
+  model_path: /home/tione/notebook/share/20260708_beebee_14B_veomni    # 替换为实际模型路径
+  config_path: /home/tione/notebook/share/20260708_beebee_14B_veomni
   model_arc: qwen2
-  vision_tower: /mnt/afs/share/qwen25_vl_encoder   # 替换为实际 vision encoder 路径
+  vision_tower: /home/tione/notebook/share/qwen25_vl_encoder   # 替换为实际 vision encoder 路径
   mm_downsample_ratio: 16
   image_projector_type: dynamic_avgpool
   audio_projector_type: conv_channel_upscale
   use_audio_start_end_token: true
-  audio_downsample_ratio: 8
+  audio_downsample_ratio: 10
   encoder_data_balance: false
 
 data:
-  train_path: ""              # fake data 模式下不需要真实数据路径
-  eval_path: ""
+  train_path: "/home/tione/notebook/yangdeyu/data/Claude_32K.json"              # fake data 模式下不需要真实数据路径
+  eval_path: "/home/tione/notebook/yangdeyu/data/aishell_test.json"
   sample_fps: 2
   finetune_sample_frames: 64
   preprocess_workers: 2
@@ -30,13 +30,13 @@ train:
   init_device: meta
 
   # ===== Fake Data 开关 =====
-  use_fake_data: true         # 启用 fake data
-  fake_data_num_samples: 500000 # 生成的 fake 样本数量
+  use_fake_data: false         # 启用 fake data
+  fake_data_num_samples: 5000000 # 生成的 fake 样本数量
 
-  freeze_vit: false
-  freeze_vit_projector: false
+  freeze_vit: true
+  freeze_vit_projector: true
   freeze_audio_tower: true
-  freeze_audio_projector: false
+  freeze_audio_projector: true
   freeze_llm: false
   output_router_logits: false
   freeze_router: true
@@ -57,7 +57,7 @@ train:
   gc_steps: 200
   empty_cache_steps: 200
   logging_steps: 2            # 每步都打印，方便观察吞吐
-  max_steps: 200              # 只跑 100 步，测速度
+  max_steps: 2000              # 只跑 100 步，测速度
   eval_steps: 0
 
   gradient_checkpointing:
@@ -73,13 +73,13 @@ train:
       reshard_after_forward: true
       reshard_after_backward: true
       offload: false
-      forward_prefetch: false
+      forward_prefetch: true
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.8
 
   checkpoint:
-    output_dir: /tmp/fake_test
+    output_dir: /home/tione/notebook/yangdeyu/VeOmni/ckpt/0827_llava_14B_gpu8_Pro5000_liger_optimized
     save_steps: 10000
     save_epochs: 1
     save_total_limit: 1
@@ -88,8 +88,19 @@ train:
     save_async: true
     hf_save_steps: 0
 
+  profile:
+    enable: true
+    start_step: 10
+    end_step: 15
+    warmup_steps: 5       
+    trace_dir: /home/tione/notebook/yangdeyu/VeOmni/profile_json
+    prefix: seq4k_1node_llm
+    print_nccl_breakdown: true
+
   wandb:
-    enable: false
+    enable: true
+    project: llavaomni
+    name: 0827_llava_14B_gpu8_Pro5000_liger_optimized
 
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2
