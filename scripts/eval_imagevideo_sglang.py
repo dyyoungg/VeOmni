@@ -9,6 +9,7 @@ import base64
 import random
 import asyncio
 import aiohttp
+import warnings
 import threading
 from typing import List, Optional, AsyncGenerator, Union, Tuple
 from dataclasses import dataclass, asdict
@@ -29,6 +30,7 @@ from veomni.data.multimodal.image_utils import qwen25vl_image_preprocess
 from aoss_client.client import Client as CepthClient
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 cepthclient = CepthClient("/mnt/afs/yangdeyu/aoss_ydy_game.conf")
 
@@ -108,7 +110,7 @@ def get_video_frames(video_path, total_sample_frames, start_time=None, end_time=
             else:
                 meta_data['duration'] = container.duration
         container.close()
-        video = iio.imiter(video_file, plugin="pyav", thread_count=1)
+        video = None
         frame_count = int(meta_data['duration'] * meta_data['fps'])
         end_frame = frame_count
         framerate = meta_data['fps']
@@ -156,6 +158,8 @@ def get_video_frames(video_path, total_sample_frames, start_time=None, end_time=
             raw_img_list = [] 
  
     if len(raw_img_list) == 0 or method == "imageio":
+        if video is None:
+            video = iio.imiter(video_file, plugin="pyav", thread_count=1)
         for idx, image in enumerate(video):
             if idx == frame_seq[img_index]:
                 image = Image.fromarray(image)
