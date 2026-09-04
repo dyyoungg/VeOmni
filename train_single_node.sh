@@ -17,5 +17,5 @@ export VEOMNI_COMPILE_FRIENDLY_CKPT=1
 
 cd /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev
 # fsdp2
-torchrun --nproc_per_node 8 tasks/train_llavaomni.py \
-   test.yaml
+torchrun --nproc_per_node 2 tasks/train_llavaomni.py \
+   /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0725_stage3_imagesft_removesubtitle_addvideoxl/30A3B_qwen35encoder_fsdp2_freeze_router_auxloss_dynamic_downsample.yaml
