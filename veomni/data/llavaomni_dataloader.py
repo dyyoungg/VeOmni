@@ -1596,7 +1596,7 @@ def get_eval_dataloader(tokenizer, data_args, training_args, model_args):
     if dist.is_available() and dist.is_initialized():
         eval_sampler = DistributedSampler(
                                         eval_dataset,
-                                        shuffle=True, 
+                                        shuffle=True,
                                         drop_last=False 
                                 )
     
