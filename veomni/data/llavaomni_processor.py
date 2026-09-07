@@ -1375,6 +1375,11 @@ class OmniSampleProcessor:
                             text_tokens += cur_tokens
                             # Mask asst_prefix, label content
                             label_tokens += [IGNORE_INDEX] * len(prefix_tokens) + content_tokens
+                except:
+                    print(traceback.format_exc())
+                    print("sample is error:", sample_data)
+                    # 抛出错误
+                    raise ValueError(f"Error processing sample: {sample_data}")
 
         assert len(label_tokens) == len(text_tokens), (
             f"{sample_data} label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"
