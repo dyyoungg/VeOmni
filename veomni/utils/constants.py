@@ -99,7 +99,10 @@ _CHAT_TEMPLATES = {
         user="\n<|im_start|>user\n{}<|im_end|>",
         assistant="\n<|im_start|>assistant\n{}<|im_end|>",
         assistant_prefix="\n<|im_start|>assistant\n",
+        assistant_content="{}<|im_end|>",
+        generation_prefix="\n<|im_start|>assistant\n",
         query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        user_format="\n<|im_start|>user\n{}<|im_end|>",
         assistant_active="\n<|im_start|>assistant\n（主动）{}<|im_end|>",
         assistant_active_prefix="\n<|im_start|>assistant\n（主动）",
         thinking="\n<|im_start|>thinking\n{}<|im_end|>",
@@ -110,3 +113,23 @@ _CHAT_TEMPLATES = {
 }
 
 _CHAT_TEMPLATES["qwen3"] = _CHAT_TEMPLATES["qwen2"]
+
+_CHAT_TEMPLATES["qwen35"] = dict(
+    system="<|im_start|>system\n{}<|im_end|>",
+    system_in_middle="\n<|im_start|>system\n{}<|im_end|>\n<|im_start|>assistant\n",
+    system_in_middle_no_assistant="\n<|im_start|>system\n{}<|im_end|>",
+    user="\n<|im_start|>user\n{}<|im_end|>",
+    assistant="\n<|im_start|>assistant\n<think>\n\n</think>\n\n{}<|im_end|>",
+    assistant_prefix="\n<|im_start|>assistant\n",
+    # query_format includes empty think block: eval can use directly, training uses user part only
+    query_format="\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    # Training: user turn format (no think, used when building training pairs)
+    user_format="\n<|im_start|>user\n{}<|im_end|>",
+    # assistant_content: non-reasoning (empty think + content)
+    assistant_content="<think>\n\n</think>\n\n{}<|im_end|>",
+    # assistant_content_reasoning: with reasoning (think has content)
+    assistant_content_reasoning="<think>\n{reasoning}\n</think>\n\n{content}<|im_end|>",
+    generation_prefix="\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    thinking="\n<|im_start|>thinking\n{}<|im_end|>",
+    thinking_prefix="\n<|im_start|>thinking\n",
+)

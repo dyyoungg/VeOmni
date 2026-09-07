@@ -28,10 +28,8 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
 from flash_attn import (
-    flash_attn_qkvpacked_func,
     flash_attn_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_qkvpacked_func,
 )
 
 try:

@@ -2,11 +2,13 @@
 
 In this section, we provide the installation guide for Nvidia GPU.
 
-VeOmni also supports other hardware platform, please refer to [Ascend](install_ascend.md).
+VeOmni also supports other hardware platforms. See the installation guides for
+[Ascend x86](install_ascend_x86.md), [Ascend ARM](install_ascend_arm.md), and
+[AMD ROCm](../../hardware_support/rocm/README.md).
 
 ## Required Environment
 
-CUDA == 12.8
+CUDA 13.0 (the `gpu` extra targets `+cu130` torch wheels and the `nvcr.io/nvidia/pytorch:25.11-py3` base image).
 
 ## Install with uv or pip
 
@@ -18,25 +20,28 @@ CUDA == 12.8
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-# use the locked uv env
-uv sync --locked  --extra gpu
+uv sync --locked --extra gpu
 source .venv/bin/activate
 ```
 
-You can use `--extra` to install other optional dependencies. Refer to [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for more details.
+`gpu` is a single full superset: cu130 torch, FA2 (cp311/cp312 prebuilt
+wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, diffusion / audio /
+video / LoRA deps, and `megatron-energon` for the
+optional energon dataset format. See
+[pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
+for the full list.
+
+### Optional MagiAttention SM90 overlay
+
+MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. SM90 GPUs require an additional CUTLASS overlay after the GPU environment is synced:
 
 ```bash
-# eg. install with dit dependencies in GPU
-uv sync --locked  --extra gpu --extra dit
-
-# eg. install with video/audio processing dependencies (torchcodec, PyAV, librosa, soundfile)
-# Note: `video` and `audio` extras are equivalent - both include video and audio processing
-uv sync --locked  --extra gpu --extra video
-# or equivalently:
-uv sync --locked  --extra gpu --extra audio
+bash scripts/kernel/install_magi_sm90.sh
 ```
 
-> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Use `--help` to inspect optional build overrides. A later exact `uv sync` can remove the overlay, so rerun the installer before using MagiAttention on SM90.
+
+> **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
 > # Ubuntu/Debian
 > sudo apt-get install ffmpeg

@@ -18,8 +18,13 @@ from veomni.models.custom.vision_encoder.modeling_qwen35_vision_encoder import B
 from veomni.models.module_utils import init_empty_weights, load_model_weights
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-from veomni.ops.fused_moe import apply_veomni_fused_moe_patch
+from veomni.utils.device import is_torch_npu_available
 from veomni.utils.logging import get_logger
+from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.auto import _bind_veomni_ops
+from veomni.ops import apply_ops_config
+from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
+from veomni.models.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as _patched_qwen3_moe_module
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
     from transformers.initialization import no_init_weights
@@ -28,15 +33,73 @@ else:
 
 logger = get_logger(__name__)
 
-def _set_attn_implementation_in_config(config: PretrainedConfig, attn_implementation: str, moe_implementation) -> None:
+
+def _install_veomni_qwen3moe_ops(ops_implementation: OpsImplementationConfig) -> None:
+    """Modern replacement for the old manual ``apply_veomni_qwen3moe_gpu_patch``.
+
+    1. ``apply_ops_config`` installs the CE kernel into LOSS_MAPPING, binds
+       GLOBAL ops (e.g. load-balancing loss), and populates the ops-config
+       singleton. Idempotent — safe to call twice.
+    2. ``_bind_veomni_ops`` walks the patchgen'd Qwen3-MoE modeling module and
+       binds every OpSlot (rms_norm / rotary_pos_emb / swiglu_mlp /
+       moe_experts / cross_entropy_loss / load_balancing_loss). It also
+       side-effects ``apply_veomni_fused_moe_patch`` internally so the
+       module-level ``_fused_moe_forward`` pointer stays in sync with the
+       ``moe_experts`` slot's bound kernel.
+
+    The patched module must already be imported (it is, via
+    ``modeling_llava_qwen3moe_omni``).
+    """
+    apply_ops_config(ops_implementation)
+    _bind_veomni_ops(_patched_qwen3_moe_module, ops_implementation)
+
+
+def _legacy_apply_fused_moe_only(moe_implementation: Optional[str]) -> None:
+    """Fallback for callers that pass only the legacy ``moe_implementation``
+    string (no full ``OpsImplementationConfig``). Preserves the pre-refactor
+    behaviour of ``_set_attn_implementation_in_config`` for the merge scripts.
+
+    Accepted values mirror ``OpsImplementationConfig.moe_implementation``
+    ([veomni/arguments/arguments_types.py:1052]):
+
+    - ``"eager"``               → skip (no fused kernel installed)
+    - ``"fused_triton"``        → ``triton``   (GPU SM70+, A100/H-series)
+    - ``"fused_quack"``         → ``quack``    (GPU SM90+, Hopper/Blackwell)
+    - ``"fused_npu"``           → ``npu``      (Ascend NPU)
+    - ``"fused"`` (deprecated)  → hardware-resolved: NPU→``npu``, GPU→``quack``
+      (matches upstream ``OpsImplementationConfig.__post_init__`` at
+      [veomni/arguments/arguments_types.py:1174-1182]; A100 users should
+      migrate to explicit ``"fused_triton"``).
+
+    Only touches the MoE kernel pointer; other OpSlots stay unbound (eager)
+    unless the caller uses ``ops_implementation``.
+    """
+    if moe_implementation is None or moe_implementation == "eager":
+        return
+    if moe_implementation == "fused":
+        moe_implementation = "fused_npu" if is_torch_npu_available() else "fused_quack"
+        logger.warning_rank0(
+            f"[llava_qwen3moe] moe_implementation='fused' is a deprecated alias; "
+            f"resolving to '{moe_implementation}' on this host."
+        )
+    prefix = "fused_"
+    if not moe_implementation.startswith(prefix):
+        raise ValueError(
+            f"Invalid moe_implementation: {moe_implementation!r}. Expected one of: "
+            f"'eager', 'fused', 'fused_triton', 'fused_quack', 'fused_npu'."
+        )
+    fused_moe_kernel = moe_implementation[len(prefix):]  # 'triton' | 'quack' | 'npu'
+    logger.info_rank0(
+        f"[llava_qwen3moe] Legacy fused-MoE-only path: moe_implementation={moe_implementation} "
+        f"(fused_moe_kernel={fused_moe_kernel}). Pass ops_implementation=OpsImplementationConfig(...) "
+        f"to also bind rms_norm/rotary_pos_emb/swiglu_mlp/cross_entropy_loss kernels."
+    )
+    apply_veomni_fused_moe_patch(fused_moe_kernel=fused_moe_kernel)
+
+
+def _set_attn_implementation_in_config(config: PretrainedConfig, attn_implementation: str) -> None:
     # The custom omni wrapper forwards `config._attn_implementation` into submodules.
     setattr(config, "_attn_implementation", attn_implementation)
-    if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused", "fused_quack"]:
-            raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
-        logger.info_rank0(f"MoE implementation: {moe_implementation}")
-        setattr(config, "_moe_implementation", moe_implementation)
-        apply_veomni_fused_moe_patch(moe_implementation=moe_implementation)
       
         
 
@@ -179,12 +242,13 @@ def build_qwen3moe_omni_from_pretrained(
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     torch_dtype: Literal["bfloat16", "float32"] = "bfloat16",
     attn_implementation: str = "veomni_flash_attention_2_with_sp",
-    moe_implementation: Optional[Literal["eager", "fused", "fused_quack"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused", "fused_triton", "fused_quack", "fused_npu"]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
     freeze_except_projectors: bool = False,
     modality_aware_routing: bool = False,
     num_routing_modalities: int = 3,
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> LlavaQwen3MoeForCausalLM:
     """
     Load a *composite* omni model directory created by `model.save_pretrained(...)`.
@@ -197,15 +261,24 @@ def build_qwen3moe_omni_from_pretrained(
     parallel_state = get_parallel_state()
     global_rank = parallel_state.global_rank if parallel_state is not None else 0
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
-  
-    _set_attn_implementation_in_config(omni_config.foundation_config, attn_implementation, moe_implementation)
+
+    # Modern path: full OpsImplementationConfig binds every OpSlot (RMSNorm,
+    # RoPE, SwiGLU, MoE experts, CE loss, load-balancing loss). Legacy path:
+    # just MoE (backward compat with callers that still pass moe_implementation).
+    if ops_implementation is not None:
+        attn_implementation = ops_implementation.attn_implementation
+        _install_veomni_qwen3moe_ops(ops_implementation)
+    else:
+        _legacy_apply_fused_moe_only(moe_implementation)
+
+    _set_attn_implementation_in_config(omni_config.foundation_config, attn_implementation)
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
-        _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation, None)
+        _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation)
         omni_config.encoder_config.image_config.encoder_data_balance = encoder_data_balance
         omni_config.encoder_config.image_config.encoder_data_balance_sorting_algo = encoder_data_balance_sorting_algo
     if getattr(omni_config.encoder_config, "audio_config", None) is not None:
-        _set_attn_implementation_in_config(omni_config.encoder_config.audio_config, attn_implementation, None)
+        _set_attn_implementation_in_config(omni_config.encoder_config.audio_config, attn_implementation)
 
     # Modality-aware routing: write into foundation_config so that every
     # Qwen3MoeTopKRouter.__init__ creates the modality_bias parameter.
@@ -234,6 +307,7 @@ def build_qwen3moe_omni_from_components(
     audio_downsample_size: int = 10,
     audio_projector_type: str = "channel_upscale",
     audio_encoder_type: str = "whisper",
+    ops_implementation: Optional[OpsImplementationConfig] = None,
 ) -> LlavaQwen3MoeForCausalLM:
     """
     Build the omni wrapper and load weights *separately*:
@@ -248,14 +322,20 @@ def build_qwen3moe_omni_from_components(
     global_rank = parallel_state.global_rank if parallel_state is not None else 0
     empty_init = init_device == "meta" or (init_device == "cpu" and global_rank != 0)
 
+    # merge_component_models() only needs shape discovery — skip ops install
+    # when the caller doesn't pass an ops_implementation.
+    if ops_implementation is not None:
+        attn_implementation = ops_implementation.attn_implementation
+        _install_veomni_qwen3moe_ops(ops_implementation)
+
     foundation_cfg = AutoConfig.from_pretrained(foundation_config_path, trust_remote_code=True)
     if getattr(foundation_cfg, "foundation_config", None) is not None:
         foundation_cfg = foundation_cfg.foundation_config
-   
+
     output_size = int(getattr(foundation_cfg, "hidden_size"))
 
-    _set_foundation_dtype_in_config(foundation_cfg, torch_dtype, )
-    _set_attn_implementation_in_config(foundation_cfg, attn_implementation, moe_implementation="fused")
+    _set_foundation_dtype_in_config(foundation_cfg, torch_dtype)
+    _set_attn_implementation_in_config(foundation_cfg, attn_implementation)
 
     vision_cfg = None
     audio_cfg = None
@@ -269,9 +349,9 @@ def build_qwen3moe_omni_from_components(
             image_projector_type=image_projector_type,
             train_vision_projector=True,
         )
-        _set_attn_implementation_in_config(vision_cfg, attn_implementation, None)
+        _set_attn_implementation_in_config(vision_cfg, attn_implementation)
 
-      
+
 
     if "audio" in encoders:
         enc = encoders["audio"]
@@ -283,7 +363,7 @@ def build_qwen3moe_omni_from_components(
             train_audio_projector=True,
             audio_encoder_type=audio_encoder_type,
         )
-        _set_attn_implementation_in_config(audio_cfg, attn_implementation, None)
+        _set_attn_implementation_in_config(audio_cfg, attn_implementation)
 
     omni_config = Qwen3MoeOmniConfig(
         encoder_config={

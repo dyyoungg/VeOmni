@@ -3,6 +3,11 @@ model:
   config_path: ./configs/model_configs/wan/wani2v_14b.json
   ops_implementation:
     attn_implementation: flash_attention_2
+    # Wan's RoPE has a non-standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan-specific liger wrapper exists.
+    rotary_pos_emb_implementation: eager
 
 data:
   train_path: Wanmini480
@@ -21,9 +26,9 @@ train:
     dp_replicate_size: 1
     ulysses_size: 4
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-      offload: false
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
     offload:
       enable_activation: false
   gradient_checkpointing:
@@ -40,8 +45,7 @@ train:
     weight_decay: 0.01
     max_grad_norm: 1.0
   vit_lr: 5.0e-5
-  enable_mixed_precision: false
-  init_device: cuda
+  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

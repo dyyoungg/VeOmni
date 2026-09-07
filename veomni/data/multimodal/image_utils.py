@@ -21,6 +21,7 @@ from functools import lru_cache
 
 import numpy as np
 import requests
+import torch
 from PIL import Image
 import base64
 from typing import List, Union, Optional, Tuple
@@ -485,6 +486,13 @@ def jpeg_degrade(img: Image.Image, quality: int) -> Image.Image:
     img.convert("RGB").save(buf, format="JPEG", quality=quality)
     buf.seek(0)
     return Image.open(buf).copy()
+
+def save_image_tensors_to_file(image_tensors: torch.Tensor, output_path: str):
+    image_tensors = image_tensors * 255.0
+    image_tensors = image_tensors.clamp(0, 255)
+    image_tensors = image_tensors.cpu().to(torch.uint8).numpy()
+    image = Image.fromarray(image_tensors)
+    image.save(output_path)
 
 
 if __name__ == "__main__":

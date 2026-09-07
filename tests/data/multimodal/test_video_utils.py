@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from veomni.data.multimodal.video_utils import (
+    _apply_dynamic_video_max_pixels,
+    calculate_frame_indices,
     fetch_videos,
     fetch_videos_metadata,
     load_video,
@@ -274,7 +276,7 @@ def test_fetch_videos_multiple_inputs():
     assert len(audios) == 3, f"Expected 3 audios, got {len(audios)}"
 
     # Verify each output
-    for i, (video, audio) in enumerate(zip(videos, audios)):
+    for _i, (video, audio) in enumerate(zip(videos, audios)):
         assert_video_output_valid(video, audio, **kwargs)
 
 
@@ -538,11 +540,11 @@ def test_frames_indices_for_qwen3vl():
     assert (frames_indices[1:] >= frames_indices[:-1]).all(), "Frame indices should be non-decreasing"
 
     # Simulate Qwen3-VL timestamp calculation (simplified version)
-    # This replicates the logic in multimodal_chat_template.py
+    # This replicates the logic in chat_template.py
     merge_size = 2
     indices_list = frames_indices.tolist()
 
-    # Pad to merge_size if needed (as done in Qwen3VLChatTemplate._calculate_timestamps)
+    # Pad to the temporal patch size (as done in Qwen3VLChatTemplate._calculate_timestamps)
     if len(indices_list) % merge_size != 0:
         indices_list.extend([indices_list[-1]] * (merge_size - len(indices_list) % merge_size))
 
@@ -565,6 +567,98 @@ def test_frames_indices_for_qwen3vl():
     print(f"FPS: {fps}")
     print(f"Calculated timestamps: {merged_timestamps}")
     print("-------------------------------------------")
+
+
+class TestCalculateFrameIndicesRemainder:
+    """Tests for frame_factor_remainder support in calculate_frame_indices."""
+
+    def test_remainder_zero_backward_compatible(self):
+        """frame_factor_remainder=0 should behave identically to the old logic."""
+        # 100 frames at 30fps, sample at 2fps -> ~6.67 frames -> floor to 4 (multiple of 4)
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=0
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 0, f"Expected multiple of 4, got {nframes}"
+
+    def test_remainder_one_with_factor_four(self):
+        """frame_factor=4, remainder=1 should produce 4k+1 frame counts (1, 5, 9, 13...)."""
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=1
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes} (nframes % 4 = {nframes % 4})"
+
+    def test_remainder_one_with_min_max_frames(self):
+        """min_frames and max_frames should also align to factor*k + remainder."""
+        indices, pad = calculate_frame_indices(
+            total_frames=200,
+            video_fps=30,
+            fps=2.0,
+            frame_factor=4,
+            frame_factor_remainder=1,
+            min_frames=8,
+            max_frames=20,
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes}"
+        # min_frames=8 -> ceil to 9 (4*2+1), max_frames=20 -> floor to 17 (4*4+1)
+        assert nframes >= 9, f"Expected >= 9 (aligned min), got {nframes}"
+        assert nframes <= 17, f"Expected <= 17 (aligned max), got {nframes}"
+
+    def test_remainder_one_small_video(self):
+        """Small video with remainder=1 should produce at least 1 frame."""
+        indices, pad = calculate_frame_indices(
+            total_frames=3, video_fps=30, fps=1.0, frame_factor=4, frame_factor_remainder=1
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 1, f"Expected 4k+1, got {nframes}"
+        assert nframes >= 1, f"Expected at least 1 frame, got {nframes}"
+
+    def test_remainder_two_with_factor_four(self):
+        """frame_factor=4, remainder=2 should produce 4k+2 frame counts (2, 6, 10, 14...)."""
+        indices, pad = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=2
+        )
+        nframes = len(indices) + pad
+        assert nframes % 4 == 2, f"Expected 4k+2, got {nframes} (nframes % 4 = {nframes % 4})"
+
+    @pytest.mark.parametrize(
+        "total_frames,video_fps,fps,factor,remainder",
+        [
+            (100, 30, 2.0, 4, 1),  # Normal case
+            (50, 24, 1.0, 4, 1),  # Different fps
+            (200, 30, 3.0, 4, 1),  # Higher target fps
+            (10, 30, 2.0, 4, 1),  # Few frames
+            (500, 60, 2.0, 4, 1),  # Many frames, high fps
+            (100, 30, 2.0, 2, 1),  # factor=2, remainder=1 -> odd numbers
+            (100, 30, 2.0, 3, 1),  # factor=3, remainder=1
+            (100, 30, 2.0, 3, 2),  # factor=3, remainder=2
+        ],
+    )
+    def test_remainder_alignment_parametrized(self, total_frames, video_fps, fps, factor, remainder):
+        """Parametrized test: output frame count should always satisfy nframes % factor == remainder."""
+        indices, pad = calculate_frame_indices(
+            total_frames=total_frames,
+            video_fps=video_fps,
+            fps=fps,
+            frame_factor=factor,
+            frame_factor_remainder=remainder,
+        )
+        nframes = len(indices) + pad
+        assert nframes % factor == remainder, (
+            f"Expected nframes % {factor} == {remainder}, got {nframes} (mod={nframes % factor})"
+        )
+        assert nframes >= remainder, f"Expected at least {remainder} frames, got {nframes}"
+
+    def test_default_remainder_is_zero(self):
+        """When frame_factor_remainder is not specified, it defaults to 0 (backward compat)."""
+        indices1, pad1 = calculate_frame_indices(total_frames=100, video_fps=30, fps=2.0, frame_factor=4)
+        indices2, pad2 = calculate_frame_indices(
+            total_frames=100, video_fps=30, fps=2.0, frame_factor=4, frame_factor_remainder=0
+        )
+        assert indices1 == indices2
+        assert pad1 == pad2
 
 
 @pytest.mark.skipif(not (is_ffmpeg_available()), reason="torchcodec or ffmpeg is not available")
@@ -721,3 +815,102 @@ def test_benchmark_audio_processing():
         assert_video_output_valid(videos[0], audios[0], **kwargs)
 
     print(f"{'=' * 85}")
+
+
+class TestApplyDynamicVideoMaxPixels:
+    """Tests for _apply_dynamic_video_max_pixels (Qwen3-VL dynamic token budget)."""
+
+    def test_noop_without_video_total_pixels(self):
+        """Without video_total_pixels, kwargs should be returned unchanged."""
+        kwargs = {"video_max_pixels": 602112, "video_min_pixels": 100352}
+        result = _apply_dynamic_video_max_pixels(nframes=20, kwargs=kwargs)
+        assert result is kwargs, "Should return the exact same dict object"
+
+    def test_noop_with_zero_nframes(self):
+        """With nframes=0, kwargs should be returned unchanged."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112}
+        result = _apply_dynamic_video_max_pixels(nframes=0, kwargs=kwargs)
+        assert result is kwargs
+
+    def test_few_frames_capped_by_video_max_pixels(self):
+        """With few frames, dynamic budget exceeds video_max_pixels and should be capped."""
+        # 20 frames: dynamic = 90_000_000 / 20 * 2 = 9_000_000 >> 602112
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=20, kwargs=kwargs)
+        assert result["video_max_pixels"] == 602112
+
+    def test_many_frames_reduces_max_pixels(self):
+        """With many frames, dynamic budget should reduce video_max_pixels."""
+        # 600 frames: dynamic = 90_000_000 / 600 * 2 = 300_000 < 602112
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert result["video_max_pixels"] == 300_000
+
+    def test_min_pixels_floor(self):
+        """Dynamic max should not go below video_min_pixels * 1.05."""
+        # 10000 frames: dynamic = 90_000_000 / 10000 * 2 = 18_000
+        # But min_pixels * 1.05 = 100352 * 1.05 = 105369
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        result = _apply_dynamic_video_max_pixels(nframes=10000, kwargs=kwargs)
+        assert result["video_max_pixels"] == int(100352 * 1.05)
+
+    def test_no_video_max_pixels_in_kwargs(self):
+        """If video_max_pixels is not set, dynamic budget is used directly."""
+        kwargs = {"video_total_pixels": 90_000_000, "frame_factor": 2}
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert result["video_max_pixels"] == int(90_000_000 / 600 * 2)
+
+    def test_no_video_min_pixels_in_kwargs(self):
+        """If video_min_pixels is not set, no floor is applied."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112, "frame_factor": 2}
+        result = _apply_dynamic_video_max_pixels(nframes=10000, kwargs=kwargs)
+        # dynamic = 90_000_000 / 10000 * 2 = 18_000, no floor
+        assert result["video_max_pixels"] == 18_000
+
+    def test_original_kwargs_not_mutated(self):
+        """The original kwargs dict should not be modified."""
+        kwargs = {
+            "video_total_pixels": 90_000_000,
+            "video_max_pixels": 602112,
+            "frame_factor": 2,
+        }
+        original_max = kwargs["video_max_pixels"]
+        _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        assert kwargs["video_max_pixels"] == original_max
+
+    def test_default_temporal_merge_factor(self):
+        """When frame_factor is not set, default temporal merge factor of 2 is used."""
+        kwargs = {"video_total_pixels": 90_000_000, "video_max_pixels": 602112}
+        result = _apply_dynamic_video_max_pixels(nframes=600, kwargs=kwargs)
+        expected = int(90_000_000 / 600 * 2)  # default factor=2
+        assert result["video_max_pixels"] == expected
+
+    def test_training_seq_len_budget(self):
+        """Typical training config: max_seq_len=4096 based budget."""
+        # 4096 * 28^2 * 0.9 = 2_889_523
+        video_total_pixels = int(4096 * 28 * 28 * 0.9)
+        kwargs = {
+            "video_total_pixels": video_total_pixels,
+            "video_max_pixels": 602112,
+            "video_min_pixels": 100352,
+            "frame_factor": 2,
+        }
+        # 16 frames: dynamic = 2_889_523 / 16 * 2 = 361_190 < 602112
+        result = _apply_dynamic_video_max_pixels(nframes=16, kwargs=kwargs)
+        assert result["video_max_pixels"] < 602112
+        assert result["video_max_pixels"] > 100352

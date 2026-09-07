@@ -11,18 +11,67 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....lora.target_mapping import convert_fused_moe_lora_targets
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
+
+
+def _convert_qwen3_vl_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "model.language_model.layers.*.mlp.experts.gate_up_proj",
+        "model.language_model.layers.*.mlp.experts.down_proj",
+    )
+
+
+def _convert_qwen3_vl_moe_model_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "language_model.layers.*.mlp.experts.gate_up_proj",
+        "language_model.layers.*.mlp.experts.down_proj",
+    )
+
+
+def _convert_qwen3_vl_moe_text_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "layers.*.mlp.experts.gate_up_proj",
+        "layers.*.mlp.experts.down_proj",
+    )
 
 
 @MODELING_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_modeling(architecture: str):
-    from .modeling_qwen3_vl_moe import (
-        Qwen3VLMoeForConditionalGeneration,
-        Qwen3VLMoeModel,
-        apply_veomni_qwen3vlmoe_patch,
+    from .checkpoint_tensor_converter import create_qwen3_vl_moe_checkpoint_tensor_converter
+
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_vl_moe_npu import (
+            Qwen3VLMoeForConditionalGeneration,
+            Qwen3VLMoeModel,
+            Qwen3VLMoeTextModel,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_vl_moe_gpu import (
+            Qwen3VLMoeForConditionalGeneration,
+            Qwen3VLMoeModel,
+            Qwen3VLMoeTextModel,
+        )
+
+    for model_cls in (Qwen3VLMoeForConditionalGeneration, Qwen3VLMoeModel, Qwen3VLMoeTextModel):
+        model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_vl_moe_checkpoint_tensor_converter)
+    Qwen3VLMoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_vl_moe_wrapped_lora_targets_to_parameters
+    )
+    Qwen3VLMoeModel._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_vl_moe_model_lora_targets_to_parameters
+    )
+    Qwen3VLMoeTextModel._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_vl_moe_text_lora_targets_to_parameters
     )
 
-    apply_veomni_qwen3vlmoe_patch()
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLMoeForConditionalGeneration
     elif "Model" in architecture:

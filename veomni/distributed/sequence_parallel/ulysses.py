@@ -35,14 +35,24 @@ def _all_gather(
     x: Tensor,
     group: dist.ProcessGroup,
 ):
-    device = x.device
-    dtype = x.dtype
+    """All-gather ``x`` over ``group``, returning the per-rank tensors and their shapes.
+
+    Shards may differ in length, but every rank must pass the same number of
+    dimensions. Shapes are exchanged first and read back to the host with a single
+    ``tolist()``: materializing them as ``torch.Size`` from per-rank device tensors
+    instead costs one device-to-host sync per dimension per rank, and with a gather in
+    every layer that drains the device queue thousands of times per step. Shapes are
+    returned as plain ints for the same reason.
+    """
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
-    x_size = torch.tensor(x.size()).to(device)
-    size_list = [torch.zeros(x_size.size(), dtype=torch.int64, device=device) for i in range(sp_world_size)]
-    dist.all_gather(size_list, x_size, group=group)
-    tensor_list = [torch.zeros(torch.Size(size_list[i]), dtype=dtype, device=device) for i in range(sp_world_size)]
+    ndim = x.dim()
+    x_size = torch.tensor(x.size(), dtype=torch.int64, device=x.device)
+    all_sizes = torch.empty(sp_world_size * ndim, dtype=torch.int64, device=x.device)
+    dist.all_gather_into_tensor(all_sizes, x_size, group=group)
+    flat_sizes = all_sizes.tolist()
+    size_list = [flat_sizes[i * ndim : (i + 1) * ndim] for i in range(sp_world_size)]
+    tensor_list = [torch.empty(size, dtype=x.dtype, device=x.device) for size in size_list]
     dist.all_gather(tensor_list, x, group=group)
     return tensor_list, size_list
 
@@ -103,8 +113,11 @@ def _all_to_all_single(
             .contiguous()
         )
 
+    # Materialize the input before allocating with empty_like: otherwise the output
+    # can inherit a non-contiguous stride that NCCL all_to_all_single rejects.
+    x = x.contiguous()
     output = torch.empty_like(x)
-    comm = dist.all_to_all_single(output, x.contiguous(), group=group, async_op=async_op)
+    comm = dist.all_to_all_single(output, x, group=group, async_op=async_op)
 
     if async_op:
 
@@ -183,6 +196,19 @@ class _Slice(torch.autograd.Function):
 
 
 class _Gather(torch.autograd.Function):
+    """All-gather + concat over the SP group; backward slices the incoming
+    full-sequence grad back to this rank's local segment.
+
+    ``sum_grad`` selects the backward semantics:
+    - True (default): all-reduce the grad first. After a mid-model gather each
+      rank consumed a DIFFERENT segment of the full sequence downstream, so its
+      grads only cover its own rows — summing reconstructs the full grad.
+    - False: no all-reduce. Used at the model output, where the downstream loss
+      (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
+      every SP rank, so the incoming grad is already the true full grad and a
+      sum would multiply it by the SP world size.
+    """
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -190,25 +216,47 @@ class _Gather(torch.autograd.Function):
         local_input: Tensor,
         dim: int,
         grad_scale: Optional[bool] = False,
+        sum_grad: Optional[bool] = True,
     ) -> Tensor:
         ctx.group = group
         ctx.rank = dist.get_rank(group)
         ctx.dim = dim
         ctx.grad_scale = grad_scale
+        ctx.sum_grad = sum_grad
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
         output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
-        dim_size_list = [size_list[i][dim].item() for i in range(seq_world_size)]
-        ctx.dim_size_list = dim_size_list
+        ctx.dim_size_list = [size[dim] for size in size_list]
         return torch.cat(output, dim=dim)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
+
+        # ``grad_output`` arrives as whatever view the gathered tensor's consumer
+        # produced, and the in-place all_reduce below rejects a non-contiguous one
+        # with "Tensors must be contiguous". Two callers reach that: one reducing
+        # the gathered output with a bare ``.sum()`` (no elementwise op in between
+        # to materialise a real buffer), which hands back a stride-0 broadcast
+        # view; and DeepSeek-V4's context-parallel attention, which gathers ``kv``
+        # ``[B, 1, S, D]`` straight into ``torch.cat([kv, compressed_kv], dim=2)``
+        # and so passes that cat's gradient narrowed on dim 2 -- a row range of a
+        # wider buffer, contiguous only while the leading dims collapse at batch 1
+        # and not at batch 2. This buys contiguity and nothing else: an
+        # already-contiguous gradient is returned unchanged, so the reduce still
+        # writes into autograd's own buffer, which is also why it protects against
+        # scribbling in place on a tensor autograd may still own.
+        # ``_GatherConcatSP.backward`` adds a ``.clone()`` for that; reconciling
+        # the two is out of scope here.
+        grad_output = grad_output.contiguous()
+        if ctx.sum_grad:
+            dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+
         return (
             None,
             grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
+            None,
             None,
             None,
         )
@@ -319,3 +367,79 @@ def all_to_all_images(image_embeds, in_splits, out_splits):
     image_embeds = image_embeds[: sum(in_splits)]
     group = get_ulysses_sequence_parallel_group()
     return _AlltoAllRegion.apply(group, image_embeds, in_splits, out_splits)
+
+
+class _Roll(torch.autograd.Function):
+    """
+    Distributed implementation of `torch.roll` using batched isend / irecv
+    """
+
+    @staticmethod
+    def _impl(input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        dimlen = input.size(dims)
+        assert abs(shifts) <= dimlen
+        if shifts > 0:  # roll afterwards
+            splits = [dimlen - shifts, shifts]
+            body, chunk = torch.split(input, splits, dims)
+            dst = (rank + 1 + world_size) % world_size
+            src = (rank - 1 + world_size) % world_size
+        else:
+            splits = [-shifts, dimlen + shifts]
+            chunk, body = torch.split(input, splits, dims)
+            dst = (rank - 1 + world_size) % world_size
+            src = (rank + 1 + world_size) % world_size
+        chunk = chunk.contiguous()
+        recv_chunk = torch.empty_like(chunk)
+        ops = [
+            dist.P2POp(dist.irecv, recv_chunk, dist.get_global_rank(group, src), group),
+            dist.P2POp(dist.isend, chunk, dist.get_global_rank(group, dst), group),
+        ]
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        if shifts > 0:
+            output = torch.cat([recv_chunk, body], dims)
+        else:
+            output = torch.cat([body, recv_chunk], dims)
+        return output.contiguous()
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        ctx.group = group
+        ctx.shifts = shifts
+        ctx.dims = dims
+        assert isinstance(shifts, int), "shifts must be an integer"
+        assert isinstance(dims, int), "dims must be an integer"
+        if group is None or shifts == 0:
+            return torch.roll(input, shifts, dims)
+        return _Roll._impl(input, shifts, dims, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        shifts = ctx.shifts
+        dims = ctx.dims
+        if group is None or shifts == 0:
+            return torch.roll(grad_output, -shifts, dims), None, None, None
+        return _Roll._impl(grad_output, -shifts, dims, group), None, None, None
+
+
+def roll_with_sequence_parallel(
+    input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup = None
+) -> torch.Tensor:
+    """
+    Roll the tensor within sequence parallel region. This is the
+    distributed implementation version of `torch.roll`
+
+    args:
+        input: input tensor of shape (sliced_tokens, num_head, head_dim)
+        shifts: number of positions to shift
+        dims: dimension to shift
+    returns:
+        rolled_tensor: rolled tensor of shape (sliced_tokens, num_head, head_dim)
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+
+    return _Roll.apply(input, shifts, dims, group)

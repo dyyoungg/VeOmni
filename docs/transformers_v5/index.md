@@ -1,19 +1,22 @@
-# Transformers v5 Compatibility Updates
+# Transformers v5 Notes
 
-This section documents VeOmni's compatibility work for HuggingFace `transformers>=5.0.0`.
+This section documents VeOmni's integration with HuggingFace
+`transformers==5.9.0` (the only supported transformers version).
 
-## Included Updates
+## Included Notes
 
-- [Flash Attention custom-name handling](veomni_flash_attention_kernel_adapter.md): explains why `_lazy_imports` failed for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
-- [Qwen3 patchgen workflow](patchgen.md): explains the modeling code generation workflow used for Qwen3 GPU patches and regeneration.
-- [Transformers v5 MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights for v5 and documents qwen3_moe handling.
-- [Testing a new model](testing_new_model.md): SOP for adding test cases in `test_models_patch.py` and `test_e2e_parallel.py` when onboarding a new v5 model.
+- [Fused attention interface](veomni_fused_attention.md): documents the unified Flash/Flex facade, config routing, native BlockMask contract, and Ulysses restrictions.
+- [Flash Attention custom-name handling](veomni_flash_attention_kernel_adapter.md): explains why `_lazy_imports` fails for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
+- [MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights to be laid out and documents qwen3_moe handling.
+- [Testing a new model](testing_new_model.md): SOP for adding test cases in `test_models_patch.py` and `test_e2e_parallel.py` when onboarding a new model.
+
+The modeling code generation workflow (patchgen) has graduated out of this section — it is no longer tied to the transformers v5 cutover and now lives at [`design/patchgen.md`](../design/patchgen.md).
 
 ```{toctree}
 :maxdepth: 1
 
 veomni_flash_attention_kernel_adapter.md
-patchgen.md
+veomni_fused_attention.md
 transformers_v5_moe_weight_loading.md
 testing_new_model.md
 ```

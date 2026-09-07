@@ -1,23 +1,34 @@
 # configs/llava_train.yaml
 model:
-  model_path: /mnt/afs/share/llava_qwen30B_A3B-veomni-down4
-  config_path: /mnt/afs/share/llava_qwen30B_A3B-veomni-down4
+  model_path: /mnt/afs/share/llava_qwen30A3B_qwen38encoder_qwen3audio_gametext
+  config_path: /mnt/afs/share/llava_qwen30A3B_qwen38encoder_qwen3audio_gametext
   model_arc: qwen2
-  vision_tower: /mnt/afs/share/qwen25_vl_encoder
+  vision_tower: /mnt/afs/share/Qwen38_27B_vision_encoder
   mm_downsample_ratio: 4
-  image_projector_type: avgpool
+  dynamic_downsample: true
+  dynamic_downsample_ratios: [1, 2, 4, 8]
+  image_projector_type: dynamic_avgpool
+  audio_projector_type: mlp_channel
+  use_audio_start_end_token: true
+  audio_downsample_ratio: 2
+  encoder_data_balance: false
+  audio_max_duration: 999999
+  audio_encoder_type: qwen3_audio
+  qwen3_audio_n_window: 50
+  audio_frame_length: 160
 
 data:
-  train_path: /mnt/afs/yangdeyu/GameMLLM/llava_dev/LLaVA_hub/data/stage2/train_0.jsonl
-  eval_path: /mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_audio_text_ocr_eval.json
+  train_path: ""
+  eval_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/text_eval.json
   mm_configs:
     image_max_pixels: 602112   # 768*28*28
   sample_fps: 4
   finetune_sample_frames: 64
   preprocess_workers: 2
+  offset_file_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0725_stage3_imagesft_removesubtitle_addvideoxl/offsets_imagevideo_sft.npy
+  file_maping_path: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/0725_stage3_imagesft_removesubtitle_addvideoxl/file_mapping.json
 
 train:
-
   num_train_epochs: 1
   seed: 42
   local_rank: 0
@@ -25,20 +36,23 @@ train:
   world_size: 8
 
   # 模型参数
-  model_max_length: 4096
+  model_max_length: 8192
   pack_seq: true
   init_device: meta
 
   freeze_vit: true
   freeze_vit_projector: false
   freeze_audio_tower: true
-  freeze_audio_projector: false
+  freeze_audio_projector: true
   freeze_llm: true
+  output_router_logits: true
+  freeze_router: true
+
   # 优化器
   optimizer:
     type: adamw
-    lr: 2.0e-4
-    lr_min: 2.0e-5
+    lr: 1.0e-4
+    lr_min: 5.0e-5
     weight_decay: 0.0
     max_grad_norm: 1.0
     lr_decay_style: cosine
@@ -46,16 +60,18 @@ train:
     lr_warmup_ratio: 0.05
     lr_start: 0.0
 
-  vit_lr: 2.0e-4
+  vit_lr: 1.0e-4
   min_lr_rate: 0.1
-  moe_load_balance_monitor_interval: 10
-  enable_mixed_precision: false
+  moe_load_balance_monitor_interval: 100
+  router_aux_loss_coef: 0.01
   enable_batch_invariant_mode: false
-  eval_steps: 0
+  vit_chunk_forward: false
+  vit_chunk_size: 30
+  eval_steps: 200
+  eval_first: false
   gc_steps: 200
   empty_cache_steps: 200
-  logging_steps: 20
-
+  logging_steps: 50
   gradient_checkpointing:
     enable: true
     debug: false
@@ -63,37 +79,47 @@ train:
 
   # FSDP / 并行
   accelerator:
-    ulysses_size: 1
-    ep_size: 2
+    ulysses_size: 2
+    ep_size: 1
     enable_async: false
     fsdp_config:
       fsdp_mode: fsdp2
-      full_shard: true
       reshard_after_forward: true
       reshard_after_backward: true
       offload: false
-      forward_prefetch: false
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.8
 
   # checkpoint
   checkpoint:
-    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/moe_test
-    save_steps: 20000000
-    save_total_limit: 3
+    output_dir: /mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/ckpt/test
+    save_steps: 1000
+    save_epochs: 1
+    save_total_limit: 2
     manager: dcp
-    save_hf_weights: false
+    save_hf_weights: true
     save_async: true
+    hf_save_steps: 0 # only save at epoch end
+
+  profile:
+    enable: false
+    start_step: 10
+    end_step: 15
+    warmup_steps: 5       
+    trace_dir: "/profile_json"
+    prefix: ulysses_seq8k
+    print_nccl_breakdown: true
  
-
-
   wandb:
     enable: true
     project: llavaomni
-    name: llavaomni_moe_ep4_down4
+    name: ep_fsdp_test
   # dataloader
   dataloader_num_workers: 4
   dataloader_prefetch_factor: 2
-  remote_dataloader: false
+  remote_dataloader: true
   broadcast_model_weights_from_rank0: true

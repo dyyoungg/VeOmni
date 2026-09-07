@@ -72,13 +72,22 @@ class Qwen3MoeOmniConfig(PretrainedConfig):
         self.foundation_config = _init_config(foundation_config)
         self.initializer_range = initializer_range
 
-        # Default architecture name communicates expected top-level class
+        # Default architecture name communicates expected top-level class.
+        # transformers>=5 validates ``architectures`` as list[str] | None,
+        # so wrap a bare default and normalize legacy str inputs from ckpts.
+        architectures = kwargs.pop("architectures", ["LlavaQwen3MoeForCausalLM"])
+        if isinstance(architectures, str):
+            architectures = [architectures]
         super().__init__(
-            architectures=kwargs.pop("architectures", "LlavaQwen3MoeForCausalLM"),
+            architectures=architectures,
             **kwargs,
         )
 
-    def get_text_config(self) -> PretrainedConfig:
+    def get_text_config(self, decoder=None, encoder=None) -> PretrainedConfig:
+        # transformers>=5 / huggingface_hub validators call this with
+        # ``decoder=``/``encoder=`` keyword args. We only host a text
+        # foundation LLM (no separate encoder/decoder), so ignore them
+        # and always return the foundation config.
         return self.foundation_config
 
 AutoConfig.register("llavaqwen3moe_omni", Qwen3MoeOmniConfig)

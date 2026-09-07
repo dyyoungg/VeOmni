@@ -1,3 +1,9 @@
+"""Four-GPU dense async Ulysses parity against the sync attention path.
+
+Single-process projection-grad contracts live in ``test_async_ulysses_grad.py``.
+Shared backward-unit math lives in ``test_backward.py``.
+"""
+
 import sys
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 import torch.distributed as c10d

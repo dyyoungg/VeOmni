@@ -507,6 +507,8 @@ class MultimodalPacker:
         "video_grid_thw",
         "audio_features",
         "audio_features_lens",
+        "image_downsample_ratios",
+        "video_downsample_ratios",
     )
  
     def __init__(
@@ -537,15 +539,17 @@ class MultimodalPacker:
  
     # ── Length estimation helpers ─────────────────────────────────────────────
  
-    def _image_tokens(self, grid_thw: Optional[torch.Tensor]) -> int:
+    def _image_tokens(self, grid_thw: Optional[torch.Tensor], downsample_ratio: Optional[float] = None) -> int:
         if grid_thw is None:
             return 0
+        if downsample_ratio is None:
+            downsample_ratio = getattr(self.model_args, "mm_downsample_ratio", 16)
         total = 0
         for thw in grid_thw:
             t, h, w = thw
             mh, mw = get_adaptive_pool_size(
                 int(h) // 2, int(w) // 2,
-                getattr(self.model_args, "mm_downsample_ratio", 16),
+                downsample_ratio,
             )
             total += int(t) * mh * mw
         return total
@@ -592,8 +596,11 @@ class MultimodalPacker:
                 trunc_ids = sample.input_ids[:self.tokenizer.model_max_length]
                 trunc_lbl = sample.labels[:self.tokenizer.model_max_length]
  
-                img_ok  = (trunc_ids == self._image_token_id).sum() == self._image_tokens(sample.image_grid_thw)
-                vid_ok  = (trunc_ids == self._video_token_id).sum() == self._image_tokens(sample.video_grid_thw)
+                # Use per-sample downsample ratio when available (dynamic compression)
+                img_ratio = float(sample.image_downsample_ratios[0]) if getattr(sample, 'image_downsample_ratios', None) is not None and sample.image_downsample_ratios.numel() > 0 else None
+                vid_ratio = float(sample.video_downsample_ratios[0]) if getattr(sample, 'video_downsample_ratios', None) is not None and sample.video_downsample_ratios.numel() > 0 else None
+                img_ok  = (trunc_ids == self._image_token_id).sum() == self._image_tokens(sample.image_grid_thw, img_ratio)
+                vid_ok  = (trunc_ids == self._video_token_id).sum() == self._image_tokens(sample.video_grid_thw, vid_ratio)
                 aud_ok  = (trunc_ids == self._audio_token_id).sum() == self._audio_tokens(sample.audio_features_lens)
  
                 if img_ok and vid_ok and aud_ok:

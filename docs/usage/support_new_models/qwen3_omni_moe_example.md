@@ -4,6 +4,17 @@
 
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
+> **Scope note:** VeOmni now ships patchgen-generated modeling files under
+> `veomni/models/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
+> patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
+> are unchanged; what has changed is *where* the patches are declared
+> (declarative patchgen config emitted into `generated/`) rather than applied
+> at import time. See
+> [the patchgen design guide](../../design/patchgen.md) and
+> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+
 ---
 
 ## P1. Fix `tie_word_embeddings` (Config)
@@ -129,8 +140,8 @@ sp_enabled = self.training and get_parallel_state().sp_enabled
 sp_group = get_parallel_state().sp_group if sp_enabled else None
 
 if sp_enabled:
-    inputs_embeds = gather_seq_scatter_heads(
-        inputs_embeds, seq_dim=1, head_dim=2, group=sp_group
+    inputs_embeds = gather_outputs(
+        inputs_embeds, gather_dim=1, group=sp_group
     )
 
 # Step 2: Same transform on image/video/audio embeddings, then fill back
@@ -138,8 +149,8 @@ if pixel_values is not None:
     image_embeds = self.get_image_features(pixel_values, image_grid_thw)
     if sp_enabled:
         # (seq//sp, hidden) → (seq, hidden//sp)
-        image_embeds = gather_seq_scatter_heads(
-            image_embeds, seq_dim=0, head_dim=-1, group=sp_group
+        image_embeds = gather_outputs(
+            image_embeds, gather_dim=0, group=sp_group
         )
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 # repeat for video, audio...
@@ -147,8 +158,8 @@ if pixel_values is not None:
 # Step 3: Restore SP layout
 # (bs, seq, hidden//sp) → (bs, seq//sp, hidden)
 if sp_enabled:
-    inputs_embeds = gather_heads_scatter_seq(
-        inputs_embeds, head_dim=2, seq_dim=1, group=sp_group
+    inputs_embeds = slice_input_tensor(
+        inputs_embeds, dim=1, group=sp_group
     )
 ```
 
@@ -296,7 +307,7 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 Replace the model's built-in CE loss with `ForCausalLMLoss` to get Liger/fused kernel selection and correct SP loss reduction:
 
 ```python
-from ....ops.fused_cross_entropy import ForCausalLMLoss
+from ....ops.kernels.cross_entropy import ForCausalLMLoss
 
 if labels is not None:
     loss, logits = ForCausalLMLoss(
@@ -374,11 +385,11 @@ Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `test
 
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
-Reference: [tests/toy_config/qwen3omni_toy/](../../../tests/toy_config/qwen3omni_toy/)
+Reference: [`tests/toy_config/qwen3omni_toy/config.json`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/toy_config/qwen3omni_toy/config.json)
 
 #### Dummy Dataset
 
-Add a `DummyXxxDataset` class to [veomni/data/dummy_dataset.py](../../../veomni/data/dummy_dataset.py) and register it in `build_dummy_dataset()`. For Qwen3-Omni-MoE, the audio output length formula matches the convolutional downsampler:
+Add a `DummyXxxDataset` class to [veomni/data/dummy_dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dummy_dataset.py) and register it in `build_dummy_dataset()`. For Qwen3-Omni-MoE, the audio output length formula matches the convolutional downsampler:
 
 ```python
 # DummyQwen3OmniMoeDataset._get_feat_extract_output_lengths
@@ -395,7 +406,7 @@ elif task_type == "your_model":
 
 #### Forward/Backward Patch Test
 
-Add to `test_cases` in [tests/models/test_models_patch.py](../../../tests/models/test_models_patch.py):
+Add to `TEST_CASES` in [tests/models/test_models_patch.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/test_models_patch.py):
 
 ```python
 pytest.param(
@@ -407,7 +418,7 @@ pytest.param(
 ),
 ```
 
-Also add `MODEL_TO_DATASET` entry and (for omni models) `parse_token_id_from_config` branch to [tests/models/utils.py](../../../tests/models/utils.py):
+Also add `MODEL_TO_DATASET` entry and (for omni models) `parse_token_id_from_config` branch to [tests/models/utils.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/utils.py):
 
 ```python
 # MODEL_TO_DATASET
@@ -430,7 +441,7 @@ pytest -s tests/models/test_models_patch.py -k your_model_type
 
 ### Level 2 — Parallel Alignment Test
 
-Add to [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py):
+Add to [tests/e2e/test_e2e_parallel.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/e2e/test_e2e_parallel.py):
 
 ```python
 your_model_test_cases = [
@@ -471,16 +482,16 @@ source .venv/bin/activate
 pytest -s tests/e2e/test_e2e_parallel.py -k your_model_type
 ```
 
-Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](../../../tests/e2e/test_e2e_parallel.py).
+Reference: `qwen3omni_test_cases` and `test_qwen3omni_parallel_align` in [tests/e2e/test_e2e_parallel.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/e2e/test_e2e_parallel.py).
 
 ### Level 3 — End-to-End Training Test
 
-Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [tests/e2e/exec_scripts.py](../../../tests/e2e/exec_scripts.py) and a `pytest.param` in `test_e2e_training.py`.
+Requires a real checkpoint and dataset. Add an entry to `E2E_TEST_SCRIPT` in [tests/e2e/exec_scripts.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/e2e/exec_scripts.py) and a `pytest.param` in `test_e2e_training.py`.
 
 Run:
 ```bash
 source .venv/bin/activate
-CI_MODEL_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
+CI_HF_MODELS_DIR=/path/to/models CI_DATASET_DIR=/path/to/data \
 pytest -s tests/e2e/test_e2e_training.py -k your_model
 ```
 
@@ -494,7 +505,7 @@ pytest -s tests/e2e/test_e2e_training.py -k your_model
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
 | `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
 | `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
-| `pytest.param` in `test_cases` | `tests/models/test_models_patch.py` | Level 1 |
+| `pytest.param` in `TEST_CASES` | `tests/models/test_models_patch.py` | Level 1 |
 | `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |

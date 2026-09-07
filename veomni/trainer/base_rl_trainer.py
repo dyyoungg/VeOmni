@@ -22,6 +22,7 @@ RLTrainer:
     2. postforward to gather outputs to get sample-wise logits
 """
 
+from dataclasses import asdict
 from typing import Any, Dict, List
 
 import torch
@@ -30,7 +31,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from ..data.data_collator import MainCollator as Preforward
 from ..data.data_collator import PostCollator as Postforward
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from .base import BaseTrainer, VeOmniArguments, build_dataloader
 
@@ -38,7 +39,11 @@ from .base import BaseTrainer, VeOmniArguments, build_dataloader
 class BaseRLTrainer(BaseTrainer):
     def __init__(self, args: VeOmniArguments):
         super().__init__(args)
-        self._build_preforward_postforward()
+        # ``super().__init__`` builds under its own ``use_parallel_state`` scope
+        # and exits it; the collators built here also read the current
+        # ParallelState, so re-enter this trainer's state for them.
+        with use_parallel_state("base"):
+            self._build_preforward_postforward()
 
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
@@ -50,8 +55,10 @@ class BaseRLTrainer(BaseTrainer):
     def _build_dataloader(self):
         """Do not build collate_fn for RL trainer."""
         args: VeOmniArguments = self.args
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
         self.train_dataloader = build_dataloader(
-            dataloader_type=args.data.dataloader.type,
+            dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
             global_batch_size=args.train.global_batch_size,
@@ -61,13 +68,13 @@ class BaseRLTrainer(BaseTrainer):
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-            num_workers=args.data.dataloader.num_workers,
-            drop_last=args.data.dataloader.drop_last,
-            pin_memory=args.data.dataloader.pin_memory,
-            prefetch_factor=args.data.dataloader.prefetch_factor,
             seed=args.train.seed,
             build_collate_fn=False,
+            **dataloader_kwargs,
         )
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:

@@ -12,14 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from ..utils import logging
 from ..utils.env import get_env
-from . import flash_attn, fused_cross_entropy, fused_moe
-from .fused_moe import fused_moe_forward
 
+# Eagerly import kernel packages so that every op registers itself with the
+# registry.  Order does not matter; each ``register_op`` call is idempotent.
+from . import kernels, liger  # noqa: F401  triggers all register_op() calls
+from .config.registry import apply_global_ops
+from .config.singleton import set_ops_config
+from .dispatch import OpSlot
+from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
+from .kernels.load_balancing_loss import load_balancing_loss_func
+from .kernels.moe import fused_moe_forward
+
+
+if TYPE_CHECKING:
+    from ..arguments.arguments_types import OpsImplementationConfig
 
 __all__ = [
     "fused_moe_forward",
+    "OpSlot",
+    "load_balancing_loss_func",
 ]
 
 logger = logging.get_logger(__name__)
@@ -27,27 +44,65 @@ logger = logging.get_logger(__name__)
 
 def build_ALL_OPS():
     return [
-        ("_fused_moe_forward", fused_moe._fused_moe_forward),
-        ("_flash_attention_forward", flash_attn._flash_attention_forward),
-        ("_cross_entropy", fused_cross_entropy._cross_entropy),
+        ("_fused_moe_forward", moe._fused_moe_forward),
+        ("_flash_attention_forward", attention.flash._flash_attention_forward),
+        ("_flex_attention_forward", attention.flex._flex_attention_forward),
+        ("_magi_attention_forward", attention.magi._magi_attention_forward),
+        ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 
 
 def apply_ops_patch():
-    import os
+    """Import-time ops patch — attention only.
 
+    Registers VeOmni's SP-aware attention variants into the shared
+    ``ALL_ATTENTION_FUNCTIONS`` registry. Loss dispatch (``LOSS_MAPPING``) is
+    deferred to ``apply_ops_config`` so there is a single binding point that
+    consumes ``OpsImplementationConfig``; ``build_foundation_model`` invokes
+    it automatically when callers pass ``ops_implementation=...`` (and
+    installs defaults otherwise).
+    """
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
     else:
-        from .flash_attn import apply_veomni_attention_patch
-        from .fused_cross_entropy import apply_veomni_loss_patch
+        from .kernels.attention import apply_veomni_attention_patch
 
         apply_veomni_attention_patch()
-        apply_veomni_loss_patch()
-        # NOTE: fused MoE patch is applied in build_foundation_model() based on
-        # the moe_implementation parameter, not at import time.
-        logger.info_rank0("✅ VeOmni ops patch applied.")
+        logger.info_rank0("✅ VeOmni attention patches applied.")
+
+
+def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
+    """Apply kernel patches based on resolved ``OpsImplementationConfig``.
+
+    Single install point for config-driven dispatch:
+
+    1. Binds the cross-entropy kernel into ``LOSS_MAPPING`` via
+       ``install_loss_mapping`` (pre-bound ``partial`` — no runtime resolution).
+    2. Walks GLOBAL ops (e.g. load-balancing loss) and binds each selected
+       backend to its ``global_slot``.
+    3. Populates the ops-config singleton so per-model ``device_patch.py`` and
+       ``OpSlot.bind`` can read the user's selections.
+
+    MoE dispatch is applied in ``build_foundation_model`` (via
+    ``moe_implementation`` ∈ {``eager``, ``fused_triton``, ``fused_quack``,
+    ``fused_npu``}); per-model kernels are applied by each model's
+    ``device_patch.py``.
+    """
+    set_ops_config(ops_config)
+
+    modeling_backend = get_env("MODELING_BACKEND")
+    if modeling_backend == "hf":
+        return
+
+    from .kernels.cross_entropy import install_loss_mapping
+
+    ce_label = install_loss_mapping(ops_config.cross_entropy_loss_implementation)
+
+    applied = apply_global_ops(ops_config)
+    applied.insert(0, ce_label)
+    logger.info_rank0(f"✅ VeOmni ops config applied: {', '.join(applied)}.")
+    logger.info_rank0(format_kernel_functions())
 
 
 def format_kernel_functions() -> str:
@@ -58,5 +113,23 @@ def format_kernel_functions() -> str:
         impl = func.__name__ if func is not None else "None"
         lines.append(f"{alias} = {impl}")
 
+    # Cross-entropy is bound via LOSS_MAPPING (partial-wrapped), not a module
+    # global — surface it here so the log still shows the active CE kernel.
+    lines.append(f"cross_entropy = {_current_cross_entropy_name()}")
+
     lines.append("==============================")
     return "\n".join(lines)
+
+
+def _current_cross_entropy_name() -> str:
+    from functools import partial
+
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    entry = LOSS_MAPPING.get("ForCausalLM")
+    if entry is None:
+        return "unset"
+    if isinstance(entry, partial):
+        ce_fn = entry.keywords.get("cross_entropy_fn")
+        return getattr(ce_fn, "__name__", repr(ce_fn)) if ce_fn is not None else "unset"
+    return getattr(entry, "__name__", repr(entry))

@@ -1,20 +1,5 @@
 # Long-Sequence Training Using Ulysses
 
-## Table of Contents
-
-- [VeOmni Long-Sequence Training Using Ulysses](#veomni-long-sequence-training-using-ulysses)
-  - [Table of Contents](#table-of-contents)
-  - [📚 Overview](#-overview)
-  - [🚀 Quick Start](#-quick-start)
-  - [🔍 Dive into Ulysses Sequence Parallelism](#-dive-into-ulysses-sequence-parallelism)
-    - [What is all\_to\_all?](#what-is-all_to_all)
-    - [DeepSpeed-Ulysses](#deepspeed-ulysses)
-    - [Communication Analysis](#communication-analysis)
-  - [⚙️ Core API](#️-core-api)
-  - [🛠️ Support Ulysses for a New Model](#️-support-ulysses-for-a-new-model)
-  - [🧩 Implementation Details: Data Pipeline and Model Interaction](#-implementation-details-data-pipeline-and-model-interaction)
-  - [🔧 Linear Attention Ulysses (GatedDeltaNet)](#-linear-attention-ulysses-gateddeltanet)
-
 ## 📚 Overview
 In this tutorial, we introduce the implementation of DeepSpeed-Ulysses for efficient long-sequence training in VeOmni. The Ulysses method optimizes memory usage by splitting both the input tensor and intermediate activations along the sequence dimension. This innovative approach significantly enhances memory efficiency, enabling the training of models with longer sequence lengths.
 
@@ -24,7 +9,7 @@ Reference Paper: [DeepSpeed Ulysses: System Optimizations for Enabling Training 
 To enable Ulysses, users can specify the `accelerator.ulysses_size` parameter in the configuration file or the launch command:
 
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen2_5_vl.py configs/multimodal/qwen2_5_vl/qwen2_5_vl_fsdp1.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
     --train.accelerator.ulysses_size 4
@@ -202,7 +187,8 @@ After the collator, the model receives:
 ### Softmax Attention (Flash Attention) SP Flow
 
 For standard softmax attention layers (e.g., `Qwen3_5Attention`), Ulysses SP is handled
-**internally** by `flash_attention_forward` in `veomni/ops/flash_attn/__init__.py`.
+**internally** by `flash_attention_forward` in
+`veomni/ops/kernels/attention/__init__.py`.
 
 The flow through a softmax attention layer:
 
@@ -344,7 +330,7 @@ To enable Async Ulysses, simply set the `accelerator.enable_async` parameter to 
 Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
-bash train.sh tasks/multimodal/omni/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --train.accelerator.ulysses_size 4 \
     --train.accelerator.enable_async true
 ```

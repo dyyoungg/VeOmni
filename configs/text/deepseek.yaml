@@ -1,8 +1,12 @@
 model:
+  # Set this to the target DeepSeek checkpoint, e.g. DeepSeek-V3/R1 or DeepSeek-V4.
   # model_path: deepseek-ai/DeepSeek-V3-0324
+  # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
   ops_implementation:
+    # DeepSeek-V4 attention is eager-only; set this to eager for V4 checkpoints.
+    # Keep moe_implementation as fused_triton on GPU so V4 uses clamp-aware fused MoE.
     attn_implementation: flash_attention_2
-    moe_implementation: fused
+    moe_implementation: fused_triton
 
 data:
   train_path: fineweb_100BT
@@ -21,9 +25,9 @@ train:
     ulysses_size: 1
     ep_size: 8
     fsdp_config:
-      fsdp_mode: fsdp1
-      full_shard: true
-      offload: false
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
     offload:
       enable_activation: false
   gradient_checkpointing:
@@ -39,7 +43,6 @@ train:
     lr_decay_ratio: 1.0
     weight_decay: 0.01
     max_grad_norm: 1.0
-  enable_mixed_precision: true
   init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500

@@ -71,6 +71,7 @@ class BaseDataLoader:
 
         self.data_list: List = []
         self.file_mapping = None
+        self._epoch_perm = None
         data_path = data_args.eval_path if eval_mode else data_args.train_path
         self.load_data(data_path)
         
@@ -114,16 +115,15 @@ class BaseDataLoader:
         else:
 
             if not self.data_args.offline_dataset_split:
-                num_epochs = int(self.training_args.num_train_epochs)
-                chunk_size = None  # computed after read
-
                 raw = read_data(data_path=data_path)
                 chunk_size = len(raw) // self.world_size
                 self.data_list = []
                 random.shuffle(raw)
                 self.data_list.extend(
-                    raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
-                )
+                        raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
+                    )
+                
+
                 split_label = "test" if self.eval_mode else "train"
                 if split_label == "train":
                     print(f"{self.rank}: {split_label} data size {len(self.data_list)}")
@@ -141,6 +141,22 @@ class BaseDataLoader:
     def __len__(self) -> int:
         return len(self.data_list)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Generate a permutation table for this epoch so remote workers
+        see a different data order each epoch.  The permutation is stored
+        in shared memory (numpy array) so forked worker processes can
+        read it without copying."""
+        if not self.training_args.remote_dataloader:
+            return
+        n = len(self.data_list)
+        rng = np.random.RandomState(seed=epoch + 42)
+        self._epoch_perm = rng.permutation(n)
+
+    def map_data_index(self, raw_index: int) -> int:
+        """Map a sequential counter value to a shuffled index."""
+        if self._epoch_perm is not None:
+            return int(self._epoch_perm[raw_index])
+        return raw_index
 
     def launch(self) -> None:
         """Set up worker processes and I/O queues.  Designed to support

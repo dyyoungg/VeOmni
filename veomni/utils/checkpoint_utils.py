@@ -14,6 +14,7 @@
 
 
 import os
+from typing import Any, Optional
 
 import torch.distributed as dist
 
@@ -29,6 +30,11 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 _GLOBAL_STEP_PREFIX = "global_step_"
+
+
+def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bool:
+    """Return whether a full non-LoRA resume can skip initial HF weight loading."""
+    return load_path is not None and not bool(lora_config)
 
 
 def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
@@ -59,19 +65,16 @@ def get_last_iteration(output_dir, is_rank0: bool):
         latest_file = os.path.join(output_dir, "checkpoints", meta_file)
         if exists(latest_file):
             copy(latest_file, meta_file)
-
     dist.barrier()
     if os.path.exists(meta_file):
         with open(meta_file) as f:
             iteration = int(f.readline())
     else:
         iteration = 0
-
     dist.barrier()
     if is_rank0:
         if os.path.exists(meta_file):
             os.remove(meta_file)
-
     return iteration
 
 

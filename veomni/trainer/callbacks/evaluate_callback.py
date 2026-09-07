@@ -88,17 +88,18 @@ class EvaluateCallback(Callback):
         return id_dict1, indices1, id_dict2, indices2
 
     def _all_reduce_mean(self, values: list, dtype=torch.float) -> float | None:
-        """Local mean → all-reduce sum → divide by world_size."""
-        if not values:
-            return None
-        local = torch.tensor(
+        """All-reduce a global mean without weighting ranks equally."""
+        local_sum = torch.tensor(
             [v.item() if isinstance(v, torch.Tensor) else v for v in values],
             dtype=dtype, device=self._device,
-        ).mean()
+        ).sum() if values else torch.zeros((), dtype=dtype, device=self._device)
+        local_count = torch.tensor(float(len(values)), dtype=dtype, device=self._device)
         if dist.is_initialized():
-            dist.all_reduce(local, op=dist.ReduceOp.SUM)
-            local = local / dist.get_world_size()
-        return local.item()
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+        if local_count.item() == 0:
+            return None
+        return (local_sum / local_count).item()
     
     def _all_reduce_category(self, category_acc: dict, all_categories: set) -> dict:
         """Per-category right_count / total_count aggregated across all ranks."""
@@ -172,24 +173,20 @@ class EvaluateCallback(Callback):
             scores = torch.where(scores < 0, scores * REP_PEN, scores / REP_PEN)
             logit  = torch.scatter(logit, 0, repeat_ids, scores)
 
-            # top-k
-            k         = min(TOP_K, logit.size(0))
-            threshold = torch.topk(logit, k)[0][-1]
-            logit     = logit.masked_fill(logit < threshold, FILTER_VAL)
-
-            # top-p
-            sorted_l, sorted_i = torch.sort(logit, descending=False)
-            cum_p     = sorted_l.softmax(-1).cumsum(-1)
-            to_remove = cum_p <= (1 - TOP_P)
-            to_remove[-1:] = False
-            logit = logit.masked_fill(
-                to_remove.scatter(0, sorted_i, to_remove), FILTER_VAL,
-            )
-
             # 采样/贪婪
             if TEMP == 0.0:
                 tok = logit.argmax().item()
             else:
+                k = min(TOP_K, logit.size(0))
+                threshold = torch.topk(logit, k)[0][-1]
+                logit = logit.masked_fill(logit < threshold, FILTER_VAL)
+                sorted_l, sorted_i = torch.sort(logit, descending=False)
+                cum_p = sorted_l.softmax(-1).cumsum(-1)
+                to_remove = cum_p <= (1 - TOP_P)
+                to_remove[-1:] = False
+                logit = logit.masked_fill(
+                    to_remove.scatter(0, sorted_i, to_remove), FILTER_VAL,
+                )
                 tok = torch.multinomial(
                     torch.nn.functional.softmax(logit / TEMP, dim=-1),
                     num_samples=1,
@@ -459,7 +456,7 @@ class EvaluateCallback(Callback):
  
         model.eval()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for idx, data in enumerate(eval_dl):
                 if rank==0 and idx % 2 == 0:
                     logger.info(f"[Eval] rank: {rank} step={state.global_step}  idx={idx}")
@@ -470,8 +467,8 @@ class EvaluateCallback(Callback):
                 for k, v in data.items():
                     if isinstance(v, torch.Tensor):
                         tgt_dtype = torch.bfloat16 if k in bf16_keys else v.dtype
-                        data[k]   = v.to(device=device, dtype=tgt_dtype)
- 
+                        data[k] = v.to(device=device, dtype=tgt_dtype, non_blocking=True)
+
                 category: str = data.pop("category")[0]
                 # Skip dummy batches produced by the collator when all samples
                 # in a batch are None (e.g. failed to load).  We still need to

@@ -17,9 +17,13 @@
 from typing import Any
 
 import torch
+try:
+    import torch_musa  # noqa: F401 - registers torch.musa and MCCL
+except ImportError:
+    torch_musa = None
 
 from . import logging
-from .import_utils import is_torch_npu_available
+from .import_utils import is_torch_mlu_available, is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
@@ -27,17 +31,25 @@ logger = logging.get_logger(__name__)
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
 IS_NPU_AVAILABLE = is_torch_npu_available()
+IS_MUSA_AVAILABLE = hasattr(torch, "musa") and torch.musa.is_available()
+IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
+MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+
 
 def get_device_type() -> str:
-    """Get device type based on current machine, currently only support CPU, CUDA, NPU."""
+    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
     if IS_CUDA_AVAILABLE:
         device = "cuda"
     elif IS_NPU_AVAILABLE:
         device = "npu"
+    elif IS_MLU_AVAILABLE:
+        device = "mlu"
+    elif IS_MUSA_AVAILABLE:
+        device = "musa"
     else:
         device = "cpu"
 
@@ -65,12 +77,22 @@ def get_device_id() -> int:
     return get_torch_device().current_device()
 
 
+def is_moe_kernel_supported(device: torch.device | str) -> bool:
+    """Return True if ``device`` is one of the supported accelerator types (CUDA/MLU)."""
+    device_type = getattr(device, "type", device)
+    return str(device_type) in MOE_TRITON_DEVICE_TYPES
+
+
 def get_dist_comm_backend() -> str:
     """Return distributed communication backend type based on device type."""
     if IS_CUDA_AVAILABLE:
         return "nccl"
     elif IS_NPU_AVAILABLE:
         return "hccl"
+    elif IS_MLU_AVAILABLE:
+        return "cncl"
+    elif IS_MUSA_AVAILABLE:
+        return "mccl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
@@ -86,6 +108,10 @@ def stream_synchronize() -> None:
         torch.cuda.current_stream().synchronize()
     elif IS_NPU_AVAILABLE:
         torch.npu.current_stream().synchronize()
+    elif IS_MLU_AVAILABLE:
+        torch.mlu.current_stream().synchronize()
+    elif IS_MUSA_AVAILABLE:
+        torch.musa.current_stream().synchronize()
     else:
         synchronize()
 
@@ -100,9 +126,9 @@ def set_device(device: torch.types.Device) -> None:
     get_torch_device().set_device(device)
 
 
-def is_nccl_backend() -> bool:
+def is_nccl_backend(backend: str | None = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
-    return get_dist_comm_backend() == "nccl"
+    return (backend or get_dist_comm_backend()) == "nccl"
 
 
 def is_hccl_backend() -> bool:
@@ -110,12 +136,61 @@ def is_hccl_backend() -> bool:
     return get_dist_comm_backend() == "hccl"
 
 
+def is_cncl_backend() -> bool:
+    """Check if the distributed communication backend is CNCL."""
+    return get_dist_comm_backend() == "cncl"
+
+
+def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
+    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
+    if not IS_CUDA_AVAILABLE:
+        return 0
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
+
+
 def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
-    if not IS_CUDA_AVAILABLE:
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+    return get_gpu_compute_capability() >= 90
+
+
+def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+    """Create a device stream (CUDA/NPU-agnostic)."""
+    device_type = get_device_type()
+    device_api = get_torch_device()
+
+    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
+    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
+    # through unconditionally makes CPU-only unit tests fail before they can
+    # exercise the device-agnostic caller.
+    if device_type == "cpu":
+        return device_api.Stream()
+
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    if priority:
+        kwargs["priority"] = priority
+    return device_api.Stream(**kwargs)
+
+
+def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
+    """Create a device event (CUDA/NPU-agnostic)."""
+    device_api = get_torch_device()
+    if get_device_type() == "cpu":
+        # ``torch.cpu.Event`` is a no-argument synchronization marker.
+        return device_api.Event()
+    return device_api.Event(enable_timing=enable_timing, blocking=blocking)
+
+
+def get_current_stream() -> Any:
+    """Get the current device stream."""
+    return get_torch_device().current_stream()
+
+
+def switch_to_specified_stream(stream: Any) -> Any:
+    """Context manager to switch to a specified device stream."""
+    return get_torch_device().stream(stream)
 
 
 def get_compute_units():
@@ -134,8 +209,11 @@ def get_compute_units():
         case "xpu":
             device_properties = torch.xpu.get_device_properties(0)
             NUM_SMS = device_properties.max_compute_units
+        case "mlu":
+            device_properties = torch.mlu.get_device_properties(0)
+            NUM_SMS = device_properties.multi_processor_count
         case _:
-            print("No CUDA or XPU device available. Using CPU.")
+            print("No CUDA, XPU, or MLU device available. Using CPU.")
             # For CPU, you might want to use the number of CPU cores
             NUM_SMS = torch.get_num_threads()
 

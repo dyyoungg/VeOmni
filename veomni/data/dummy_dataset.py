@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional
 import json
 import os
 
@@ -224,101 +224,105 @@ class DummyQwen3OmniMoeDataset(DummyQwenOmniDataset):
         return output_lengths
 
 
-class DummyUGDataset(Dataset):
-    def __init__(
-        self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
-    ):
-        """
-        Args:
-            size (int): Nums of datasets
-            seq_length (int, optional): seq_length
-            dummy_data:
-            [input_ids, input_image_token, input_audio_token, input_video_token, output_image_token]
-        """
+class WanT2VDataset(Dataset):
+    """
+    Generates ready-to-use WAN T2V transformer inputs for CI/SP-alignment testing.
+
+    Dimensions are hard-coded to match the toy config
+    (``tests/toy_config/wan_t2v_toy/config.json``):
+
+    * ``in_channels = 16``, ``patch_size = (1, 2, 2)``
+    * ``text_dim = 512``
+    * latent shape ``(1, 4, 1, 16, 16)`` → 64 patches after patchification,
+      which is divisible by SP size 2.
+
+    Each sample is a dict whose values can be fed **directly** to
+    ``WanTransformer3DModel.forward`` (after moving to the target device):
+
+    * ``hidden_states``:        ``(1, IN_CHANNELS, NUM_FRAMES, HEIGHT, WIDTH)``
+    * ``training_target``:      ``(1, IN_CHANNELS, NUM_FRAMES, HEIGHT, WIDTH)``
+    * ``encoder_hidden_states``: ``(1, TEXT_SEQ_LEN, TEXT_DIM)``
+    * ``timestep``:              ``(1,)``  – fixed float value
+    """
+
+    IN_CHANNELS = 16  # matches toy config in_channels * 2 (mean logvar)
+    NUM_FRAMES = 10
+    HEIGHT = 16  # latent spatial size; gives 8 patches with patch_size=2
+    WIDTH = 16
+    TEXT_SEQ_LEN = 10
+    TEXT_DIM = 512  # matches toy config text_dim
+    TIMESTEP = 0.5
+
+    def __init__(self, size: int = 16) -> None:
         self.size = size
-        self.seq_length = seq_length
-        self.vocab_size = 1024
-
-        h, w = 18, 18
-        image_t = 2
-        video_t = 10
-        channel_size = 3
-
-        self.input_image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
-        self.input_image_grid_thw = torch.tensor([[1, h, w]] * image_t, dtype=torch.long)
-        self.input_image_seq_length = image_t * h * w // (merge_size**2)
-
-        audio_token_num = 100
-        audio_num = 2
-        self.input_audio_size = [4 * audio_token_num * audio_num, 128]
-        self.input_audio_feature_lengths = torch.tensor([4 * audio_token_num] * audio_num, dtype=torch.long)
-        self.input_audio_seq_length = audio_num * audio_token_num
-
-        output_image_token_num = 1024
-        output_image_num = 1
-        self.output_image_size = [output_image_num, 3, 256, 256]
-        self.output_image_seq_length = output_image_num * output_image_token_num
-
-        rest_seq_length = self.seq_length - (
-            self.input_image_seq_length + self.input_audio_seq_length + self.output_image_seq_length
-        )
-
-        self.input_video_size = [video_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
-        self.input_video_grid_thw = torch.tensor([[video_t, h, w]], dtype=torch.long)
-        self.video_seq_length = video_t * h * w // (merge_size**2)
-
-        self.text_seq_length = rest_seq_length - self.video_seq_length
-
-        self.seq_length = (
-            self.text_seq_length
-            + self.input_image_seq_length
-            + self.input_audio_seq_length
-            + self.video_seq_length
-            + self.output_image_seq_length
-        )
-        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
-        start_index = self.text_seq_length
-        self.image_input_mask = mask.clone()
-        self.image_input_mask[start_index : start_index + self.input_image_seq_length] = 1
-        self.audio_input_mask = mask.clone()
-        start_index += self.input_image_seq_length
-        self.audio_input_mask[start_index : start_index + self.input_audio_seq_length] = 1
-        self.video_input_mask = mask.clone()
-        start_index += self.input_audio_seq_length
-        self.video_input_mask[start_index : start_index + self.video_seq_length] = 1
-        self.image_output_mask = mask.clone()
-        start_index += self.video_seq_length
-        self.image_output_mask[start_index : start_index + self.output_image_seq_length] = 1
 
     def __len__(self) -> int:
         return self.size
 
-    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
-        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
-        labels = input_ids.clone()
-        position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        image_input_features = torch.rand(self.input_image_size, dtype=torch.float32)
-        audio_input_features = torch.rand(self.input_audio_size, dtype=torch.float32)
-        video_input_features = torch.rand(self.input_video_size, dtype=torch.float32)
-        image_output_features = torch.rand(self.output_image_size, dtype=torch.float32)
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        gen = torch.Generator().manual_seed(index)
+        hidden_states = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        training_target = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
+        latents = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
+        timestep = torch.tensor([self.TIMESTEP])
         return [
             {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "position_ids": position_ids,
-                "image_input_features": image_input_features,
-                "audio_input_features": audio_input_features,
-                "video_input_features": video_input_features,
-                "image_output_features": image_output_features,
-                "image_input_mask": self.image_input_mask,
-                "audio_input_mask": self.audio_input_mask,
-                "video_input_mask": self.video_input_mask,
-                "image_output_mask": self.image_output_mask,
-                "image_input_grid_thw": self.input_image_grid_thw,
-                "video_input_grid_thw": self.input_video_grid_thw,
-                "audio_input_feature_lengths": self.input_audio_feature_lengths,
+                "hidden_states": hidden_states,
+                "training_target": training_target,
+                "encoder_hidden_states": encoder_hidden_states,
+                "timestep": timestep,
+                "latents": latents,
+            }
+        ]
+
+
+class QwenImageDataset(Dataset):
+    """
+    Generates ready-to-use Qwen-Image transformer inputs for FSDP2 smoke tests.
+
+    Channel/text dimensions match ``tests/toy_config/qwen_image_toy/config.json``.
+    ``image_dims`` and ``text_seq_len`` are parameterised so callers can pick
+    non-``sp_size``-divisible lengths to exercise the Ulysses-SP padding path.
+    """
+
+    IN_CHANNELS = 16
+    TEXT_DIM = 32
+    TIMESTEP = 0.5
+
+    def __init__(
+        self,
+        size: int = 16,
+        *,
+        image_dims: tuple[int, int, int] = (1, 4, 4),
+        text_seq_len: int = 8,
+    ) -> None:
+        self.size = size
+        self.image_dims = tuple(image_dims)
+        self.image_seq_len = self.image_dims[0] * self.image_dims[1] * self.image_dims[2]
+        self.text_seq_len = text_seq_len
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        gen = torch.Generator().manual_seed(index)
+        hidden_states = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
+        training_target = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
+        encoder_hidden_states = torch.randn(1, self.text_seq_len, self.TEXT_DIM, generator=gen)
+        encoder_hidden_states_mask = torch.ones(1, self.text_seq_len, dtype=torch.long)
+        latents = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
+        timestep = torch.tensor([self.TIMESTEP])
+        img_shapes = torch.tensor([list(self.image_dims)], dtype=torch.long)
+        return [
+            {
+                "hidden_states": hidden_states,
+                "training_target": training_target,
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
+                "timestep": timestep,
+                "img_shapes": img_shapes,
+                "latents": latents,
             }
         ]
 
@@ -457,8 +461,15 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int, data_path="
         return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3omni":
         return DummyQwen3OmniMoeDataset(size=size, seq_length=max_seq_len, patch_size=16)
-    elif task_type == "ug":
-        return DummyUGDataset(size=size, seq_length=max_seq_len)
+    elif task_type == "wan_t2v":
+        return WanT2VDataset(size=size)
+    elif task_type == "qwen_image":
+        return QwenImageDataset(size=size)
+    elif task_type == "qwen_image_padding":
+        # Odd image (1*3*5=15) and text (7) lengths so ``sp_size > 1`` runs
+        # actually hit the Ulysses-SP pad/truncate path (the default 16/8 case
+        # is divisible by 2 and silently bypasses it).
+        return QwenImageDataset(size=size, image_dims=(1, 3, 5), text_seq_len=7)
     else:
         raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")
 

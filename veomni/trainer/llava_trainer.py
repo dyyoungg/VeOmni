@@ -48,6 +48,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, build_tokenizer
 from veomni.models.custom.llava_qwen3moe.auto import build_qwen3moe_omni_from_pretrained
 from veomni.models.custom.llava_qwen2.auto import build_llavaqwen2_omni_from_pretrained
+from veomni.models.custom.llava_qwen35.auto import build_qwen35_omni_from_pretrained
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.trainer.callbacks import (
     CheckpointerCallback,
@@ -237,6 +238,10 @@ class VLMMModelArguments(ModelArguments):
     audio_projector_type: Optional[str] = field(default="conv_channel_upscale") # avgpool, channel_upscale
     audio_encoder_type: Optional[str] = field(default="whisper")
     qwen3_audio_n_window: Optional[int] = field(default=50)
+    use_3d_rope: bool = field(
+            default=False,
+            metadata={"help": "Enable 3D M-RoPE position IDs pre-computation in the dataloader (for Qwen3.5-based models)."},
+    )
 
 @dataclass
 class VeOmniVLMArguments(VeOmniArguments):
@@ -326,34 +331,41 @@ class VLMTrainer:
             self.model = build_qwen3moe_omni_from_pretrained(
                 args.model.model_path,
                 init_device=args.train.init_device,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
                 modality_aware_routing=args.train.modality_aware_routing,
                 num_routing_modalities=args.train.num_routing_modalities,
+                ops_implementation=args.model.ops_implementation,
             )
         elif self.model_config.model_type == "llavaqwen2_omni":
             self.model = build_llavaqwen2_omni_from_pretrained(
                 args.model.model_path,
                 init_device=args.train.init_device,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
+            )
+        elif self.model_config.model_type == "llavaqwen35_omni":
+            self.model = build_qwen35_omni_from_pretrained(
+                args.model.model_path,
+                init_device=args.train.init_device,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+                encoder_data_balance=args.model.encoder_data_balance,
+                encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
             )
 
         else:
             self.model = build_foundation_model(
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-                attn_implementation=args.model.ops_implementation.attn_implementation,
-                moe_implementation=args.model.ops_implementation.moe_implementation,
+                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 init_device=args.train.init_device,
                 encoder_data_balance=args.model.encoder_data_balance,
                 encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
+                ops_implementation=args.model.ops_implementation,
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model.config_path,
@@ -367,7 +379,7 @@ class VLMTrainer:
         self.model.omni_config.video_token_id = video_token_id
         self.model.omni_config.audio_token_id = audio_token_id
         logger.info_rank0(f"image pad token {image_token_id}, video pad token: {video_token_id}, audio pad token:{audio_token_id}")
-        if self.model_config.model_type == "llavaqwen3moe_omni":
+        if self.model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen35_omni"):
             self.model.config.output_router_logits = self.args.train.output_router_logits
             self.model.foundation_config.router_aux_loss_coef = self.args.train.router_aux_loss_coef
             self.model.omni_config.mm_balance_coef = self.args.train.mm_balance_coef
@@ -394,7 +406,7 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.args
         model_config = self.model_config
 
-        if model_config.model_type in ("llavaqwen3moe_omni","llavaqwen2_omni"):
+        if model_config.model_type in ("llavaqwen3moe_omni", "llavaqwen2_omni", "llavaqwen35_omni"):
             if args.train.freeze_vit:
                 self.model.image_encoder.requires_grad_(False)
                 self.model.image_encoder.freeze_vit = True
@@ -483,9 +495,8 @@ class VLMTrainer:
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
-            enable_full_shard=args.train.accelerator.fsdp_config.full_shard,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            enable_mixed_precision=args.train.enable_mixed_precision,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             enable_gradient_checkpointing_vit=args.train.gradient_checkpointing.enable_vit,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
@@ -538,6 +549,7 @@ class VLMTrainer:
             param_groups=param_groups,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
+            optimizer_config=args.train.optimizer,
         )
 
     def _build_lr_scheduler(self):
@@ -549,6 +561,7 @@ class VLMTrainer:
             dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
         if args.train.remote_dataloader:
             self.init_data_size = len(self.train_dataloader.data_list)
+
         elif hasattr(self.train_dataloader, "num_train_epochs"):
             # Ulysses PrefetchingPackedLoader: data_list is single-epoch per DP rank.
             # Total samples across all epochs = per_rank * dp_world_size * num_epochs.
@@ -558,7 +571,6 @@ class VLMTrainer:
                 * self.train_dataloader.num_train_epochs
             )
         else:
-            # OmniDataloader: data_list already contains num_epochs copies
             self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
 
         # Fake data mode: use max_steps to control training loop length.
@@ -573,8 +585,8 @@ class VLMTrainer:
        
         self.start_step = 0
         self.video_trained_num = 0  
-        self.train_steps = self.init_data_size
-        print("dp world size", dp_world_size, "Total initial data size", self.init_data_size)
+        self.train_steps = self.init_data_size * args.train.num_train_epochs
+        print("dp world size", dp_world_size, "Total initial data size", self.init_data_size, "train step", self.train_steps)
         
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
@@ -792,7 +804,7 @@ class VLMTrainer:
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in micro_batch.items()
         }
-        if getattr(self, "LOG_SAMPLE", True):
+        if getattr(self, "LOG_SAMPLE", False):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
         return micro_batch
@@ -886,7 +898,7 @@ class VLMTrainer:
                 self.model.set_reshard_after_backward(True)
 
 
-    def _sync_video_trained_num(self) -> bool:
+    def _sync_video_trained_num(self, epoch) -> bool:
         """Sync consumed/remaining data count across ranks and update video_trained_num.
 
         Returns True if training should stop (data exhausted on any rank).
@@ -898,10 +910,10 @@ class VLMTrainer:
         if getattr(args.train, "use_fake_data", False):
             self.video_trained_num = self.state.global_step
             self.state.video_trained_num = self.video_trained_num
-            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
             return
 
-        if args.train.remote_dataloader:
+        if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
             if dist.is_initialized():
                 rank = dist.get_rank()
             else:
@@ -916,9 +928,9 @@ class VLMTrainer:
             if dist.is_initialized():
                 dist.broadcast(data_tensor, src=0)
             
-            self.video_trained_num = int(data_tensor.item())
-            self.state.video_trained_num = self.video_trained_num
-            self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+            video_trained_num = int(data_tensor.item())
+            self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
+            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
             
         else:
             if hasattr(self.train_dataloader, "samples_consumed"):
@@ -932,9 +944,9 @@ class VLMTrainer:
                     ps = get_parallel_state()
                     dp_group = ps.dp_group if ps is not None else None
                     dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
-                self.video_trained_num = int(consumed_tensor.item())
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = int(consumed_tensor.item())
+                self.state.video_trained_num = video_trained_num + epoch* self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
 
             elif hasattr(self.train_dataloader, "data_queue"):
                 remain_data = self.train_dataloader.data_queue.qsize()
@@ -950,18 +962,18 @@ class VLMTrainer:
                 if get_parallel_state() is not None:
                     self._data_tensor_out = self._data_tensor_out // get_parallel_state().sp_size
 
-                self.video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
+                self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
 
             else:
                 remain_data = len(self.train_dataloader.data_list)
                 logger.warning(
                     "dataloader has no attr data_queue or samples_consumed, defaulting to len(data_list)"
                 )
-                self.video_trained_num = self.init_data_size - remain_data
-                self.state.video_trained_num = self.video_trained_num
-                self.state.epoch = self.video_trained_num / max(self.init_data_size, 1)
+                video_trained_num = self.init_data_size - remain_data
+                self.state.video_trained_num = video_trained_num + epoch *self.init_data_size
+                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
  
     
     def _collect_modality_stats(self, micro_batches: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -1000,6 +1012,7 @@ class VLMTrainer:
 
     def train_step(
         self,
+        epoch,
         micro_batches: Any,
     ) -> Dict[str, float]:
         args = self.args
@@ -1042,18 +1055,18 @@ class VLMTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        self._sync_video_trained_num()
+        self._sync_video_trained_num(epoch)
 
         warmup_steps = int(
             self.train_steps * args.train.optimizer.lr_warmup_ratio
         )
-        if warmup_steps > 0 and self.video_trained_num < warmup_steps:
-            self.lr_scheduler.step(epoch=self.video_trained_num)
+        if warmup_steps > 0 and self.state.video_trained_num < warmup_steps:
+            self.lr_scheduler.step(epoch=self.state.video_trained_num)
 
         else:
             decay_ratio = getattr(args.train.optimizer, "lr_decay_ratio", 1.0)
-            if self.video_trained_num / max(self.init_data_size, 1) <= decay_ratio:
-                self.lr_scheduler.step(epoch=max(self.video_trained_num, warmup_steps))
+            if self.state.video_trained_num/ max(self.train_steps, 1) <= decay_ratio:
+                self.lr_scheduler.step(epoch=max(self.state.video_trained_num, warmup_steps))
 
         self.state.global_step += 1
         self.current_step += 1
@@ -1074,16 +1087,17 @@ class VLMTrainer:
 
     def train(self):
         args: VeOmniArguments = self.args
-    
+        self.state.start_epoch = 0
+        self.state.start_step = 0
         self.on_train_begin()
-        self.train_dataloader.launch()
+
         self.state.max_steps = self.train_steps
         self.state.total_video_num = self.train_steps
         self.state.video_trained_num = 0
         self.state.num_train_epochs = args.train.num_train_epochs
         self.state.is_local_process_zero = (args.train.local_rank == 0)
         self.state.is_world_process_zero = (args.train.global_rank == 0)
-
+        self.start_step = self.state.start_step
 
 
         logger.info(
@@ -1094,13 +1108,16 @@ class VLMTrainer:
             f"Train epochs: {args.train.num_train_epochs}."
         )
         
-        for epoch in range(args.train.num_train_epochs):
-            if not self.train_dataloader.is_launched:
-                self.train_dataloader.launch()
+        for epoch in range(self.state.start_epoch, args.train.num_train_epochs):
+            
+            if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
+                # Keep checkpoint-restored counter on mid-epoch resume
+                if not (epoch == self.state.start_epoch and self.start_step > 0):
+                    self.train_dataloader.remote_data_index.value = 0
+            self.train_dataloader.set_epoch(epoch)
+            self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)
             self.current_epoch = epoch
-            if hasattr(self.train_dataloader, "set_epoch"):
-                self.train_dataloader.set_epoch(epoch)
 
             self.state.epoch = float(epoch)
 
@@ -1129,7 +1146,7 @@ class VLMTrainer:
                 if not should_continue:
                     logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping cleanly.")
                     break
-                self.train_step(micro_batches)
+                self.train_step(epoch, micro_batches)
 
 
             self.start_step = 0
@@ -1137,7 +1154,6 @@ class VLMTrainer:
             dist.barrier()
             self.train_dataloader.close()
 
-            self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
         self.on_train_end()
