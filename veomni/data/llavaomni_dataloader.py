@@ -1213,10 +1213,13 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         
         if has_visual:
             answer_idx = -1
-            for idx, c in enumerate(sample_data.get('candidates', [])):
-                question += f"\n({chr(ord('A') + idx)}) {c}\n" if idx == 0 else f"({chr(ord('A') + idx)}) {c}\n"
-                if c == answer: 
-                    answer_idx = idx
+            is_generation_task = "generate" in category
+            
+            if not is_generation_task:
+                for idx, c in enumerate(sample_data.get('candidates', [])):
+                    question += f"\n({chr(ord('A') + idx)}) {c}\n" if idx == 0 else f"({chr(ord('A') + idx)}) {c}\n"
+                    if c == answer: 
+                        answer_idx = idx
             
             if "audio" not in sample_data:
                 question_tokens = self.build_inputs_token(question, input_type="query_format", return_tensor=False)
@@ -1225,7 +1228,6 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                 if not question_tokens: 
                     return None
             
-            is_generation_task = "generate" in category
             
             if is_generation_task:
                 subtitle_tokens = question_tokens
@@ -1411,6 +1413,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
                     w = img.width  // factor // merge
                     mh, mw = get_adaptive_pool_size(h, w, scale=selected_downsample_ratio)
                     n_tokens = mh * mw
+                    # print(f"[Eval Info] Image {img.height}  {img.width} has {n_tokens} tokens after pooling.", flush=True)
                     if total_tokens + n_tokens > max_tokens and kept_imgs:
                         break
                     kept_imgs.append(img)
@@ -1479,8 +1482,8 @@ def get_eval_dataloader(tokenizer, data_args, training_args, model_args):
     if dist.is_available() and dist.is_initialized():
         eval_sampler = DistributedSampler(
                                         eval_dataset,
-                                        shuffle=True, 
-                                        drop_last=False 
+                                        shuffle=False, 
+                                        drop_last=True 
                                 )
     
     else:

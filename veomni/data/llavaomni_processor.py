@@ -1302,55 +1302,61 @@ class OmniSampleProcessor:
 
             else:
                 # ---------------- 非交错模式 ----------------
-                if is_human:
-                    if has_image or has_video:
-                        value = re.sub(img_pat, "", value)
-                        value = re.sub(vid_pat, "", value)
-                    cur_text = user_fmt.format(content=value)
-                    audio_count += cur_text.count(DEFAULT_AUDIO_TOKEN)
+                try:
+                    if is_human:
+                        if has_image or has_video:
+                            value = re.sub(img_pat, "", value)
+                            value = re.sub(vid_pat, "", value)
+                        cur_text = user_fmt.format(content=value)
+                        audio_count += cur_text.count(DEFAULT_AUDIO_TOKEN)
 
-                    if has_audio:
-                        cur_tokens = self._tokenize_with_audio_placeholders(cur_text)
-                    else:
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                        if has_audio:
+                            cur_tokens = self._tokenize_with_audio_placeholders(cur_text)
+                        else:
+                            cur_tokens = self.tokenizer(cur_text)["input_ids"]
 
-                    text_tokens += cur_tokens
-                    label_tokens += [IGNORE_INDEX] * len(cur_tokens)
-                else:
-                    # assistant
-                    if has_video and "chatgpt-videos" in sample_data.get("video", ""):
-                        value = value.split("\n")[0]
-                    if has_image:
-                        value = re.sub(img_pat, "", value)
-                    cur_text = asst_fmt.format(content=value)
-
-                    if c.get("infer"):
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
                         text_tokens += cur_tokens
                         label_tokens += [IGNORE_INDEX] * len(cur_tokens)
-                        
-                    elif c.get("first_token"):
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
-                        text_tokens += cur_tokens
-                        new_labels = [IGNORE_INDEX] * len(cur_tokens)
-                        new_labels[:2] = cur_tokens[:2]
-                        label_tokens += new_labels
-                    elif "ignore_bracket" in sample_data:
-                        bracket_pattern = re.compile(r"([\(\（][^\)\）]*[\)\）])")
-                        b_parts = bracket_pattern.split(cur_text)
-                        for part in b_parts:
-                            if not part:
-                                continue
-                            part_tokens = self.tokenizer(part)["input_ids"]
-                            text_tokens += part_tokens  # 同步追加 text token
-                            if part.startswith(("(", "（")) and part.endswith((")", "）")):
-                                label_tokens += [IGNORE_INDEX] * len(part_tokens)
-                            else:
-                                label_tokens += part_tokens
                     else:
-                        cur_tokens = self.tokenizer(cur_text)["input_ids"]
-                        text_tokens += cur_tokens
-                        label_tokens += cur_tokens
+                        # assistant
+                        if has_video and "chatgpt-videos" in sample_data.get("video", ""):
+                            value = value.split("\n")[0]
+                        if has_image:
+                            value = re.sub(img_pat, "", value)
+                        cur_text = asst_fmt.format(content=value)
+
+                        if c.get("infer"):
+                            cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                            text_tokens += cur_tokens
+                            label_tokens += [IGNORE_INDEX] * len(cur_tokens)
+                            
+                        elif c.get("first_token"):
+                            cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                            text_tokens += cur_tokens
+                            new_labels = [IGNORE_INDEX] * len(cur_tokens)
+                            new_labels[:2] = cur_tokens[:2]
+                            label_tokens += new_labels
+                        elif "ignore_bracket" in sample_data:
+                            bracket_pattern = re.compile(r"([\(\（][^\)\）]*[\)\）])")
+                            b_parts = bracket_pattern.split(cur_text)
+                            for part in b_parts:
+                                if not part:
+                                    continue
+                                part_tokens = self.tokenizer(part)["input_ids"]
+                                text_tokens += part_tokens  # 同步追加 text token
+                                if part.startswith(("(", "（")) and part.endswith((")", "）")):
+                                    label_tokens += [IGNORE_INDEX] * len(part_tokens)
+                                else:
+                                    label_tokens += part_tokens
+                        else:
+                            cur_tokens = self.tokenizer(cur_text)["input_ids"]
+                            text_tokens += cur_tokens
+                            label_tokens += cur_tokens
+                except:
+                    print(traceback.format_exc())
+                    print("sample is error:", sample_data)
+                    # 抛出错误
+                    raise ValueError(f"Error processing sample: {sample_data}")
 
         assert len(label_tokens) == len(text_tokens), (
             f"{sample_data} label/token length mismatch: {len(label_tokens)} vs {len(text_tokens)}"

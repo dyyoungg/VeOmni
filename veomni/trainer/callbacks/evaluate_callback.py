@@ -156,6 +156,8 @@ class EvaluateCallback(Callback):
                 model_kwargs["pixel_values_videos"]  = data.pop("pixel_values_videos", None)
                 model_kwargs["image_grid_thw"]       = data.pop("image_grid_thw", None)
                 model_kwargs["video_grid_thw"]       = data.pop("video_grid_thw", None)
+                model_kwargs["image_downsample_ratios"] = data.pop("image_downsample_ratios", None)
+                model_kwargs["video_downsample_ratios"] = data.pop("video_downsample_ratios", None)
 
             out     = model(**model_kwargs)
             past_kv = out.past_key_values
@@ -276,7 +278,7 @@ class EvaluateCallback(Callback):
             model, data
         )
     
-    def _eval_llm_batch(self, model, data: dict, category: str) -> tuple[bool, str, torch.device]:
+    def _eval_llm_batch(self, model, data: dict, raw_data: dict, category: str) -> tuple[bool, str, torch.device]:
         """Decodes autoregressively for LLM text generation tasks and scores by rules."""
         
         # 对于 LLM 生成，设置 max_gen 为 128 
@@ -285,6 +287,7 @@ class EvaluateCallback(Callback):
         )
 
         acc = False
+        similarity = None
         if "function_call" in category:
             if "_nosearch" in category:
                 acc = "（搜索：" not in hypothesis
@@ -306,10 +309,63 @@ class EvaluateCallback(Callback):
                 acc = "www.link" not in hypothesis
             elif "_world_book_link" in category:
                 acc = "www.link" in hypothesis
+                
+        elif "generate" in category:
+            # Ground Truth 文本
+            gt_str = ""
+            if "answer" in raw_data:
+                gt_str = raw_data["answer"]
+                if isinstance(gt_str, list) and len(gt_str) > 0:
+                    gt_str = gt_str[0]
+        
+            hyp_cleaned = self.clean_text(hypothesis)
+            gt_cleaned = self.clean_text(gt_str)
+            buffer = 5  
+            gt_sliced = gt_cleaned[:len(hyp_cleaned) + buffer]
+            print("hyp_cleaned", hyp_cleaned, "gt_sliced", gt_sliced, flush=True)
+            similarity = self.calculate_similarity_cleaned(hyp_cleaned, gt_sliced)
+            
+            threshold = 1.0
+            acc = similarity >= threshold
         else:
             acc = False
 
-        return acc, hypothesis, gen_device
+        return acc, hypothesis, gen_device, similarity
+    
+    def clean_text(self, s: str) -> str:
+        """
+        统一的数据清洗逻辑：
+        转小写并只保留英文(a-z)、数字(0-9)、中文(\u4e00-\u9fff)、日文平假名(\u3040-\u309f)、日文片假名(\u30a0-\u30ff)
+        """
+        s = str(s).strip().lower()
+        clean_pattern = re.compile(r'[^a-z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]')
+        return clean_pattern.sub('', s)
+
+
+    def calculate_similarity_cleaned(self, s1_cleaned: str, s2_cleaned: str) -> float:
+        """
+        基于已经清洗完毕的字符串计算 Levenshtein 编辑距离相似度
+        """
+        if not s1_cleaned and not s2_cleaned:
+            return 1.0
+        if not s1_cleaned or not s2_cleaned:
+            return 0.0
+        
+        m, n = len(s1_cleaned), len(s2_cleaned)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+            
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if s1_cleaned[i-1] == s2_cleaned[j-1]:
+                    dp[i][j] = dp[i-1][j-1]
+                else:
+                    dp[i][j] = min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]) + 1
+                    
+        return 1.0 - (dp[m][n] / max(m, n))
     
     def _generate_and_score(
         self, model, data,
@@ -434,12 +490,19 @@ class EvaluateCallback(Callback):
                     pred_record["prediction"] = hypothesis
                     pred_record["metric"] = metric
                     pred_record["eval_type"] = "asr"
-                elif ("function_call" in category) or ("deploy" in category) or ("generate" in category):
+                elif ("function_call" in category) or ("deploy" in category) or ("generate" in category): # 需要生成的数据放在在测试集开头且数量必须为world_size的倍数
                     # 指令/工具调用评估
-                    acc, hypothesis, _ = self._eval_llm_batch(model, data, category)
+                    acc, hypothesis, _, similarity = self._eval_llm_batch(model, data, pred_record, category)
                     category_acc[category].append(
                         torch.tensor(1.0 if acc else 0.0, dtype=torch.float, device=device)
                     )
+                    if similarity is not None:
+                        sim_key = f"{category}_similarity"
+                        category_acc[sim_key].append(
+                            torch.tensor(similarity, dtype=torch.float, device=device)
+                        )
+                        pred_record["similarity"] = similarity
+                        
                     pred_record["prediction"] = hypothesis
                     pred_record["is_correct"] = bool(acc)
                     pred_record["eval_type"] = "generation"
@@ -458,6 +521,8 @@ class EvaluateCallback(Callback):
                         category_acc[category].append(acc)
                         if "wukong" in category:
                             category_acc["wukong"].append(acc)
+                        if "_uimcq" in category:
+                            category_acc["_uimcq"].append(acc)
  
                         pred_record["prediction"] = chr(ord('A') + pred_idx)
                         pred_record["ground_truth"] = chr(ord('A') + target_idx)
@@ -500,6 +565,8 @@ class EvaluateCallback(Callback):
                 evaluate_logs[metric_key] = val
 
         all_categories = getattr(eval_dl, "categories", set())
+        for key in category_acc.keys():
+            all_categories.add(key)
         evaluate_logs.update(self._all_reduce_category(category_acc, all_categories))
         evaluate_logs["step"]  = state.global_step
         evaluate_logs["epoch"] = round(float(state.epoch), 4)

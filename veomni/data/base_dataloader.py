@@ -80,6 +80,7 @@ class BaseDataLoader:
     # ------------------------------------------------------------------
 
     def load_data(self, data_path: str) -> None:
+        random.seed(233)
         if self.eval_mode:
             return
         if getattr(self.training_args, "use_fake_data", False):
@@ -109,23 +110,20 @@ class BaseDataLoader:
             elif offsets_path.endswith('.json'):
                 with open(offsets_path, 'r') as f:
                     self.data_list = json.load(f)
+                    random.shuffle(self.data_list)
         else:
 
             if not self.data_args.offline_dataset_split:
-                random.seed(233)
                 num_epochs = int(self.training_args.num_train_epochs)
                 chunk_size = None  # computed after read
 
                 raw = read_data(data_path=data_path)
                 chunk_size = len(raw) // self.world_size
                 self.data_list = []
-                for _ in range(num_epochs):
-                    random.shuffle(raw)
-                    self.data_list.extend(
-                        raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
-                    )
-                
-
+                random.shuffle(raw)
+                self.data_list.extend(
+                    raw[self.rank * chunk_size: (self.rank + 1) * chunk_size]
+                )
                 split_label = "test" if self.eval_mode else "train"
                 if split_label == "train":
                     print(f"{self.rank}: {split_label} data size {len(self.data_list)}")
