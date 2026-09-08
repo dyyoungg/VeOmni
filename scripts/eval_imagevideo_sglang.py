@@ -257,6 +257,7 @@ class MultiModalClient:
         images: Optional[List[Image.Image]] = None,
         audios: Optional[List[Union[np.ndarray, str, bytes]]] = None,
         target_sizes: Optional[List[Tuple]] = None,
+        image_downsample_ratios: Optional[List[int]] = None,
     ) -> AsyncGenerator[str, None]:
         
         image_data_list = []
@@ -284,7 +285,9 @@ class MultiModalClient:
             
         if audio_data_list:
             payload["audio_data"] = audio_data_list if len(audio_data_list) > 1 else audio_data_list[0]
-        
+
+        if image_downsample_ratios is not None:
+            payload["image_downsample_ratios"] = image_downsample_ratios
        
         try:
             async with aiohttp.ClientSession() as session:
@@ -315,12 +318,12 @@ class LLMconnector:
         print(urls)
         self.clients = [MultiModalClient(url=f"http://{url}:{port}/generate", default_sampling_params=sampling_params) for url in urls]
        
-    async def generate(self, prompt, images, audios=None, sampling_params=None):
+    async def generate(self, prompt, images, audios=None, sampling_params=None, image_downsample_ratios=None):
         client = random.choice(self.clients)
         try:
             full_response = ""
             # print(prompt, len(images))
-            async for chunk in client.generate(prompt, images, audios):
+            async for chunk in client.generate(prompt, images, audios, image_downsample_ratios=image_downsample_ratios):
                 full_response += chunk
             return full_response
         except Exception as e:
@@ -394,12 +397,14 @@ def worker_eval(args, worker_id, url, input_queue, result_queue):
             else:
                 media_path = line.get("image_path", line.get("image", ""))
                 images_list = get_image_frames(media_path, args.mm_downsample_ratio, args.size_factor)
+
+            image_downsample_ratios = [args.mm_downsample_ratio] * (len(images_list)//2)
            
             prompt = construct_prompt(question, image_num=len(images_list), system_prompt=system_prompt)
            
             sample_param = SamplingParams(temperature=0.7).asdict()
             answer = loop.run_until_complete(
-                local_connector.generate(prompt, images=images_list, sampling_params=sample_param)
+                local_connector.generate(prompt, images=images_list, sampling_params=sample_param, image_downsample_ratios=image_downsample_ratios)
             )
             
             if args.dataset_name not in ["MMhalBench", "RefoMB"]:
