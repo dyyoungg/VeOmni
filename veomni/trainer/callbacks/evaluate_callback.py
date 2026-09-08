@@ -456,7 +456,7 @@ class EvaluateCallback(Callback):
  
         model.eval()
 
-        with torch.inference_mode():
+        with torch.no_grad():
             for idx, data in enumerate(eval_dl):
                 if rank==0 and idx % 2 == 0:
                     logger.info(f"[Eval] rank: {rank} step={state.global_step}  idx={idx}")
