@@ -919,7 +919,10 @@ class VLMTrainer:
             else:
                 rank = 0
             if rank == 0:
-                current_global_index = self.train_dataloader.remote_data_index.value
+                if hasattr(self.train_dataloader, "samples_consumed"):
+                    current_global_index = self.train_dataloader.samples_consumed.value
+                else:
+                    current_global_index = self.train_dataloader.remote_data_index.value
             else:
                 current_global_index = 0
                 
@@ -1114,6 +1117,8 @@ class VLMTrainer:
                 # Keep checkpoint-restored counter on mid-epoch resume
                 if not (epoch == self.state.start_epoch and self.start_step > 0):
                     self.train_dataloader.remote_data_index.value = 0
+                    if hasattr(self.train_dataloader, "samples_consumed"):
+                        self.train_dataloader.samples_consumed.value = 0
             self.train_dataloader.set_epoch(epoch)
             self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)

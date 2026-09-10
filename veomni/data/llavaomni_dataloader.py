@@ -338,15 +338,23 @@ class OmniDataloader(BaseDataLoader):
             self.proactive_processor._threadpool = self.processor._threadpool
     
     def state_dict(self) -> Dict:
- 
+
         total = len(self.data_list)
         remaining = self.data_queue.qsize() if hasattr(self, "data_queue") else 0
         trained_index = total - remaining
-   
+
+        # For remote mode, use samples_consumed (tracks what fetch_data_loop
+        # has actually handed to the trainer) instead of remote_data_index
+        # (which races ahead due to pipeline buffering).
+        if self.training_args.remote_dataloader and hasattr(self, "samples_consumed"):
+            effective_remote_index = self.samples_consumed.value
+        else:
+            effective_remote_index = self.remote_data_index.value
+
         return {
             "data_path":     self.data_args.train_path,
             "trained_index": max(trained_index, 0),
-            "remote_data_index": self.remote_data_index.value
+            "remote_data_index": effective_remote_index,
         }
 
     def load_state_dict(self, state: Dict) -> None:
@@ -426,6 +434,9 @@ class OmniDataloader(BaseDataLoader):
         self.image_merge_sizes: List = []
         self._clear_pack_buffer()
         self.worker_metrics_queue = torch.multiprocessing.Queue()
+        self.samples_consumed = torch.multiprocessing.Value(
+            "i", self.remote_data_index.value
+        )
         if getattr(self.data_args, "save_token_counted_data", False):
             self.save_info_queue = torch.multiprocessing.Queue()
         super().launch()
@@ -851,7 +862,7 @@ class OmniDataloader(BaseDataLoader):
 
         if not self.training_args.pack_seq:
             self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources,
-                                        channel_ids=[channel_id])
+                                        channel_ids=[channel_id], num_raw_samples=1)
             return
         image_num = 0
         if len(self.new_images_thw):
@@ -907,10 +918,12 @@ class OmniDataloader(BaseDataLoader):
             packed_resources,
             channel_ids=list(self.channel_id_list),
             position_ids=position_ids,
+            num_raw_samples=self._pack_raw_count,
         )
 
     def _enqueue_packed_result(self, input_ids, labels, attn_mask_len, resources,
-                               channel_ids=None, position_ids=None) -> None:
+                               channel_ids=None, position_ids=None,
+                               num_raw_samples: int = 1) -> None:
         self.result_queue.put({
             "input_ids":            input_ids,
             "labels":               labels,
@@ -925,6 +938,7 @@ class OmniDataloader(BaseDataLoader):
             "attention_mask_len":   attn_mask_len,
             "channel_ids":          channel_ids or [],
             "position_ids":         position_ids,
+            "num_raw_samples":      num_raw_samples,
         })
 
     def _compute_packed_position_ids(self, packed_ids, attention_mask_len, packed_resources):
@@ -983,6 +997,7 @@ class OmniDataloader(BaseDataLoader):
         self.new_labels.append(cur_labels)
         self.attention_mask_len.append(cur_caption_len)
         self.channel_id_list.append(channel_id)
+        self._pack_raw_count += 1
 
         if resources.get("image_pixels") is not None and resources.get("image_thw") is not None:
             self.new_images_list.append(resources["image_pixels"])
@@ -1015,6 +1030,7 @@ class OmniDataloader(BaseDataLoader):
         self.new_image_downsample_ratios = []
         self.new_video_downsample_ratios = []
         self.channel_id_list = []
+        self._pack_raw_count = 0
 
     
     # ------------------------------------------------------------------
@@ -1099,11 +1115,13 @@ class OmniDataloader(BaseDataLoader):
         while not self.end_signal:
             batch_data = []
             batch_count = 0
+            batch_raw_samples = 0
             data = None
             while batch_count < self.training_args.per_device_train_batch_size and not self.end_signal:
                 while True:  # add loop for gracefully exit
                     try:
                         data = self.result_queue.get(timeout=2)
+                        batch_raw_samples += data.pop("num_raw_samples", 0)
                         batch_data.append(data)
                         batch_count += 1
                         break
@@ -1124,18 +1142,18 @@ class OmniDataloader(BaseDataLoader):
                         batch_inputs[k] = v.to(device=device, dtype=torch.bfloat16, non_blocking=True)
                     else:
                         batch_inputs[k] = v.to(device=device, non_blocking=True)
-                    del v  
-            
+                    del v
+
             while True: # add loop for gracefully exit
                 try:
                     self.batch_data_queue.put(batch_inputs, timeout=1)
-                
+                    self.samples_consumed.value += batch_raw_samples
                     break
                 except queue.Full:
                     pass
                 if self.end_signal:
                     break
-            
+
             if self.end_signal:
                 break
                 
