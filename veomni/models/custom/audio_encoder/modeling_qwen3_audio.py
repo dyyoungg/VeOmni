@@ -339,16 +339,8 @@ class Qwen3AudioEncoder(PreTrainedModel):
         self.post_init()
 
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Conv2d):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, SinusoidsPositionEmbedding):
+        super()._init_weights(module)
+        if isinstance(module, SinusoidsPositionEmbedding):
             pos_emb = module._compute_embedding()
             module.positional_embedding.copy_(pos_emb)
 
