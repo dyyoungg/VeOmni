@@ -629,10 +629,10 @@ def build_prompt(
                 prompt += "\n<|im_start|>user\n"
                 if i == 0 and media_type == "audio":
                     prompt += f"{DEFAULT_AUDIO_START_TOKEN}<audio>{DEFAULT_AUDIO_END_TOKEN}\n"
-                prompt += text + "<|im_end|>\n"
+                prompt += text + "<|im_end|>"
             else:
-                prompt += f"<|im_start|>assistant\n{text}<|im_end|>\n"
-        prompt += "<|im_start|>assistant\n"
+                prompt += f"\n<|im_start|>assistant\n{text}<|im_end|>"
+        prompt += "\n<|im_start|>assistant\n"
     else:
         if vision_prefix:
             prompt += vision_prefix
@@ -692,27 +692,26 @@ def prepare_question(
     if task == "mcq":
         answer_option = ""
         if is_conversation:
-            if "candidates" in sample:
+            if "candidates" in sample and media_type in ("image", "video"):
                 last_role, last_text = turns[-1]
                 for idx, c in enumerate(sample["candidates"]):
                     option_char = chr(ord("A") + idx)
-                    last_text += f"\n({option_char}) {c}"
+                    last_text += f"\n({option_char}) {c}\n"
                     if c == answer:
                         answer_option = option_char
-                last_text += MCQ_INSTRUCTION_IMAGE
                 turns[-1] = (last_role, last_text)
+            elif "candidates" in sample:
+                for idx, c in enumerate(sample["candidates"]):
+                    if c == answer:
+                        answer_option = chr(ord("A") + idx)
             return turns, answer_option or str(answer)
         else:
             if "candidates" in sample:
                 for idx, c in enumerate(sample["candidates"]):
                     option_char = chr(ord("A") + idx)
-                    question += f"\n({option_char}) {c}"
+                    question += f"\n({option_char}) {c}\n"
                     if c == answer:
                         answer_option = option_char
-            if media_type == "video":
-                question += MCQ_INSTRUCTION_VIDEO
-            else:
-                question += MCQ_INSTRUCTION_IMAGE
             return question, answer_option or str(answer)
     else:
         if is_conversation:
@@ -818,6 +817,9 @@ async def evaluate_sample(
 
     num_images = len(images) if images else 0
     prompt = build_prompt(question_text, media_type, task, num_images, language, system_prompt)
+
+    if task == "mcq" and media_type in ("image", "video", "audio"):
+        prompt += "My best option: ("
 
     raw_answer = await client.generate(
         prompt, images=images, audios=audios, image_downsample_ratios=image_downsample_ratios
@@ -995,7 +997,7 @@ def main(args):
     dataset = load_dataset(data_path)
 
     # Detect media type and annotate
-    video_count, image_count, audio_count = 0, 0, 0
+    video_count, image_count, audio_count, text_count = 0, 0, 0, 0
     for sample in dataset:
         media_type, media_path = detect_media_type(sample)
         sample["_media_type"] = media_type
@@ -1006,11 +1008,13 @@ def main(args):
             image_count += 1
         elif media_type == "audio":
             audio_count += 1
+        else:
+            text_count += 1
 
     random.shuffle(dataset)
 
     print(f"Loaded {len(dataset)} samples from {data_path}")
-    print(f"  Media: video={video_count}, image={image_count}, audio={audio_count}")
+    print(f"  Media: video={video_count}, image={image_count}, audio={audio_count}, text={text_count}")
     print(f"  Task: {global_task or 'auto'}, Metric: {global_metric or 'auto'}")
     print(f"  Server URLs: {args.urls}")
 
