@@ -1511,12 +1511,12 @@ class OmniSampleProcessor:
 
 
     def _get_dynamic_downsample_ratio(self, sample_data) -> Optional[int]:
-        """
-        TODO:根据sample data实现动态下采样率
-        """
+        _DYNAMIC_DS_RATIOS = [1, 2, 4, 8, 12]
+        _DYNAMIC_DS_WEIGHTS = [1, 2, 4, 8, 16]
         if getattr(self.model_args, "dynamic_downsample", False):
-            candidates = getattr(self.model_args, "dynamic_downsample_ratios", [4, 8, 12, 16])
-            return random.choice(candidates)
+            candidates = getattr(self.model_args, "dynamic_downsample_ratios", _DYNAMIC_DS_RATIOS)
+            weights = getattr(self.model_args, "dynamic_downsample_weights", _DYNAMIC_DS_WEIGHTS)
+            return random.choices(candidates, weights=weights, k=1)[0]
         else:
             return self.model_args.mm_downsample_ratio
 

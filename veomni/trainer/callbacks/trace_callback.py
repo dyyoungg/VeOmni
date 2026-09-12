@@ -567,7 +567,7 @@ class EnvironMeterCallback(Callback):
             tc = token_counts[i].item()
             if tc > 0:
                 result[f"channel_loss/{ch}"] = loss_sums[i].item() / tc
-                result[f"channel_tokens/{ch}"] = tc
+                result[f"channel_ktokens/{ch}"] = tc / 1000.0
         return result
 
 
@@ -587,7 +587,10 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        postfix = ", ".join(
+            f"{k.split('/', 1)[-1]}: {v:.4f}" for k, v in self.trainer.step_train_metrics.items()
+            if not k.startswith("channel_loss/") and not k.startswith("channel_ktokens/")
+        )
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()
 
@@ -627,7 +630,10 @@ class VideoTqdmCallback(Callback):
         global_step = f"step:{state.global_step}"
         epoch_progress = f"{trained_videos / self.epoch_total:.3f}" if self.epoch_total > 0 else "0.000"
 
-        metrics_str = ", ".join(fmt(k, v) for k, v in self.trainer.step_train_metrics.items())
+        metrics_str = ", ".join(
+            fmt(k, v) for k, v in self.trainer.step_train_metrics.items()
+            if not k.startswith("channel_loss/") and not k.startswith("channel_ktokens/")
+        )
         eval_metrics: dict = getattr(self.trainer, "eval_metrics", None)
         eval_suffix = ""
         if eval_metrics:

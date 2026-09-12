@@ -279,7 +279,7 @@ class OmniDataloader(BaseDataLoader):
             self.bos_client = None
         self.processor: Optional[OmniSampleProcessor] = None
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
-        self._trained_index = 0
+        self._resumed_trained_index = 0
 
         # Channel loss: load mapping from config
         self.channel_mapping: Dict[str, str] = {}
@@ -339,17 +339,17 @@ class OmniDataloader(BaseDataLoader):
     
     def state_dict(self) -> Dict:
 
-        total = len(self.data_list)
-        remaining = self.data_queue.qsize() if hasattr(self, "data_queue") else 0
-        trained_index = total - remaining
-
-        # For remote mode, use samples_consumed (tracks what fetch_data_loop
-        # has actually handed to the trainer) instead of remote_data_index
-        # (which races ahead due to pipeline buffering).
         if self.training_args.remote_dataloader and hasattr(self, "samples_consumed"):
             effective_remote_index = self.samples_consumed.value
         else:
             effective_remote_index = self.remote_data_index.value
+
+        if hasattr(self, "samples_consumed"):
+            trained_index = self.samples_consumed.value
+        else:
+            total = len(self.data_list)
+            remaining = self.data_queue.qsize() if hasattr(self, "data_queue") else 0
+            trained_index = self._resumed_trained_index + (total - remaining)
 
         return {
             "data_path":     self.data_args.train_path,
@@ -384,6 +384,7 @@ class OmniDataloader(BaseDataLoader):
                 return
 
             self.data_list = self.data_list[resume_index:]
+            self._resumed_trained_index = resume_index
             logger.info(
                 f"[Dataloader] Resumed: skipped {resume_index}/{total}, "
                 f"{len(self.data_list)} samples remaining."
@@ -435,7 +436,8 @@ class OmniDataloader(BaseDataLoader):
         self._clear_pack_buffer()
         self.worker_metrics_queue = torch.multiprocessing.Queue()
         self.samples_consumed = torch.multiprocessing.Value(
-            "i", self.remote_data_index.value
+            "i", self.remote_data_index.value if self.training_args.remote_dataloader
+            else self._resumed_trained_index
         )
         if getattr(self.data_args, "save_token_counted_data", False):
             self.save_info_queue = torch.multiprocessing.Queue()
@@ -771,6 +773,7 @@ class OmniDataloader(BaseDataLoader):
                     continue
             
             else:
+                file_path = None
                 try:
                     sample_data = json.loads(self.data_queue.get(timeout=5))
                     sample_index += 1
@@ -779,8 +782,8 @@ class OmniDataloader(BaseDataLoader):
                     continue
 
             if isinstance(sample_data, dict):
-                self.worker_loop_finetune(sample_data, sample_index)
-                
+                self.worker_loop_finetune(sample_data, sample_index, file_path=file_path)
+
             elif isinstance(sample_data, list):
                 # Susbtitle List 格式：[video_path, subtitle_path, (可选的 system_prompt)]
                 formatted_data = {
@@ -789,8 +792,8 @@ class OmniDataloader(BaseDataLoader):
                 }
                 if len(sample_data) > 2:
                     formatted_data["system_prompt"] = sample_data[2]
-                
-                self.worker_loop_finetune(formatted_data, sample_index, is_long_video=True)
+
+                self.worker_loop_finetune(formatted_data, sample_index, is_long_video=True, file_path=file_path)
             else:
                 raise NotImplementedError("Unsupported sample_data format.")
             
@@ -813,7 +816,7 @@ class OmniDataloader(BaseDataLoader):
                         f"rss={mem_mb:.0f}MB "
                         f"gc=({gen0},{gen1},{gen2})"
                     )
-                gc.collect()
+                # gc.collect()
         try:
             for f in file_cache.values():
                 f.close()
@@ -1036,7 +1039,8 @@ class OmniDataloader(BaseDataLoader):
     # ------------------------------------------------------------------
     # Finetune worker: dispatch + batch packing
     # ------------------------------------------------------------------    
-    def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False) -> None:        
+    def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False,
+                             file_path: Optional[str] = None) -> None:        
         # Route processing through the proactive processor if enabled
         # if getattr(self.training_args, "proactive", False):
         #     processor = self.proactive_processor
@@ -1067,28 +1071,37 @@ class OmniDataloader(BaseDataLoader):
                 for sample in samples:
                     if sample is None:
                         continue
-                    self._process_single_sample(sample_data, sample, processor)
+                    self._process_single_sample(sample_data, sample, processor, file_path=file_path)
             finally:
                 if hasattr(samples, 'close'):
                     samples.close()
         else:
-            self._process_single_sample(sample_data, samples, processor)
+            self._process_single_sample(sample_data, samples, processor, file_path=file_path)
 
-    def _resolve_channel_id(self, sample_data: Dict) -> str:
-        """Map sample's dataset_type to a channel name via self.channel_mapping."""
+    def _resolve_channel_id(self, sample_data: Dict, file_path: Optional[str] = None) -> str:
+        """Map sample's dataset_type to a channel name via self.channel_mapping.
+
+        When using remote_dataloader, sample_data may not contain dataset_type.
+        In that case, fall back to matching file_path against channel_mapping keys.
+        """
         dataset_type = sample_data.get("dataset_type", "")
-        if not dataset_type:
-            return "other"
-        return self.channel_mapping.get(dataset_type, dataset_type)
+        if dataset_type:
+            return self.channel_mapping.get(dataset_type, dataset_type)
 
-    def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any) -> None:
+        if file_path and self.channel_mapping:
+           return self.channel_mapping.get(file_path, "unknown")
+        
+        return "unknown"
+
+    def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any,
+                               file_path: Optional[str] = None) -> None:
         if getattr(self.data_args, "save_token_counted_data", False):
             system_token = processor._build_system_token(sample_data, 0)
             self._save_token_counts(
                 sample_data, system_token, sample.token_counts, sample.caption_len
             )
 
-        channel_id = self._resolve_channel_id(sample_data)
+        channel_id = self._resolve_channel_id(sample_data, file_path=file_path)
         self._pack_and_enqueue(
             cur_input_ids=sample.input_ids,
             cur_labels=sample.labels,

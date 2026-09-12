@@ -561,9 +561,14 @@ class EvaluateCallback(Callback):
             if val is not None:
                 evaluate_logs[metric_key] = val
 
-        all_categories = getattr(eval_dl, "categories", set())
+        all_categories = set(getattr(eval_dl, "categories", set()))
         for key in category_acc.keys():
             all_categories.add(key)
+        if dist.is_initialized():
+            all_cats_list = [None] * dist.get_world_size()
+            dist.all_gather_object(all_cats_list, all_categories)
+            for cats in all_cats_list:
+                all_categories.update(cats)
         evaluate_logs.update(self._all_reduce_category(category_acc, all_categories))
         evaluate_logs["step"]  = state.global_step
         evaluate_logs["epoch"] = round(float(state.epoch), 4)

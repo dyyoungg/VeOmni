@@ -227,7 +227,8 @@ class VLMMModelArguments(ModelArguments):
     vision_tower: Optional[List[str]] = field(default=None)
     mm_downsample_ratio: int = field(default=16)
     dynamic_downsample: bool = field(default=False, metadata={"help": "Enable dynamic downsample ratio during training"})
-    dynamic_downsample_ratios: List[int] = field(default_factory=lambda: [4, 8, 12], metadata={"help": "Candidate downsample ratios for dynamic selection"})
+    dynamic_downsample_ratios: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 12], metadata={"help": "Candidate downsample ratios for dynamic selection"})
+    dynamic_downsample_weights: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16], metadata={"help": "Weights for dynamic downsample ratios"})
     audio_downsample_ratio: int = field(default=10)
     audio_frame_length: int = field(default=320)
     num_mel_bins: Optional[int] = field(default=128)
@@ -898,85 +899,50 @@ class VLMTrainer:
                 self.model.set_reshard_after_backward(True)
 
 
-    def _sync_video_trained_num(self, epoch) -> bool:
-        """Sync consumed/remaining data count across ranks and update video_trained_num.
+    def _get_consumed_samples(self) -> int:
+        """Read the local consumed-sample count from the dataloader.
 
-        Returns True if training should stop (data exhausted on any rank).
+        Handles multiprocessing.Value (OmniDataloader) and plain int
+        (PrefetchingPackedLoader) transparently.
         """
+        raw = self.train_dataloader.samples_consumed
+        return raw.value if hasattr(raw, "value") else int(raw)
+
+    def _sync_video_trained_num(self, epoch) -> None:
+        """Sync consumed data count across ranks and update training progress."""
         args = self.args
 
-        # Fake data mode: workers produce infinitely, no data_queue to track.
-        # Use global_step directly as the progress counter.
         if getattr(args.train, "use_fake_data", False):
-            self.video_trained_num = self.state.global_step
-            self.state.video_trained_num = self.video_trained_num
-            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
-            return
-
-        if args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
+            video_trained_num = self.state.global_step
+        elif hasattr(self.train_dataloader, "samples_consumed"):
+            # Unified path for OmniDataloader (remote or local) and
+            # Ulysses PrefetchingPackedLoader. All-reduce across DP ranks.
+            consumed_tensor = torch.tensor(
+                [self._get_consumed_samples()], dtype=torch.long, device=self.device
+            )
             if dist.is_initialized():
-                rank = dist.get_rank()
-            else:
-                rank = 0
-            if rank == 0:
-                if hasattr(self.train_dataloader, "samples_consumed"):
-                    current_global_index = self.train_dataloader.samples_consumed.value
-                else:
-                    current_global_index = self.train_dataloader.remote_data_index.value
-            else:
-                current_global_index = 0
-                
+                ps = get_parallel_state()
+                dp_group = ps.dp_group if ps is not None else None
+                dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
+            video_trained_num = int(consumed_tensor.item())
+        elif args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
+            # Legacy remote path without samples_consumed: broadcast from rank 0
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            current_global_index = self.train_dataloader.remote_data_index.value if rank == 0 else 0
             data_tensor = torch.tensor([current_global_index], dtype=torch.long, device=self.device)
-            
             if dist.is_initialized():
                 dist.broadcast(data_tensor, src=0)
-            
             video_trained_num = int(data_tensor.item())
-            self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
-            self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
-            
         else:
-            if hasattr(self.train_dataloader, "samples_consumed"):
-                # Ulysses PrefetchingPackedLoader path: samples_consumed is
-                # the cumulative count of raw samples consumed on this DP rank.
-                # All-reduce (sum) across DP ranks to get the global total.
-                # Use dp_group to avoid double-counting SP ranks within the same DP group.
-                consumed_per_rank = self.train_dataloader.samples_consumed
-                consumed_tensor = torch.tensor(consumed_per_rank, dtype=torch.long, device=self.device)
-                if dist.is_initialized():
-                    ps = get_parallel_state()
-                    dp_group = ps.dp_group if ps is not None else None
-                    dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
-                video_trained_num = int(consumed_tensor.item())
-                self.state.video_trained_num = video_trained_num + epoch* self.init_data_size
-                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
+            remain_data = len(self.train_dataloader.data_list)
+            logger.warning(
+                "dataloader has no samples_consumed or remote_data_index, "
+                "defaulting to len(data_list)"
+            )
+            video_trained_num = self.init_data_size - remain_data
 
-            elif hasattr(self.train_dataloader, "data_queue"):
-                remain_data = self.train_dataloader.data_queue.qsize()
-
-                data_tensor_in = torch.tensor(remain_data, dtype=torch.long, device=self.device)
-                world_size = dist.get_world_size() if dist.is_initialized() else 1
-                self._data_tensor_out = torch.zeros(world_size, dtype=torch.long, device=self.device)
-                if dist.is_initialized():
-                    dist.all_gather_into_tensor(self._data_tensor_out, data_tensor_in)
-                else:
-                    self._data_tensor_out[0] = data_tensor_in
-
-                if get_parallel_state() is not None:
-                    self._data_tensor_out = self._data_tensor_out // get_parallel_state().sp_size
-
-                video_trained_num = self.init_data_size - int(self._data_tensor_out.sum().item())
-                self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
-                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
-
-            else:
-                remain_data = len(self.train_dataloader.data_list)
-                logger.warning(
-                    "dataloader has no attr data_queue or samples_consumed, defaulting to len(data_list)"
-                )
-                video_trained_num = self.init_data_size - remain_data
-                self.state.video_trained_num = video_trained_num + epoch *self.init_data_size
-                self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
+        self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
+        self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
  
     
     def _collect_modality_stats(self, micro_batches: List[Dict[str, Any]]) -> Dict[str, float]:

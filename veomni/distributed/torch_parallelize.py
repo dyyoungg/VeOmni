@@ -824,7 +824,7 @@ def build_parallelize_model(
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
         import os as _os
         if _os.environ.get("VEOMNI_COMPILE_FRIENDLY_CKPT", "0") == "1":
-            gc_kwargs.pop("context_fn", None)
+            gradient_checkpointing_kwargs.pop("context_fn", None)
             logger.info_rank0("Compile-friendly checkpoint: context_fn dropped (default context).")
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
