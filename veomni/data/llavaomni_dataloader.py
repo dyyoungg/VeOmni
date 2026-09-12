@@ -778,6 +778,12 @@ class OmniDataloader(BaseDataLoader):
                     sample_data = json.loads(self.data_queue.get(timeout=5))
                     sample_index += 1
                 except queue.Empty:
+                    # The local input queue is finite.  Flush this worker's
+                    # final packed record before marking it done; otherwise
+                    # pack_seq silently drops the tail of each worker's data.
+                    if getattr(self, 'new_input_ids', None):
+                        self._flush_pack_buffer()
+                        self._clear_pack_buffer()
                     status_event.set()
                     continue
 
@@ -1130,6 +1136,7 @@ class OmniDataloader(BaseDataLoader):
             batch_count = 0
             batch_raw_samples = 0
             data = None
+            workers_exhausted = False
             while batch_count < self.training_args.per_device_train_batch_size and not self.end_signal:
                 while True:  # add loop for gracefully exit
                     try:
@@ -1141,25 +1148,44 @@ class OmniDataloader(BaseDataLoader):
                     except queue.Empty:
                         if self.end_signal:
                             break
+                        workers_done = bool(getattr(self, "worker_status_event", None)) and self.check_all_workers_done()
+                        if workers_done:
+                            workers_exhausted = True
+                            break
                         else:
                             continue
+                if self.end_signal or workers_exhausted:
+                    break
             if self.end_signal:
                 break
+            if batch_count < self.training_args.per_device_train_batch_size:
+                logger.info(
+                    "rank %s dropping incomplete final batch (%s/%s records)",
+                    self.rank,
+                    batch_count,
+                    self.training_args.per_device_train_batch_size,
+                )
+                break
 
-            batch_inputs = Qwen25VLcollatorFunc(batch_data, self.tokenizer)
+            # Keep each packed record as an independent model micro-batch.
+            micro_batches = [
+                Qwen25VLcollatorFunc([data], self.tokenizer) for data in batch_data
+            ]
             del batch_data
+
             bf16_keys = ["images", "pixel_values", "pixel_values_videos", "audio_features"]
-            for k, v in batch_inputs.items():
-                if isinstance(v, torch.Tensor):
-                    if k in bf16_keys:
-                        batch_inputs[k] = v.to(device=device, dtype=torch.bfloat16, non_blocking=True)
-                    else:
-                        batch_inputs[k] = v.to(device=device, non_blocking=True)
-                    del v
+            for micro_batch in micro_batches:
+                for k, v in micro_batch.items():
+                    if isinstance(v, torch.Tensor):
+                        if k in bf16_keys:
+                            micro_batch[k] = v.to(device=device, dtype=torch.bfloat16, non_blocking=True)
+                        else:
+                            micro_batch[k] = v.to(device=device, non_blocking=True)
+                        del v
 
             while True: # add loop for gracefully exit
                 try:
-                    self.batch_data_queue.put(batch_inputs, timeout=1)
+                    self.batch_data_queue.put(micro_batches, timeout=1)
                     self.samples_consumed.value += batch_raw_samples
                     break
                 except queue.Full:
