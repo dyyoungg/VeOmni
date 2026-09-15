@@ -145,6 +145,7 @@ class Qwen3_5MoeVisionFlashAttention2(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -159,7 +160,7 @@ class Qwen3_5MoeVisionFlashAttention2(nn.Module):
         sp_enabled = get_parallel_state() is not None and get_parallel_state().sp_enabled and self.training
         if sp_enabled:
             qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
-            
+
         q, k, v = qkv.unbind(0)  # each [seq_full, heads_local, head_dim]
 
         if position_embeddings is None:
@@ -170,8 +171,8 @@ class Qwen3_5MoeVisionFlashAttention2(nn.Module):
 
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Flash attention (variable-length, no causal mask)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(
             q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
         )
@@ -207,6 +208,7 @@ class Qwen3_5MoeVisionBlockSP(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
@@ -214,6 +216,7 @@ class Qwen3_5MoeVisionBlockSP(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
             **kwargs,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
@@ -305,12 +308,13 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
                     cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 
             position_embeddings = (emb.cos(), emb.sin())
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         with _vit_timer(self._vit_timings, "vit_blocks"):
             for blk in self.blocks:
                 if self.gradient_checkpointing and self.training:
                     hidden_states = checkpoint(
-                        blk.__call__, hidden_states, cu_seqlens, None, position_embeddings,
+                        blk.__call__, hidden_states, cu_seqlens, None, position_embeddings, max_seqlen,
                         use_reentrant=False,
                     )
                 else:
@@ -318,6 +322,7 @@ class Qwen3_5MoeViTPretrainedModel(Qwen3_5MoeVisionModel):
                         hidden_states,
                         cu_seqlens=cu_seqlens,
                         position_embeddings=position_embeddings,
+                        max_seqlen=max_seqlen,
                         **kwargs,
                     )
 
