@@ -1017,6 +1017,10 @@ class VLMTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() if isinstance(v, torch.Tensor) else v
 
+        # Raw aux loss is a per-forward metric, unlike the token-weighted losses.
+        if "aux_loss" in total_loss_dict:
+            total_loss_dict["aux_loss"] /= num_micro_steps
+
         # Gradient clipping
         grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
