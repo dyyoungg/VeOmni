@@ -18,12 +18,11 @@ from veomni.models.custom.llava_qwen3moe.modeling_audio_encoder import BeeBeeVLA
 from veomni.models.custom.llava_qwen3moe.modeling_qwen3_audio_encoder import BeeBeeVLQwen3AudioModel
 from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
     Qwen3MoeForCausalLM,
-    load_balancing_loss_func,
 )
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
-
+from veomni.ops.kernels.load_balancing_loss import load_balancing_loss_func
 
 class Qwen3MoeOmniPreTrainedModel(PreTrainedModel):
     config_class = Qwen3MoeOmniConfig
