@@ -43,8 +43,8 @@ class AudioConvUpScaleProjector(nn.Module):
         pad_len = target_seq_len - seq_len
 
         if pad_len > 0:
-            pad_tensor = torch.zeros(bs, pad_len, audio_hidden_size, device=x.device, dtype=x.dtype)
-            x = torch.cat([x, pad_tensor], dim=1)  # 在时间维度 padding
+            padding_tensor = torch.zeros(bs, pad_len, audio_hidden_size, device=x.device, dtype=x.dtype)
+            x = torch.cat([x, padding_tensor], dim=1)  # 在时间维度 padding
         new_seq_len = target_seq_len // self.linear_compress_ratio
         x = x.reshape(bs, new_seq_len, audio_hidden_size * self.linear_compress_ratio)
         sp_enabled = self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled
@@ -317,6 +317,5 @@ def build_audio_projector(projector_type, encoder_hidden, out_hidden, downsample
         return AudioMLPChannelProjector(encoder_hidden, out_hidden, downsample_ratio)
     else:
         raise NotImplementedError
-
 
 

@@ -447,8 +447,6 @@ def merge_component_models(vision_model_path, save_directory, vlm_path=None, loa
                     hidden_size = base_tensor.shape[1]
                     print(f"正在对齐 {key}: ckpt({ckpt_vocab_size}) vs model({model_vocab_size})，以较大值({max_vocab_size})为准")
 
-                    # 以较大的 vocab size 为准，创建新 tensor
-                    import torch
                     new_tensor = torch.zeros(max_vocab_size, hidden_size, dtype=base_tensor.dtype, device=base_tensor.device)
                     # 先填入当前模型权重作为底板
                     new_tensor[:model_vocab_size, :] = base_tensor
