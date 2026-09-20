@@ -17,6 +17,7 @@
 from typing import Callable, Optional
 
 import torch
+from torch.nn.attention import flex_attention as torch_flex_attention
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, causal_mask_function
@@ -32,6 +33,26 @@ from .ulysses import (
 # Module-level patch slot for the underlying Transformers FlexAttention adapter.
 _flex_attention_forward: Callable = hf_flex_attention_forward
 _flex_attention_mask_builder: Callable = ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"]
+
+_SUPPORTS_BACKEND_OPTION = "BACKEND" in getattr(
+    getattr(torch_flex_attention, "FlexKernelOptions", None), "__annotations__", {}
+)
+
+
+def _normalize_kernel_options(options: Optional[dict]) -> dict:
+    """Select the standard Triton kernel using the installed PyTorch's API."""
+    options = dict(options or {})
+    if _SUPPORTS_BACKEND_OPTION:
+        options.setdefault("BACKEND", "TRITON")
+    else:
+        # Older Inductor treats unknown options as Triton constexprs, emitting
+        # invalid code (BACKEND = TRITON) instead of selecting a backend.
+        backend = options.pop("BACKEND", "TRITON")
+        if backend == "TRITON":
+            options["FORCE_USE_FLEX_ATTENTION"] = True
+        elif backend != "AUTO":
+            raise ValueError(f"This PyTorch does not support FlexAttention BACKEND={backend!r}.")
+    return options
 
 
 def flex_attention_mask_builder(
@@ -122,11 +143,10 @@ def flex_attention_forward(
     # from the integer metadata.
     del sliding_window
 
-    kernel_options = dict(kwargs.pop("kernel_options", {}) or {})
     # PyTorch's AUTO backend may select Flex Decoding for short queries and then
     # fail during Inductor kernel selection. Use the standard Triton FlexAttention
     # kernel by default while preserving an explicit caller override.
-    kernel_options.setdefault("BACKEND", "TRITON")
+    kernel_options = _normalize_kernel_options(kwargs.pop("kernel_options", None))
 
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses

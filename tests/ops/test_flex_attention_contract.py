@@ -51,7 +51,9 @@ def _causal_block_mask(sequence_length: int, device: torch.device):
     )
 
 
-def test_flex_module_compute_slot_preserves_the_hf_adapter_contract_and_diagnostics(monkeypatch):
+@pytest.mark.parametrize("supports_backend", [False, True])
+def test_flex_module_compute_slot_preserves_the_hf_adapter_contract_and_diagnostics(monkeypatch, supports_backend):
+    monkeypatch.setattr(flex_backend, "_SUPPORTS_BACKEND_OPTION", supports_backend)
     captured = {}
 
     def replacement_backend(module, query, key, value, attention_mask, **kwargs):
@@ -94,12 +96,36 @@ def test_flex_module_compute_slot_preserves_the_hf_adapter_contract_and_diagnost
         "dropout": 0.0,
         "scaling": 0.19,
         "softcap": 30.0,
-        "kernel_options": kernel_options,
+        "kernel_options": (
+            kernel_options if supports_backend else {"FORCE_USE_FLEX_ATTENTION": True, "BLOCKS_ARE_CONTIGUOUS": True}
+        ),
         "output_attentions": False,
     }
     torch.testing.assert_close(output, query.transpose(1, 2) + 1)
     assert auxiliary is not None
     assert dict(build_ALL_OPS())["_flex_attention_forward"] is replacement_backend
+    assert kernel_options == {"BACKEND": "TRITON", "BLOCKS_ARE_CONTIGUOUS": True}
+
+
+@pytest.mark.parametrize("supports_backend", [False, True])
+@pytest.mark.parametrize("backend", [None, "TRITON", "AUTO", "FLASH"])
+def test_flex_kernel_options_support_old_and_new_torch(monkeypatch, supports_backend, backend):
+    monkeypatch.setattr(flex_backend, "_SUPPORTS_BACKEND_OPTION", supports_backend)
+    options = {"BLOCK_M": 64}
+    if backend is not None:
+        options["BACKEND"] = backend
+    original = options.copy()
+    if not supports_backend and backend == "FLASH":
+        with pytest.raises(ValueError, match="does not support FlexAttention BACKEND"):
+            flex_backend._normalize_kernel_options(options)
+    else:
+        expected = {"BLOCK_M": 64}
+        if supports_backend:
+            expected["BACKEND"] = backend or "TRITON"
+        elif backend != "AUTO":
+            expected["FORCE_USE_FLEX_ATTENTION"] = True
+        assert flex_backend._normalize_kernel_options(options) == expected
+    assert options == original
 
 
 def test_flex_attention_cpu_forward_uses_native_block_mask_and_hf_layout():
@@ -206,7 +232,9 @@ def test_flex_attention_rejects_unsupported_masks(monkeypatch):
         veomni_attention.flex_attention_forward(module, query, query, query, head_specific_mask)
 
 
-def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypatch):
+@pytest.mark.parametrize("supports_backend", [False, True])
+def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypatch, supports_backend):
+    monkeypatch.setattr(flex_backend, "_SUPPORTS_BACKEND_OPTION", supports_backend)
     captured = {}
 
     def fake_backend(module, query, key, value, attention_mask, **kwargs):
@@ -238,7 +266,9 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
 
     assert captured["attention_mask"] is block_mask
     assert "sliding_window" not in captured["kwargs"]
-    assert captured["kwargs"]["kernel_options"] == {"BACKEND": "TRITON"}
+    assert captured["kwargs"]["kernel_options"] == (
+        {"BACKEND": "TRITON"} if supports_backend else {"FORCE_USE_FLEX_ATTENTION": True}
+    )
     torch.testing.assert_close(output, query.transpose(1, 2))
     assert auxiliary is None
 

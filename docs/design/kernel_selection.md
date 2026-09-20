@@ -134,6 +134,11 @@ variants (`veomni_flash_attention_*_with_sp` and
 `veomni_flex_attention_with_sp`). All VeOmni names enter one
 `fused_attention_forward` facade and then dispatch to the selected backend.
 
+FlexAttention selects the standard Triton kernel by default. On older PyTorch
+versions without the `BACKEND` kernel option (including 2.8), VeOmni translates
+`BACKEND="TRITON"` to `FORCE_USE_FLEX_ATTENTION=True`; `BACKEND="AUTO"` leaves
+selection to PyTorch. Other explicit backends require the newer API.
+
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
 head-broadcast (`BlockMask.shape[1] == 1`) because rank-local head indices are
