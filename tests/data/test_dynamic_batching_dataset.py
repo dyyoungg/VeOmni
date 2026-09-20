@@ -46,9 +46,8 @@ import torch
 from tools import resolve_ops_overrides
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
-from transformers import PretrainedConfig
 from utils import (
-    FakeModel,
+    FakeModelRuntime,
     ShardedIterableDataset,
     ShardedMappingDataset,
     StepAwareResumeCheckpointerCallback,
@@ -75,7 +74,6 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import get_device_type
 
 
 logger = helper.create_logger(__name__)
@@ -604,7 +602,7 @@ def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi
         "--train.micro_batch_size=2",
         f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
@@ -642,18 +640,12 @@ class TrainerTest(BaseTrainer):
         self.multi_sample_per_iteration = multi_sample_per_iteration
         super().__init__(args)
 
-    def _setup(self):
-        self.device, _ = setup_test_distributed(self.args)
+    def _setup(self, args):
+        device, _ = setup_test_distributed(args)
+        return device
 
-    def _freeze_model_module(self):
-        pass
-
-    def _build_model(self):
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def _build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         pass
@@ -704,16 +696,10 @@ class TrainerTest(BaseTrainer):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
-        self.model.train()
-
-    def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
-
     def _build_lr_scheduler(self):
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+        self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
-    def _build_training_context(self):
+    def _build_training_context(self, model=None):
         self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
 

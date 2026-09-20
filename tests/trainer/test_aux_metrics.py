@@ -183,19 +183,23 @@ def _accumulating_trainer(outputs, recorded):
     """
     trainer = _bare_trainer()
     trainer.state = TrainerState(global_step=0)
-    trainer.model = SimpleNamespace()
-    trainer.optimizer = SimpleNamespace(step=lambda: None, zero_grad=lambda: None)
-    trainer.lr_scheduler = SimpleNamespace(step=lambda: None)
+    model_args = SimpleNamespace(
+        optimizer=SimpleNamespace(max_grad_norm=1.0),
+        accelerator=SimpleNamespace(
+            dp_replicate_size=1,
+            fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
+            offload_config=OffloadConfig(),
+        ),
+    )
+    trainer.model = SimpleNamespace(
+        clip_grad_norm=lambda: 0.0,
+        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+        lr_scheduler=SimpleNamespace(step=lambda: None),
+        args=model_args,
+    )
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
-            optimizer=SimpleNamespace(max_grad_norm=1.0),
-            accelerator=SimpleNamespace(
-                dp_replicate_size=1,
-                fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
-                offload_config=OffloadConfig(),
-            ),
-            sync_each_train_step=False,
-        )
+        train=SimpleNamespace(sync_each_train_step=False),
+        model=model_args,
     )
     trainer._callbacks = []
 
@@ -226,8 +230,7 @@ def run_train_step(request, monkeypatch):
     """Runs one training step through whichever trainer owns the loop."""
     module, wrapper_cls = _TRAIN_STEP_OWNERS[request.param]
     monkeypatch.setattr(module, "synchronize", lambda: None)
-    monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext())
-    monkeypatch.setattr(module, "veomni_clip_grad_norm", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
     # Single process: the all-reduce over the step's token denominators is the identity.
     monkeypatch.setattr(
         module, "reduce_global_loss_token", lambda token_len: {key: value.item() for key, value in token_len.items()}
@@ -324,7 +327,7 @@ def _environ_meter_callback(env_metrics=None, lr=None):
     callback.freeze_vit = None
     callback.trainer = SimpleNamespace(
         environ_meter=SimpleNamespace(step=lambda delta_time, global_step, **kwargs: dict(env_metrics or {})),
-        lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr]),
+        model=SimpleNamespace(lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr])),
     )
     return callback
 
@@ -396,3 +399,38 @@ def test_environ_meter_tolerates_a_step_without_aux_metrics(monkeypatch, aux_met
 
     assert callback.trainer.step_train_metrics["training/foundation_loss"] == pytest.approx(2.0)
     assert callback.trainer.step_train_metrics["training/grad_norm"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("model_kind", ["plain", "ddp", "runtime"])
+def test_environ_meter_initializes_for_both_trainer_ownership_models(monkeypatch, model_kind):
+    import veomni.trainer.callbacks.base as callback_base
+
+    config = object()
+    lora_config = {"rank": 8}
+    module = SimpleNamespace(get_lora_config=lambda: lora_config)
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(global_batch_size=4, empty_cache_steps=0, gc_steps=0, freeze_vit=False),
+            data=SimpleNamespace(enable_multisource=False, train_path="dataset"),
+        ),
+        train_dataloader=object(),
+    )
+    if model_kind == "runtime":
+        trainer.model = SimpleNamespace(unwrapped_module=module, model_config=config)
+    else:
+        trainer.model = module if model_kind == "plain" else SimpleNamespace(module=module)
+        trainer.model_config = config
+    captured = {}
+    meter = object()
+
+    def build_meter(**kwargs):
+        captured.update(kwargs)
+        return meter
+
+    monkeypatch.setattr(callback_base, "get_parallel_state", lambda: None)
+    monkeypatch.setattr(trace_callback_module.helper, "EnvironMeter", build_meter)
+    callback = trace_callback_module.EnvironMeterCallback(trainer)
+
+    assert trainer.environ_meter is meter
+    assert captured["config"] is config
+    assert callback.lora_config is lora_config

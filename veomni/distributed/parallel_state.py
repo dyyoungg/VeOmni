@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
+    from ..arguments import AcceleratorConfig
+
 
 logger = logging.get_logger(__name__)
 
@@ -208,7 +210,8 @@ class ParallelState:
         if self.sp_enabled and self.device_mesh is None:
             raise ValueError(
                 "A sequence-parallel ParallelState must be built with a device mesh "
-                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
+                "(use init_parallel_state_from_config); meshless sequence-parallel init "
+                "is no longer supported."
             )
 
         # Build the CPU (gloo) mirror of the Ulysses group and attach it to this
@@ -588,7 +591,7 @@ def clear_parallel_state() -> None:
     Drop the ambient state, topology cache, and named registry.
 
     Call after ``destroy_process_group()`` (or in test teardown) so a later
-    ``init_parallel_state`` with the same topology cannot reuse DeviceMesh /
+    ``_init_parallel_state`` with the same topology cannot reuse DeviceMesh /
     process groups from a destroyed distributed session.
     """
     global _PARALLEL_STATE
@@ -605,7 +608,7 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
-def init_parallel_state(
+def _init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
     dp_shard_size: int = 1,
@@ -626,8 +629,18 @@ def init_parallel_state(
     Initialize a parallel state, register it under ``name``, and set it as the
     global state when none is current yet.
 
-    If ``name`` is already registered, log a warning and return the existing
-    state without building, caching, or overwriting anything.
+    Private: every parallelism knob here also lives on
+    :class:`~veomni.arguments.AcceleratorConfig`, so a second mapping restated
+    at a call site is a second place to keep in sync. Production code goes
+    through :func:`init_parallel_state_from_config`. Tests call this
+    directly to build a topology no job config can express — a CPU mesh, or a
+    rank layout unrelated to ``WORLD_SIZE``.
+
+    If ``name`` is already registered, log at debug and return the existing
+    state without building, caching, or overwriting anything. Single-model
+    trainers hit this on every run: ``BaseTrainer._setup`` registers ``"base"``
+    and ``VeOmniModelRuntime.setup`` registers the same name from the same
+    accelerator. A warning there trains people to ignore warnings.
 
     ``name=None`` claims no registry key, for a caller that holds the returned
     state itself rather than looking it up later — it would otherwise have to
@@ -639,7 +652,7 @@ def init_parallel_state(
     global _PARALLEL_STATE
 
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
-        logger.warning(
+        logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
         return _PARALLEL_STATE_REGISTRY[name]
@@ -827,6 +840,30 @@ def init_parallel_state(
     if name is not None:
         _PARALLEL_STATE_REGISTRY[name] = parallel_state
     return parallel_state
+
+
+def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Optional[str]) -> "ParallelState":
+    """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
+
+    Every parallelism knob already lives on the config, so a caller that has one
+    should not be restating the mapping. Both a job's own mesh and a single
+    model's come through here.
+    """
+    return _init_parallel_state(
+        dp_size=accelerator.dp_size,
+        dp_replicate_size=accelerator.dp_replicate_size,
+        dp_shard_size=accelerator.dp_shard_size,
+        tp_size=accelerator.tp_size,
+        pp_size=accelerator.pp_size,
+        cp_size=accelerator.cp_size,
+        ulysses_size=accelerator.ulysses_size,
+        extra_parallel_sizes=accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=accelerator.extra_parallel_names,
+        dp_mode=accelerator.fsdp_config.fsdp_mode,
+        async_enabled=accelerator.enable_async,
+        name=name,
+    )
 
 
 def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:

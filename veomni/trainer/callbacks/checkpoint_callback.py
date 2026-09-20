@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from veomni.checkpoint import CheckpointerBase, build_checkpointer
 from veomni.models import save_model_assets
+from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.utils import helper
 from veomni.utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from veomni.trainer.callbacks.base import Callback, TrainerState
@@ -40,10 +41,22 @@ class CheckpointerCallback(Callback):
         self.every_n_steps = args.train.checkpoint.save_steps
         self.every_n_epochs = args.train.checkpoint.save_epochs
         self._last_saved_step: int = -1
+        accelerator = args.model.accelerator if self._uses_runtime else args.train.accelerator
+        if self._uses_runtime:
+            self.parallel_state = trainer.model.parallel_state
         self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
-            dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+            dist_backend=accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
         )
         self.save_total_limit = getattr(args.train.checkpoint, "save_total_limit", None)
+
+    @property
+    def _uses_runtime(self):
+        return isinstance(self.trainer.model, VeOmniModelRuntime)
+
+    @property
+    def _model_owner(self):
+        """Locate model state without changing the legacy checkpoint payload."""
+        return self.trainer.model if self._uses_runtime else self.trainer
 
     def on_step_end(self, state: TrainerState, **kwargs):
         if self.every_n_steps and state.global_step % self.every_n_steps == 0:
@@ -76,8 +89,8 @@ class CheckpointerCallback(Callback):
             return
 
         state = {
-            "model": self.trainer.model,
-            "optimizer": self.trainer.optimizer,
+            "model": self._model_owner.model,
+            "optimizer": self._model_owner.optimizer,
             "extra_state": {},
         }
 
@@ -93,9 +106,12 @@ class CheckpointerCallback(Callback):
         extra = state["extra_state"]
         self.trainer.state.global_step = extra["global_step"]
         self.trainer.state.start_epoch = extra["start_epoch"]
-        self.trainer.state.start_step  = extra["start_step"]
+        self.trainer.state.start_step = extra["start_step"]
+        if self._uses_runtime:
+            self.trainer.start_epoch = extra["start_epoch"]
+            self.trainer.start_step = extra["start_step"]
 
-        self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+        self._model_owner.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
         channel_loss_state = state["extra_state"].get("channel_loss_callback")
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
@@ -111,7 +127,7 @@ class CheckpointerCallback(Callback):
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
-        if self.trainer.state.start_step == 0:
+        if self.trainer.state.start_step == 0 and self.trainer.train_dataloader is not None:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
 
@@ -132,15 +148,23 @@ class CheckpointerCallback(Callback):
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
 
+        if self._uses_runtime:
+            start_epoch, start_step = divmod(state.global_step, args.train_steps)
+        else:
+            start_epoch, start_step = self.trainer.current_epoch, self.trainer.current_step
+        dataloader = self.trainer.train_dataloader
+        if self._uses_runtime and hasattr(getattr(self.trainer, "data_iterator", None), "state_dict"):
+            dataloader = self.trainer.data_iterator
+
         ckpt_state = {
-            "model": self.trainer.model,
-            "optimizer": self.trainer.optimizer,
+            "model": self._model_owner.model,
+            "optimizer": self._model_owner.optimizer,
             "extra_state": {
                 "global_step": state.global_step,
-                "start_epoch":  self.trainer.current_epoch,   # 当前是第几个 epoch
-                "start_step":   self.trainer.current_step,    # 当前 epoch 内跑完了第几步
-                "train_dataloader": self.trainer.train_dataloader.state_dict(),
-                "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
+                "start_epoch": start_epoch,
+                "start_step": start_step,
+                "train_dataloader": dataloader.state_dict() if dataloader is not None else None,
+                "lr_scheduler": self._model_owner.lr_scheduler.state_dict(),
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "channel_loss_callback": channel_loss_state,
                 "torch_rng_state": torch.get_rng_state(),
@@ -257,7 +281,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def _save_model_assets(self):
         args: "VeOmniArguments" = self.trainer.args
         if args.train.global_rank == 0:
-            save_model_assets(args.train.checkpoint.model_assets_dir, self.trainer.model_assets)
+            save_model_assets(args.train.checkpoint.model_assets_dir, self._model_owner.model_assets)
         dist.barrier()
 
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
@@ -276,11 +300,11 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
         logger.info_rank0(f"Saving HF weights to {hf_weights_path} ...")
         save_hf_safetensor(
             save_hf_safetensor_path=hf_weights_path,
-            model_assets=self.trainer.model_assets,
+            model_assets=self._model_owner.model_assets,
             ckpt_manager=args.train.checkpoint.manager,
             output_dir=args.train.checkpoint.output_dir,
             save_checkpoint_path=save_checkpoint_path,
-            model=self.trainer.model,
+            model=self._model_owner.model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
             is_rank_0=args.train.global_rank == 0,
             parallel_state=self.parallel_state,
@@ -308,13 +332,13 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             dist.barrier()
 
         if stage == "train_end":
-            self.trainer.optimizer = None
-            self.trainer.lr_scheduler = None
+            self._model_owner.optimizer = None
+            self._model_owner.lr_scheduler = None
 
         lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
         logger.info_rank0(f"Saving LoRA adapter to {lora_save_path} ...")
         save_lora_adapter_with_dcp(
-            model=self.trainer.model,
+            model=self._model_owner.model,
             save_path=lora_save_path,
             adapter_name="default",
         )

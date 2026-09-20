@@ -370,10 +370,16 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
-        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        # LoRA config lives on VeOmniLoraModel, which DDP does not forward.
+        module = getattr(trainer.model, "unwrapped_module", trainer.model)
+        module = getattr(module, "module", module)
+        model_config = getattr(trainer.model, "model_config", None)
+        if model_config is None:
+            model_config = trainer.model_config
+        self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
-            config=trainer.model_config,
+            config=model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,

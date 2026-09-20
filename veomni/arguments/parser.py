@@ -15,6 +15,7 @@
 import argparse
 import dataclasses
 import os
+from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from typing import Any, Dict, Literal, Type, TypeVar, Union, get_type_hints
@@ -115,13 +116,84 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             parser.add_argument(f"--{arg_name}", **kwargs)
 
 
-def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
+def _legacy_config_layout(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize model-local input to the public pre-merge YAML layout.
+
+    Equal or disjoint settings can be combined. Conflicting values must not
+    silently select a different optimizer or parallel topology.
+    """
+    config = deepcopy(config)
+    model = config.setdefault("model", {})
+    train = config.setdefault("train", {})
+    data = config.setdefault("data", {})
+
+    def merge(destination, key, value, path):
+        if key not in destination:
+            destination[key] = value
+        elif isinstance(destination[key], dict) and isinstance(value, dict):
+            for child, child_value in value.items():
+                merge(destination[key], child, child_value, f"{path}.{child}")
+        elif destination[key] != value:
+            raise ValueError(f"Conflicting legacy and model-local settings for {path}.")
+
+    for name in ("accelerator", "optimizer", "broadcast_model_weights_from_rank0", "ep_sharded_stream_load"):
+        if name in model:
+            merge(train, name, model.pop(name), f"train.{name}")
+    accelerator = train.get("accelerator", {})
+    if isinstance(accelerator, dict):
+        for name in ("init_device", "gradient_checkpointing", "torch_compile"):
+            if name in accelerator:
+                merge(train, name, accelerator.pop(name), f"train.{name}")
+    if "chat_template" in model:
+        merge(data, "chat_template", model.pop("chat_template"), "data.chat_template")
+
+    # Older experiment YAMLs often include these values. torchrun's environment
+    # has always been authoritative; never reuse ranks from a saved run.
+    for name in ("local_rank", "global_rank", "world_size"):
+        train.pop(name, None)
+    # Empty groups created by normalization are not CLI overrides of YAML.
+    for name in ("model", "train", "data"):
+        if config[name] == {}:
+            del config[name]
+    return config
+
+
+def _is_training_config(cls: Type[Any]) -> bool:
+    from .arguments_types import VeOmniArguments
+
+    return isinstance(cls, type) and issubclass(cls, VeOmniArguments)
+
+
+def _reject_unknown_keys(cls: Type[Any], config_dict: Dict[str, Any], path: str) -> None:
+    """Fail on config keys the dataclass does not declare.
+
+    Silently dropping them is how a moved knob keeps its old default while the
+    config still looks like it sets something.
+    """
+    known = {field_info.name for field_info in dataclasses.fields(cls)}
+    unknown = [key for key in config_dict if key not in known]
+    if not unknown:
+        return
+
+    problems = []
+    for key in unknown:
+        dotted = f"{path}.{key}" if path else key
+        problems.append(f"  {dotted} is not a field of {cls.__name__} (known: {', '.join(sorted(known))})")
+
+    raise ValueError("Invalid configuration keys:\n" + "\n".join(problems))
+
+
+def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any], path: str = "") -> T:
     """
     Recursively convert a dictionary into Dataclass instances.
     This triggers __post_init__ validation at every level.
     """
     if not is_dataclass(cls):
         return config_dict
+
+    if _is_training_config(cls):
+        config_dict = _legacy_config_layout(config_dict)
+    _reject_unknown_keys(cls, config_dict, path)
 
     try:
         type_hints = get_type_hints(cls)
@@ -150,7 +222,8 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
 
         # If the field expects a Dataclass and we have a dict, recurse
         if is_dataclass(field_type) and isinstance(raw_value, dict):
-            field_values[field_name] = _instantiate_recursive(field_type, raw_value)
+            child_path = f"{path}.{field_name}" if path else field_name
+            field_values[field_name] = _instantiate_recursive(field_type, raw_value, child_path)
         else:
             field_values[field_name] = raw_value
 
@@ -193,6 +266,9 @@ def parse_args(root_class: Type[T]) -> T:
             current_level = current_level[k]
         current_level[keys[-1]] = value
 
+    if _is_training_config(root_class):
+        final_config = _legacy_config_layout(final_config)
+        cli_config = _legacy_config_layout(cli_config)
     final_config = _deep_update(final_config, cli_config)
 
     return _instantiate_recursive(root_class, final_config)
@@ -219,7 +295,10 @@ def save_args(args: T, output_path: str) -> None:
 
     # Save as YAML
     with open(local_path, "w") as f:
-        f.write(yaml.safe_dump(asdict(args), default_flow_style=False))
+        config = asdict(args)
+        if _is_training_config(type(args)):
+            config = _legacy_config_layout(config)
+        f.write(yaml.safe_dump(config, default_flow_style=False))
 
     if remote_dir is not None:
         if not exists(remote_dir):

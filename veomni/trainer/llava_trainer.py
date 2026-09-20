@@ -44,7 +44,7 @@ from veomni.data.llavaomni_dataloader import get_eval_dataloader, get_train_data
 from veomni.data.ulysess_dataloader import PrefetchingPackedLoader, make_ulysses_train_dataloader
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import init_parallel_state_from_config
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, build_tokenizer
 from veomni.models.custom.llava_qwen3moe.auto import build_qwen3moe_omni_from_pretrained
@@ -299,20 +299,7 @@ class VLMTrainer:
         logger.info(f"Process rank: {self.args.train.global_rank}, {device_str}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
-        init_parallel_state(
-            dp_size=self.args.train.accelerator.dp_size,
-            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.train.accelerator.dp_shard_size,
-            tp_size=self.args.train.accelerator.tp_size,
-            pp_size=self.args.train.accelerator.pp_size,
-            cp_size=self.args.train.accelerator.cp_size,
-            ulysses_size=self.args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
-            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.enable_async,
-        )
+        init_parallel_state_from_config(self.args.train.accelerator, name="base")
 
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)

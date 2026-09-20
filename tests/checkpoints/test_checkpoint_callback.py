@@ -14,6 +14,7 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointerCallback,
     HuggingfaceCkptCallback,
+    VeOmniModelRuntime,
 )
 
 
@@ -110,6 +111,8 @@ class TestCheckpointerCallbackLastSavedStep:
         def load_checkpoint(path, state, **kwargs):
             state["extra_state"] = {
                 "global_step": 7,
+                "start_epoch": 0,
+                "start_step": 7,
                 "lr_scheduler": {},
                 "train_dataloader": None,
                 "environ_meter": {},
@@ -149,8 +152,8 @@ class TestCheckpointerCallbackLastSavedStep:
         assert trainer.checkpointer.save.call_count == 1
         assert cb._last_saved_step == 5
 
-    def test_epoch_end_skips_after_successful_step_save(self, mock_helper, mock_dist, mock_build_ckpt):
-        """If save succeeds at step_end, epoch_end should skip duplicate save."""
+    def test_epoch_end_preserves_unconditional_legacy_save(self, mock_helper, mock_dist, mock_build_ckpt):
+        """The pre-merge local trainer saves at epoch end even after a step save."""
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = trainer.checkpointer
         cb = CheckpointerCallback(trainer)
@@ -164,8 +167,7 @@ class TestCheckpointerCallbackLastSavedStep:
 
         trainer.checkpointer.save.reset_mock()
         cb.on_epoch_end(state)
-        # Should skip — no new save call
-        trainer.checkpointer.save.assert_not_called()
+        trainer.checkpointer.save.assert_called_once()
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.save_hf_safetensor")
@@ -176,6 +178,7 @@ class TestCheckpointerCallbackLastSavedStep:
 class TestHuggingfaceCkptCallbackLastSavedStep:
     """Tests for HuggingfaceCkptCallback._last_saved_step placement."""
 
+    @pytest.mark.xfail(strict=True, reason="Pre-merge HF export does not record its step when the DCP already exists.")
     def test_last_saved_step_updated_after_successful_hf_save(
         self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
     ):
@@ -225,8 +228,8 @@ class TestHuggingfaceCkptCallbackLastSavedStep:
         # train_end should NOT skip because _last_saved_step was not updated
         cb.on_train_end(state)
         assert mock_save_hf.call_count == 1
-        assert cb._last_saved_step == 5
 
+    @pytest.mark.xfail(strict=True, reason="Pre-merge HF export can repeat at train end; retain that behavior in rollback.")
     def test_train_end_skips_after_successful_step_save(
         self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
     ):
@@ -244,3 +247,77 @@ class TestHuggingfaceCkptCallbackLastSavedStep:
         mock_save_hf.reset_mock()
         cb.on_train_end(state)
         mock_save_hf.assert_not_called()
+
+
+@pytest.mark.parametrize("use_runtime", [False, True])
+@pytest.mark.parametrize("has_dataloader", [False, True])
+def test_legacy_checkpoint_payload_roundtrip(tmp_path, use_runtime, has_dataloader):
+    """Both trainer interfaces keep the pre-merge payload, paths and resume cursor."""
+    trainer = _make_mock_trainer(save_path=str(tmp_path))
+    trainer.current_epoch = 2
+    trainer.current_step = 3
+    trainer.args.train_steps = 10
+    trainer.args.model.lora_config = None
+    trainer.lr_scheduler.state_dict.return_value = {"last_epoch": 23}
+    trainer.train_dataloader.state_dict.return_value = {"position": 23}
+    trainer.environ_meter.state_dict.return_value = {"tokens": 230}
+    trainer.channel_loss_callback.state_dict.return_value = {"channel": 1}
+    if not has_dataloader:
+        trainer.train_dataloader = None
+
+    model = trainer.model
+    optimizer = trainer.optimizer
+    scheduler = trainer.lr_scheduler
+    if use_runtime:
+        runtime = MagicMock(spec=VeOmniModelRuntime)
+        runtime.model = model
+        runtime.optimizer = optimizer
+        runtime.lr_scheduler = scheduler
+        runtime.model_assets = trainer.model_assets
+        runtime.parallel_state = SimpleNamespace(global_rank=0)
+        trainer.model = runtime
+        trainer.args.model.accelerator = trainer.args.train.accelerator
+        del trainer.args.train.accelerator
+        del trainer.optimizer
+        del trainer.lr_scheduler
+        del trainer.data_iterator
+
+    with (
+        patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer", return_value=trainer.checkpointer),
+        patch("veomni.trainer.callbacks.checkpoint_callback.dist"),
+        patch("veomni.trainer.callbacks.checkpoint_callback.helper"),
+    ):
+        cb = CheckpointerCallback(trainer)
+        cb._save_checkpoint(TrainerState(global_step=23))
+        path, payload = trainer.checkpointer.save.call_args.args
+        assert path == str(tmp_path / "global_step_23")
+        assert set(payload) == {"model", "optimizer", "extra_state"}
+        assert payload["model"] is model
+        assert payload["optimizer"] is optimizer
+        assert payload["extra_state"]["start_epoch"] == 2
+        assert payload["extra_state"]["start_step"] == 3
+        assert payload["extra_state"]["lr_scheduler"] == {"last_epoch": 23}
+        assert payload["extra_state"]["train_dataloader"] == ({"position": 23} if has_dataloader else None)
+        assert "stage_dir" not in trainer.checkpointer.save.call_args.kwargs
+        if use_runtime:
+            assert trainer.checkpointer.save.call_args.kwargs["parallel_state"] is runtime.parallel_state
+
+        trainer.args.train.checkpoint.load_path = path
+
+        def load_checkpoint(load_path, target, **kwargs):
+            assert load_path == path
+            assert target["model"] is model
+            assert target["optimizer"] is optimizer
+            target["extra_state"] = payload["extra_state"]
+
+        trainer.checkpointer.load.side_effect = load_checkpoint
+        cb._load_checkpoint()
+        assert trainer.state.global_step == 23
+        assert trainer.state.start_epoch == 2
+        assert trainer.state.start_step == 3
+        if use_runtime:
+            assert trainer.start_epoch == 2
+            assert trainer.start_step == 3
+        scheduler.load_state_dict.assert_called_once_with({"last_epoch": 23})
+        if has_dataloader:
+            trainer.train_dataloader.load_state_dict.assert_called_once_with({"position": 23})
