@@ -78,7 +78,7 @@ def unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
     """Remove the last `padding_size` slices along `dim`."""
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(0, -padding_size)
-    return x[slc]
+    return x[tuple(slc)]
 
 class BeeBeeVLQwen35MoeVisionModelConfig(BaseEncoderConfigMixin, Qwen3_5MoeVisionConfig):
    

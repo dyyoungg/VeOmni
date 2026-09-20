@@ -31,7 +31,7 @@ from veomni.data.multimodal.image_utils import get_adaptive_pool_size
 from veomni.data.data_collator import UlysessOmniDataSharderCollator
 from veomni.data.llavaomni_processor import OmniSampleProcessor, LongVideoProcessor
 from veomni.distributed.sequence_parallel import get_data_parallel_rank, get_data_parallel_world_size, get_ulysses_sequence_parallel_cpu_group
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state, _init_parallel_state
 from veomni.utils.logging import get_logger
 from veomni.utils.helper import read_data
 from veomni.data.ulysses_protocol import RecordState, SynchronizedDataError, synchronize_records
@@ -1064,7 +1064,7 @@ def test_ulysess(args=None):
         world_size = dist.get_world_size()
         if world_size % sp_size:
             raise ValueError(f"world_size={world_size} must be divisible by SP_SIZE={sp_size}")
-        init_parallel_state(
+        _init_parallel_state(
             dp_size=world_size // sp_size,
             ulysses_size=sp_size,
             device_type="cuda" if use_cuda else "cpu",
