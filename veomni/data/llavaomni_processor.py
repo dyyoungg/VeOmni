@@ -133,7 +133,7 @@ class OmniSampleProcessor:
         self.video_merge_size = 2
         self.image_patch_size = IMAGE_PACTH_SIZE
         self.image_factor = IMAGE_PACTH_SIZE * 2
-        self._rng = random.Random()
+        self._rng = random
  
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
         if dist.is_initialized() and get_parallel_state() is not None:
@@ -300,8 +300,8 @@ class OmniSampleProcessor:
 
         # Audio volume augmentation
         if getattr(self.training_args, "audio_volume_augmentation", False):
-            if random.random() < self.audio_volume_augmentation_prob:
-                gain_db = random.uniform(*self.audio_volume_gain_range)
+            if self._rng.random() < self.audio_volume_augmentation_prob:
+                gain_db = self._rng.uniform(*self.audio_volume_gain_range)
                 y = self._augment_audio_volume(y, gain_db)
 
         return torch.from_numpy(y), sr
@@ -328,7 +328,7 @@ class OmniSampleProcessor:
         if image_merge_size is None:
             image_merge_size = self.image_merge_size
         if self.training_args.jpeg_image_augmentation:
-            quality = random.choice(self.jpeg_degrade_qualities)
+            quality = self._rng.choice(self.jpeg_degrade_qualities)
             image = jpeg_degrade(image, quality)
         fix_size = (
             self.model_args.mm_image_size if self.training_args.fix_image_size else None
@@ -477,10 +477,10 @@ class OmniSampleProcessor:
             available_frames = list(range(start_frame, end_frame))
             # 无放回随机抽样
             if len(available_frames) >= desired_num_frames:
-                seq = random.sample(available_frames, desired_num_frames)
+                seq = self._rng.sample(available_frames, desired_num_frames)
             # 有放回抽样（允许重复帧）
             else:
-                seq = random.choices(available_frames, k=desired_num_frames)
+                seq = self._rng.choices(available_frames, k=desired_num_frames)
             
             # 排序以保证时间顺序是从前到后的
             seq.sort()
@@ -489,7 +489,7 @@ class OmniSampleProcessor:
             step = max(1, int(framerate / sample_fps))
             seq = list(range(start_frame, end_frame, step))
             if len(seq) > desired_num_frames:
-                seq = sorted(random.sample(seq, desired_num_frames))
+                seq = sorted(self._rng.sample(seq, desired_num_frames))
         else:
             seg = float((total_num_frames - 1) / desired_num_frames)
             seq = []
@@ -539,7 +539,7 @@ class OmniSampleProcessor:
         if isinstance(sample_data, dict):
             random_sample = sample_data.get("random_sample", False)
             if random_sample:
-                if random.random() < 0.1: print('use random_sample')
+                if self._rng.random() < 0.1: print('use random_sample')
 
         try:
            
@@ -1516,7 +1516,7 @@ class OmniSampleProcessor:
         if getattr(self.model_args, "dynamic_downsample", False):
             candidates = getattr(self.model_args, "dynamic_downsample_ratios", _DYNAMIC_DS_RATIOS)
             weights = getattr(self.model_args, "dynamic_downsample_weights", _DYNAMIC_DS_WEIGHTS)
-            return random.choices(candidates, weights=weights, k=1)[0]
+            return self._rng.choices(candidates, weights=weights, k=1)[0]
         else:
             return self.model_args.mm_downsample_ratio
 
@@ -1898,7 +1898,7 @@ class LongVideoProcessor(OmniSampleProcessor):
                             cur_token_num += 1
 
                 # 追加文本
-                sub_text = random.choice(sub['image_line']) if 'image_line' in sub else sub['text']
+                sub_text = self._rng.choice(sub['image_line']) if 'image_line' in sub else sub['text']
                 text_tensor = torch.tensor(self.tokenizer(sub_text)["input_ids"], dtype=torch.long)
                 
                 cur_tokens.append(text_tensor)
@@ -2065,8 +2065,9 @@ class LongVideoProcessor(OmniSampleProcessor):
             input_ids=flat_tokens, 
             labels=flat_labels, 
             image_thw=None, 
-            video_thw=video_grid_thw, 
-            audio_feature_len=[]
+            video_thw=video_grid_thw,
+            audio_feature_len=[],
+            downsample_ratio=selected_downsample_ratio,
         )
         
         video_downsample_ratios = None
@@ -2334,7 +2335,7 @@ class ProactiveVideoProcessor(LongVideoProcessor):
                     label_token[:len(prefix_token)] = IGNORE_INDEX
 
                     if sub.get('active_line'):
-                        assistant_text_token = self._build_inputs_token(random.choice(sub['active_line']), input_type='assistant')
+                        assistant_text_token = self._build_inputs_token(self._rng.choice(sub['active_line']), input_type='assistant')
                         prefix_asst_token = self._build_inputs_token(input_type='assistant_prefix')
                         assistant_label_token = assistant_text_token.clone()
                         assistant_label_token[:len(prefix_asst_token)] = IGNORE_INDEX

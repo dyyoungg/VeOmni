@@ -281,10 +281,28 @@ class DynamicAvgPoolProjector(nn.Module):
         
 
 
-def build_image_projector(projector_type, encoder_hidden, out_hidden, downsample_ratio):
+def build_image_projector(
+    projector_type,
+    encoder_hidden,
+    out_hidden,
+    downsample_ratio,
+    *,
+    num_attention_heads=32,
+    attention_dropout=0.0,
+):
     # print("image encoder", encoder_hidden, out_hidden, downsample_ratio)
-    if projector_type== "dynamic_avgpool":
+    if projector_type == "dynamic_avgpool":
         return DynamicAvgPoolProjector(encoder_hidden, out_hidden, downsample_ratio)
+    elif projector_type == "frame_varlen_attention":
+        from .projector_frame_attention import FrameVarlenAttentionProjector
+
+        return FrameVarlenAttentionProjector(
+            encoder_hidden,
+            out_hidden,
+            downsample_ratio,
+            num_attention_heads=num_attention_heads,
+            attention_dropout=attention_dropout,
+        )
     else:
         raise NotImplementedError
 
@@ -299,8 +317,6 @@ def build_audio_projector(projector_type, encoder_hidden, out_hidden, downsample
         return AudioMLPChannelProjector(encoder_hidden, out_hidden, downsample_ratio)
     else:
         raise NotImplementedError
-
-
 
 
 

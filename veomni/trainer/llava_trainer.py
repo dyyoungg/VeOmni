@@ -18,6 +18,7 @@ import json
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional
 import contextlib
 
@@ -40,7 +41,7 @@ from veomni.arguments import (
     save_args,
 )
 from veomni.data.llavaomni_dataloader import get_eval_dataloader, get_train_dataloader
-from veomni.data.ulysess_dataloader import make_ulysses_train_dataloader
+from veomni.data.ulysess_dataloader import PrefetchingPackedLoader, make_ulysses_train_dataloader
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import init_parallel_state
@@ -228,7 +229,10 @@ class VLMMModelArguments(ModelArguments):
     mm_downsample_ratio: int = field(default=16)
     dynamic_downsample: bool = field(default=False, metadata={"help": "Enable dynamic downsample ratio during training"})
     dynamic_downsample_ratios: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 12], metadata={"help": "Candidate downsample ratios for dynamic selection"})
-    dynamic_downsample_weights: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16], metadata={"help": "Weights for dynamic downsample ratios"})
+    dynamic_downsample_weights: List[float] = field(
+        default_factory=lambda: [1.0, 2.0, 4.0, 8.0, 16.0],
+        metadata={"help": "Weights for dynamic downsample ratios"},
+    )
     audio_downsample_ratio: int = field(default=10)
     audio_frame_length: int = field(default=320)
     num_mel_bins: Optional[int] = field(default=128)
@@ -285,8 +289,12 @@ class VLMTrainer:
 
         # Initialize distributed process group
         if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend(),
-                                    device_id=torch.device(device_str))
+            # Allow rank-0 HF export to finish while other ranks wait at the barrier.
+            dist.init_process_group(
+                backend=get_dist_comm_backend(),
+                device_id=torch.device(device_str),
+                timeout=timedelta(minutes=60),
+            )
        
         logger.info(f"Process rank: {self.args.train.global_rank}, {device_str}, world size: {self.args.train.world_size}")
 
@@ -560,17 +568,15 @@ class VLMTrainer:
             dp_world_size = get_data_parallel_world_size()
         else:
             dp_world_size = int(os.environ.get('WORLD_SIZE', 1))
-        if args.train.remote_dataloader:
+        if isinstance(self.train_dataloader, PrefetchingPackedLoader):
+            # Shards may differ by one raw sample. All DP ranks must use the
+            # same single-epoch total for the sample-based LR schedule.
+            count = torch.tensor([len(self.train_dataloader.data_list)], dtype=torch.long, device=self.device)
+            if dist.is_initialized():
+                dist.all_reduce(count, group=get_parallel_state().dp_group)
+            self.init_data_size = int(count.item())
+        elif args.train.remote_dataloader:
             self.init_data_size = len(self.train_dataloader.data_list)
-
-        elif hasattr(self.train_dataloader, "num_train_epochs"):
-            # Ulysses PrefetchingPackedLoader: data_list is single-epoch per DP rank.
-            # Total samples across all epochs = per_rank * dp_world_size * num_epochs.
-            self.init_data_size = (
-                len(self.train_dataloader.data_list)
-                * dp_world_size
-                * self.train_dataloader.num_train_epochs
-            )
         else:
             self.init_data_size = len(self.train_dataloader.data_list) * dp_world_size
 
@@ -1028,6 +1034,8 @@ class VLMTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
+        if isinstance(self.train_dataloader, PrefetchingPackedLoader):
+            self.train_dataloader.mark_batch_consumed()
         self._sync_video_trained_num(epoch)
 
         warmup_steps = int(
@@ -1098,36 +1106,44 @@ class VLMTrainer:
 
             self.on_epoch_begin()
             start = self.start_step
+            self.current_step = start
+            stop_training = False
+            try:
+                # Packing makes this an estimated upper bound for every loader.
+                for step in range(start, self.init_data_size):
+                    self.current_step = step
+                    try:
+                        micro_batches = next(data_iterator)
+                        has_data = int(micro_batches is not None and len(micro_batches) > 0)
+                    except StopIteration:
+                        micro_batches = None
+                        has_data = 0
+                    except Exception:
+                        logger.exception(f"rank:{args.train.global_rank} Dataloader failed; stopping training.")
+                        micro_batches = None
+                        has_data = -1
 
-            for step in range(start, self.init_data_size):
-                self.current_step = step
-                try:
-                    micro_batches = next(data_iterator)
-                    has_data = 1
-                except:
-                    import traceback
-                    traceback.print_exc()
-                    logger.info(f"epoch:{epoch} rank:{self.args.train.global_rank} Dataloader finished.")
-                    micro_batches = None
-                    has_data = 0
+                    if dist.is_initialized():
+                        status_tensor = torch.tensor([has_data], dtype=torch.long, device=self.device)
+                        dist.all_reduce(status_tensor, op=dist.ReduceOp.MIN)
+                        has_data = int(status_tensor.item())
+                    if has_data <= 0:
+                        stop_training = has_data < 0
+                        logger.info(
+                            f"rank:{args.train.global_rank} No synchronized batch available; "
+                            f"stopping {'training' if stop_training else 'epoch'}."
+                        )
+                        break
+                    self.train_step(epoch, micro_batches)
+            finally:
+                self.train_dataloader.close()
 
-                if dist.is_initialized():
-                    status_tensor = torch.tensor([has_data], dtype=torch.long, device=self.device)
-                    dist.all_reduce(status_tensor, op=dist.ReduceOp.MIN)
-                    should_continue = (status_tensor.item() == 1)
-                else:
-                    should_continue = (has_data == 1)
-                
-                if not should_continue:
-                    logger.info(f"rank:{self.args.train.global_rank} Data exhausted on one or more ranks, stopping cleanly.")
-                    break
-                self.train_step(epoch, micro_batches)
-
-
+            if stop_training:
+                break
             self.start_step = 0
+            # Save the current epoch/cursor; the next loop owns set_epoch().
             self.on_epoch_end()
             dist.barrier()
-            self.train_dataloader.close()
 
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 

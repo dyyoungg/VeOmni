@@ -369,6 +369,8 @@ class BeeBeeVLQwen35MoeVisionModel(BaseEncoderModelMixin, Qwen3_5MoeViTPretraine
             encoder_hidden=config.hidden_size * config.spatial_merge_size ** 2,
             out_hidden=config.output_size,
             downsample_ratio=config.image_downsample_size,
+            num_attention_heads=getattr(config, "image_projector_num_attention_heads", 32),
+            attention_dropout=getattr(config, "image_projector_attention_dropout", 0.0),
         )
         self._encoder_data_balance: Optional[Qwen3VLEncoderDataBalance] = None
         self.freeze_vit = False

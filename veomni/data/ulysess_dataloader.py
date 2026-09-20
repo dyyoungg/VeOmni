@@ -3,7 +3,7 @@ import os
 import json
 import time
 import random
-from typing import Optional, List, Dict, Any, Callable, Tuple, Iterator
+from typing import Optional, List, Dict, Any, Tuple, Iterator
 import types
 import traceback
 import heapq
@@ -11,7 +11,7 @@ import queue
 import threading
 import datetime
 import pickle
-import gc
+import hashlib
 
 
 import math
@@ -34,7 +34,7 @@ from veomni.distributed.sequence_parallel import get_data_parallel_rank, get_dat
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.utils.logging import get_logger
 from veomni.utils.helper import read_data
-from veomni.utils.constants import get_image_video_audio_placeholder
+from veomni.data.ulysses_protocol import RecordState, SynchronizedDataError, synchronize_records
 
 try:
     from baidubce.bce_client_configuration import BceClientConfiguration
@@ -126,13 +126,18 @@ class UlysessOmniProcessor:
                     bos_client=self.bos_client,
                     rank=self.rank,
                     build_inputs_token_fn=self.build_inputs_token,
-                    preprocess_workers=getattr(self.data_args, "preprocess_workers", 2),)
+                    preprocess_workers=1,)
             self.longvideo_processor.init_image_processor()
 
 
     
     def __call__(self, sample_data: Dict[str, Any], sample_idx) -> Optional[Dict[str, Any]]:
         self.init_image_processor()
+        # A raw sample owns its RNG, so worker scheduling and earlier failures do
+        # not change its augmentation or chunking when replayed after a checkpoint.
+        seed = f"{getattr(self.training_args, 'seed', 42)}:{self.epoch}:{sample_idx}"
+        self.processor._rng = random.Random(seed)
+        self.longvideo_processor._rng = random.Random(seed)
         if "subtitles" in sample_data:
             # Generator返回 generator 对象，不执行内部代码
             return self.longvideo_processor.process(sample_data, sample_idx)
@@ -271,7 +276,7 @@ class UlyssesStreamingDataset(IterableDataset):
  
     def _get_shuffled_data(self) -> List:
         g = torch.Generator()
-        g.manual_seed(self.epoch + 42)
+        g.manual_seed(self.epoch + getattr(self.training_args, "seed", 42))
         perm = torch.randperm(len(self.data_list), generator=g).tolist()
         return [self.data_list[i] for i in perm]
 
@@ -298,79 +303,34 @@ class UlyssesStreamingDataset(IterableDataset):
         line = fh.readline()
         return json.loads(line)
  
-    @staticmethod
-    def _iterate_with_lookahead(iterable):
-        """Yield (item, is_last) pairs; is_last=True for the final element."""
-        it = iter(iterable)
-        try:
-            prev = next(it)
-        except StopIteration:
-            return
-        for item in it:
-            yield prev, False
-            prev = item
-        yield prev, True
- 
- 
     def __iter__(self):
-       
         self._init_processor()
- 
+        self._processor.epoch = self.epoch
         data = self._get_shuffled_data()
         worker_info = get_worker_info()
         num_workers = worker_info.num_workers if worker_info else 1
-        worker_id   = worker_info.id          if worker_info else 0
-
-        total_shards    = num_workers
-        current_shard   = worker_id
-
-        # Resume support: skip already-consumed samples
-        data = data[self.skip_samples_count :]
-        global_idx    = self.skip_samples_count
-        local_counter = self.skip_samples_count
-        self.skip_samples_count = 0  # reset so next epoch starts fresh
- 
-        for i, item in enumerate(data):
-            try:
-                if global_idx % total_shards == current_shard:
-
-                    try:
-                        # offset 模式：item 是 offset 数组的 global index，按需读取
-                        sample_data = self._read_sample_by_offset(item) if self.use_offset else item
-                        result = self._processor(sample_data, sample_idx=local_counter)
-                        if result is not None:
-                            if isinstance(result, (list, types.GeneratorType)):
-                                sub_idx = 0
-                                for sub_item, is_last in self._iterate_with_lookahead(result):
-                                    yield (global_idx, sub_idx, is_last, sub_item)
-                                    sub_idx += 1
-                                result = None
-                            else:
-                                yield (global_idx, 0, True, result)
-                                result = None
-                        else:
-                            yield (global_idx, 0, True, None)
-                            result = None
-                        # print(f"rank {self.rank}, sample idx: {global_idx}")
-                        local_counter += 1
-                        if local_counter % 50 == 0:
-                            time.sleep(0.001)  # yield GIL briefly
-                            gc.collect()
-    
-                    except Exception as e:
-                        traceback.print_exc()
-                        logger.warning(
-                            f"[DP Rank {self.dp_rank} Worker {worker_id}] "
-                            f"Processing failed at idx {i}: {e}"
-                        )
-                        yield (global_idx, 0, True, None)
-                        local_counter += 1
-    
-                global_idx += 1
- 
-            except Exception as e:
-                logger.error(f"Outer loop error at sample {i}: {e}")
+        worker_id = worker_info.id if worker_info else 0
+        for global_idx in range(self.skip_samples_count, len(data)):
+            if global_idx % num_workers != worker_id:
                 continue
+            sub_idx = 0
+            try:
+                item = data[global_idx]
+                sample_data = self._read_sample_by_offset(item) if self.use_offset else item
+                result = self._processor(sample_data, sample_idx=global_idx)
+                if result is not None:
+                    if not isinstance(result, (list, types.GeneratorType)):
+                        result = [result]
+                    for sample in result:
+                        yield (global_idx, sub_idx, False, sample)
+                        sub_idx += 1
+            except Exception:
+                logger.warning(
+                    f"[DP Rank {self.dp_rank} Worker {worker_id}] "
+                    f"Processing failed at sample {global_idx}: {traceback.format_exc()}"
+                )
+            # Never omit an empty sample or reuse an already emitted chunk ID.
+            yield (global_idx, sub_idx, True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +380,7 @@ class ReorderingDataLoader:
  
         def _advance(data, is_last):
             nonlocal next_global, next_sub
-            yield data
+            yield (next_global, next_sub, is_last, data)
             if is_last:
                 next_global += 1
                 next_sub = 0
@@ -536,7 +496,8 @@ class MultimodalPacker:
             **{k: [] for k in self._MULTIMODAL_KEYS},
         }
         self._cur_len = 0
- 
+        self._resume_sample = None
+
     # ── Length estimation helpers ─────────────────────────────────────────────
  
     def _image_tokens(self, grid_thw: Optional[torch.Tensor], downsample_ratio: Optional[float] = None) -> int:
@@ -574,8 +535,9 @@ class MultimodalPacker:
             valid = [t for t in self._buf[key] if t is not None and t.numel() > 0]
             out[key] = torch.cat(valid, dim=0) if valid else None
  
+        out["_resume_sample"] = self._resume_sample
         return out
- 
+
     def __iter__(self):
         for sample in self.source:
             if sample is None:
@@ -584,7 +546,7 @@ class MultimodalPacker:
             # Normalise attention_mask_len to a plain int
             attn_len_raw = sample.attention_mask_len
             if attn_len_raw is None:
-                attn_len_raw = sample.input_ids
+                attn_len_raw = [sample.input_ids.numel()]
             if isinstance(attn_len_raw, torch.Tensor):
                 sample_len = int(attn_len_raw.sum().item()) if attn_len_raw.numel() > 1 else int(attn_len_raw.item())
             else:
@@ -624,6 +586,7 @@ class MultimodalPacker:
  
             # ── Append to buffer ──────────────────────────────────────────────
             self._cur_len += sample_len
+            self._resume_sample = sample._ulysses_sample_index
             self._buf["input_ids"].append(sample.input_ids)
             self._buf["labels"].append(sample.labels)
  
@@ -649,351 +612,257 @@ class MultimodalPacker:
 # ---------------------------------------------------------------------------
  
 class PrefetchingPackedLoader:
+    """One epoch of packed micro-batches with coarse raw-sample checkpointing.
+
+    Resume re-reads the current raw sample from its beginning. Chunks of a long
+    video may be trained again; packing buffers and chunk cursors are not saved.
     """
-    Background-thread loader that continuously:
-      1. Iterates UlyssesStreamingDataset (via ReorderingDataLoader)
-      2. Syncs samples across SP ranks using CPU Gloo all_gather
-      3. Packs samples with MultimodalPacker
-      4. Colates batches with OmniDataSharderCollator
-      5. Puts finished batches in a queue for the main training loop
- 
-    The loader is infinite: after each epoch it increments self.epoch and
-    starts over, so the training loop never sees StopIteration.
-    """
- 
+
+    STATE_VERSION = 1
+
     def __init__(
         self,
-        dataset,             # ReorderingDataLoader wrapping a DataLoader
+        dataset,
         tokenizer,
         model_args,
-        max_seq_len: int,
-        batch_size: int,
-        collate_fn: Optional[Callable] = None,
-        prefetch_batches: int = 2,
-        start_epoch: int = 0,
-        num_train_epochs: int = 1,
+        max_seq_len,
+        batch_size,
+        collate_fn=None,
+        prefetch_batches=2,
+        start_epoch=0,
+        num_train_epochs=1,
     ):
-        self.dataset        = dataset
-        self.tokenizer      = tokenizer
-        self.model_args     = model_args
-        self.max_seq_len    = max_seq_len
-        self.batch_size     = batch_size
-        self.collate_fn     = collate_fn
+        if batch_size < 1 or prefetch_batches < 1:
+            raise ValueError("batch_size and prefetch_batches must be positive")
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.model_args = model_args
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+        self.collate_fn = collate_fn
         self.prefetch_batches = prefetch_batches
-        self.epoch          = start_epoch
+        self.epoch = start_epoch
         self.num_train_epochs = num_train_epochs
         self.samples_consumed = 0
- 
-        self.is_launched    = False
-        self.queue: Optional[queue.Queue] = None
-        self.stop_event     = threading.Event()
-        self.producer_thread: Optional[threading.Thread] = None
- 
-        self.rank    = dist.get_rank()    if dist.is_initialized() else int(os.getenv("RANK", 0))
-        ps           = get_parallel_state()
-        self.dp_rank = ps.dp_rank if ps is not None else self.rank
- 
-    # ── Public API ────────────────────────────────────────────────────────────
- 
-    def launch(self):
-        if self.is_launched:
-            return
-        if self.samples_consumed > 0:
-            self._propagate(self.dataset, "set_consumed_samples", self.samples_consumed)
- 
-        # logger.info(f"[Rank {self.rank}] Launching PrefetchingPackedLoader (epoch {self.epoch})…")
-        self.queue = queue.Queue(maxsize=self.prefetch_batches)
-        self.stop_event.clear()
-        self.producer_thread = threading.Thread(target=self._producer, daemon=True)
-        self.producer_thread.start()
-        self.is_launched = True
- 
-    def close(self):
-        self.stop_event.set()
-        time.sleep(1)
-        try:
-            while not self.queue.empty():
-                self.queue.get_nowait()
-        except Exception:
-            pass
-        if self.producer_thread is not None:
-            self.producer_thread.join(timeout=5.0)
-            if self.producer_thread.is_alive():
-                logger.warning(f"[Rank {self.rank}] Producer thread did not exit cleanly.")
-        self.producer_thread = None
+        self._resume_index = 0
+        self._pending_sample = None
         self.is_launched = False
- 
+        self.queue = None
+        self.stop_event = threading.Event()
+        self.producer_thread = None
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        ps = get_parallel_state()
+        self.dp_rank = ps.dp_rank
+        self.dp_size = ps.dp_size
+        self.sp_size = ps.ulysses_size
+        self.cpu_group = get_ulysses_sequence_parallel_cpu_group() if self.sp_size > 1 else None
+        if self.sp_size > 1 and self.cpu_group is None:
+            raise RuntimeError("Ulysses data synchronization requires the CPU Gloo group")
+        if getattr(ps, "cp_size", 1) > 1:
+            raise ValueError("The Ulysses omni dataloader does not support combined context parallelism")
+
     @property
-    def raw_samples_consumed(self) -> int:
-        return self.samples_consumed
- 
-    @property
-    def data_list(self) -> List:
-        """Walk the dataset chain to find the underlying OmniStreamingDataset."""
+    def raw_dataset(self):
         obj = self.dataset
         while hasattr(obj, "dataset"):
             obj = obj.dataset
-        return getattr(obj, "data_list", [])
- 
-    # ── Helpers ───────────────────────────────────────────────────────────────
- 
-    def _propagate(self, obj, method: str, value):
-        """Recursively call `method(value)` on every layer of the dataset chain."""
+        return obj
+
+    @property
+    def data_list(self):
+        return self.raw_dataset.data_list
+
+    @property
+    def raw_samples_consumed(self):
+        return self.samples_consumed
+
+    def _propagate(self, obj, method, value):
         if hasattr(obj, method):
             getattr(obj, method)(value)
         if hasattr(obj, "dataset"):
             self._propagate(obj.dataset, method, value)
- 
-    # ── CPU consistency sync ──────────────────────────────────────────────────
- 
-    def _sample_fingerprint(self, item: Optional[Dict]) -> List[int]:
-        """
-        Compute a 3-element integer fingerprint [input_len, modal_hash, is_valid]
-        used to detect rank divergence before a sample is processed.
-        """
-        if item is None:
-            return [-1, -1, -1]
- 
-        input_len = len(item.input_ids)
-        h = 0
- 
-        def _shape_sum(key):
-            val = getattr(item, key)
-            if val is None:
-                return 0
-            if isinstance(val, torch.Tensor):
-                return sum(val.shape)
-            if isinstance(val, (list, tuple)):
-                return sum(sum(t.shape) for t in val if isinstance(t, torch.Tensor))
-            return 0
- 
-        def _val_sum(key):
-            val = getattr(item, key)
-            if val is None:
-                return 0
-            if isinstance(val, torch.Tensor):
-                return int(val.float().sum().item())
-            if isinstance(val, (list, tuple)):
-                return sum(int(t.float().sum().item()) for t in val if isinstance(t, torch.Tensor))
-            return 0
- 
-        h += _shape_sum("pixel_values")
-        h += _val_sum("image_grid_thw")
-        h += _shape_sum("pixel_values_video")
-        h += _val_sum("video_grid_thw")
-        h += _shape_sum("audio_features")
-        h += _val_sum("audio_features_lens")
- 
-        return [input_len, h, 1]
- 
-    def _process_sync_buffer(
-        self, buffer: List[Optional[Dict]], cpu_group
-    ) -> Iterator[Dict]:
-        """
-        all_gather fingerprints for every item in buffer, then yield only
-        those where all SP ranks agree on (input_len, modal_hash, is_valid).
-        """
-        meta = [self._sample_fingerprint(item) for item in buffer]
-        device     = "cpu"
-        local_t    = torch.tensor(meta, dtype=torch.long, device=device)  # [B, 3]
-        world_size = dist.get_world_size(group=cpu_group)
-        gathered   = [torch.zeros_like(local_t) for _ in range(world_size)]
- 
-        try:
-            if not self.stop_event.is_set():
-                dist.all_gather(gathered, local_t, group=cpu_group)
-            else:
-                return
-        except Exception as e:
-            logger.error(f"[Rank {self.rank}] CPU Gloo all_gather failed: {e}")
-            return
- 
-        dropped = 0
-        for i, item in enumerate(buffer):
-            metas = [g[i] for g in gathered]
-            ref_len, ref_fp, ref_valid = metas[0].tolist()
- 
-            ok = ref_valid == 1
-            if ok:
-                for m in metas[1:]:
-                    ml, mf, mv = m.tolist()
-                    if ml != ref_len or mf != ref_fp or mv != ref_valid:
-                        ok = False
-                        break
- 
-            if ok and item is not None:
-                yield item
-            else:
-                dropped += 1
- 
-        if dropped:
-            logger.debug(
-                f"[Rank {self.rank}] SP sync dropped {dropped}/{len(buffer)} samples."
-            )
- 
-    def _create_cpu_synced_iterator(
-        self, raw_iterator: Iterator, chunk_size: int = 1
-    ) -> Iterator[Dict]:
-        """
-        Wrap raw_iterator with SP-consistency gating.
- 
-        When sp_data_group is available, samples are processed in chunks of
-        `chunk_size` and fingerprints are compared across SP ranks.  Ranks
-        that fail to produce matching data (e.g., missing modality due to a
-        corrupt file) have those samples dropped uniformly so every SP rank
-        always sees the exact same sequence of packed samples.
-        """
-        cpu_group = None
-        sp_size   = 1
-        try:
-            ps = get_parallel_state()
-            if ps is not None and ps.sp_size > 1:
-                cpu_group = get_ulysses_sequence_parallel_cpu_group()
-                sp_rank   = ps.ulysses_rank
-                sp_size   = ps.ulysses_size
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Could not retrieve sp_data_group: {e}")
- 
-        if cpu_group is None or sp_size <= 1:
-            logger.error(
-                f"[Rank {self.rank}] CRITICAL WARNING: SP CPU Gloo group is None! "
-                "Data divergence across SP ranks will NOT be caught!"
-            )
-            for item in raw_iterator:
-                if item is not None:
-                    yield item
-            return
-     
-        buffer: List = []
-        for item in raw_iterator:
-            buffer.append(item)
-            if len(buffer) >= chunk_size:
-                yield from self._process_sync_buffer(buffer, cpu_group)
-                buffer = []
- 
-        if buffer:
-            yield from self._process_sync_buffer(buffer, cpu_group)
- 
-    # ── Producer thread ───────────────────────────────────────────────────────
- 
-    def _producer(self):
-        # Make sure CUDA device is set correctly inside the thread
-        try:
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            torch.cuda.set_device(local_rank)
-        except Exception:
-            pass
- 
-        try:
-            while not self.stop_event.is_set():
-                # Check epoch limit
-                if self.epoch >= self.num_train_epochs:
-                    logger.info(
-                        f"[Rank {self.rank}] All {self.num_train_epochs} epoch(s) finished. "
-                        f"Producer stopping."
-                    )
-                    break
 
-                self._propagate(self.dataset, "set_epoch", self.epoch)
- 
-                raw_iter    = iter(self.dataset)
-                synced_iter = self._create_cpu_synced_iterator(raw_iter)
-                packer      = MultimodalPacker(
-                    synced_iter, self.tokenizer, self.model_args, self.max_seq_len
-                )
- 
-                batch_buf: List = []
-                for packed in packer:
-                    if self.stop_event.is_set():
-                        return
- 
-                    batch_buf.append(packed)
-                    del packed  
-                    if len(batch_buf) == self.batch_size:
-                        self._emit(batch_buf)
-                        batch_buf.clear()
- 
-                if batch_buf and not self.stop_event.is_set():
-                    self._emit(batch_buf)
-                    batch_buf.clear()
- 
-                logger.info(
-                    f"[Rank {self.rank}] Epoch {self.epoch} finished "
-                    f"({self.epoch + 1}/{self.num_train_epochs})."
-                )
-                self.epoch += 1
- 
-        except Exception as e:
-            if not self.stop_event.is_set():
-                logger.error(f"[Rank {self.rank}] Producer error: {e}\n{traceback.format_exc()}")
-                self.queue.put(e)
-        finally:
-            # Signal consumer to stop, whether we finished all epochs or were stopped
-            self.queue.put(None)
- 
-    def _emit(self, batch_buf: List):
-        """Collate and enqueue a batch; propagate exceptions to consumer."""
-        try:
-            if self.collate_fn is not None:
-                batch = self.collate_fn(batch_buf)
-            else:
-                batch = batch_buf
-            while not self.stop_event.is_set():
-                try:
-                    self.queue.put(batch, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
-        except Exception as e:
-            logger.error(f"[Rank {self.rank}] Collation error: {e}\n{traceback.format_exc()}")
-            while not self.stop_event.is_set():
-                try:
-                    self.queue.put(e, timeout=0.1)
-                    break
-                except queue.Full:
-                    pass
- 
-    # ── Consumer (main thread) ────────────────────────────────────────────────
- 
-    def __iter__(self):
+    def set_epoch(self, epoch):
+        if epoch == self.epoch:
+            return  # Preserve a restored mid-epoch sample index.
+        if self.is_launched:
+            raise RuntimeError("Close the Ulysses dataloader before changing epochs")
+        self.epoch = epoch
+        self._resume_index = 0
+        self._pending_sample = None
+        self.samples_consumed = 0
+
+    def mark_batch_consumed(self):
+        """Commit progress only after the trainer successfully updates parameters."""
+        if self._pending_sample is None:
+            raise RuntimeError("No Ulysses batch is pending consumption")
+        self._resume_index = self._pending_sample
+        self._pending_sample = None
+        self.samples_consumed = self._resume_index
+
+    def _configuration(self):
+        raw = self.raw_dataset
+        return {
+            "data_path": raw.data_args.train_path,
+            "num_samples": len(self.data_list),
+            "seed": getattr(raw.training_args, "seed", 42),
+            "dp_rank": self.dp_rank,
+            "dp_size": self.dp_size,
+            "sp_size": self.sp_size,
+            "batch_size": self.batch_size,
+            "max_seq_len": self.max_seq_len,
+        }
+
+    def state_dict(self):
+        return {
+            "version": self.STATE_VERSION,
+            "epoch": self.epoch,
+            "resume_index": self._resume_index,
+            "samples_consumed": self.samples_consumed,
+            "configuration": self._configuration(),
+        }
+
+    def load_state_dict(self, state):
+        if self.is_launched:
+            raise RuntimeError("Restore the Ulysses dataloader before launching it")
+        if state.get("version") != self.STATE_VERSION:
+            raise ValueError("Unsupported Ulysses dataloader checkpoint version")
+        if state["configuration"] != self._configuration():
+            raise ValueError("Ulysses dataloader configuration differs from its checkpoint")
+        resume_index = int(state["resume_index"])
+        if not 0 <= resume_index <= len(self.data_list):
+            raise ValueError("Invalid Ulysses dataloader resume index")
+        self.epoch = state["epoch"]
+        self._resume_index = resume_index
+        self.samples_consumed = resume_index
+
+    def launch(self):
+        if self.is_launched:
+            return
+        self._propagate(self.dataset, "set_epoch", self.epoch)
+        self._propagate(self.dataset, "set_consumed_samples", self._resume_index)
+        self.queue = queue.Queue(maxsize=self.prefetch_batches)
+        self.stop_event.clear()
+        self.is_launched = True
+        self.producer_thread = threading.Thread(target=self._producer, daemon=True)
+        self.producer_thread.start()
+
+    def close(self):
         if not self.is_launched:
-            self.launch()
+            return
+        self.stop_event.set()
+        # Drain to unblock a producer waiting to enqueue while an SP peer waits
+        # in the next metadata exchange. Stop is agreed in that same exchange.
+        deadline = time.monotonic() + 30
+        while self.producer_thread.is_alive() and time.monotonic() < deadline:
+            try:
+                self.queue.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            self.producer_thread.join(timeout=0.1)
+        if self.producer_thread.is_alive():
+            raise RuntimeError("Ulysses producer did not stop; refusing to reuse its queue or process group")
+        self.producer_thread = None
+        self.is_launched = False
+
+    def _sample_fingerprint(self, item):
+        if item is None:
+            return -1
+        digest = hashlib.blake2b(digest_size=8)
+        for key in ("input_ids", "labels", "attention_mask_len", *MultimodalPacker._MULTIMODAL_KEYS):
+            value = getattr(item, key, None)
+            digest.update(key.encode())
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for tensor in values:
+                if isinstance(tensor, torch.Tensor):
+                    tensor = tensor.detach().cpu().contiguous()
+                    digest.update(str((tensor.dtype, tuple(tensor.shape))).encode())
+                    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+                else:
+                    digest.update(repr(tensor).encode())
+        return int.from_bytes(digest.digest(), "little") & ((1 << 63) - 1)
+
+    def _exchange_metadata(self, metadata):
+        if self.cpu_group is None:
+            peers = [metadata]
+        else:
+            local = torch.tensor(metadata, dtype=torch.long)
+            gathered = [torch.empty_like(local) for _ in range(self.sp_size)]
+            try:
+                dist.all_gather(gathered, local, group=self.cpu_group)
+            except RuntimeError as exc:
+                raise SynchronizedDataError("Ulysses metadata collective failed") from exc
+            peers = [peer.tolist() for peer in gathered]
+        if any(peer[2] == RecordState.ERROR for peer in peers):
+            raise SynchronizedDataError("A Ulysses peer failed during reading, packing or collation")
+        return peers
+
+    def _create_cpu_synced_iterator(self, raw_iterator):
+        for raw_id, _, _, sample in synchronize_records(
+            raw_iterator, self._exchange_metadata, self._sample_fingerprint, self.stop_event.is_set
+        ):
+            sample._ulysses_sample_index = raw_id
+            yield sample
+
+    def _put(self, item):
+        while not self.stop_event.is_set():
+            try:
+                self.queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def _producer(self):
+        try:
+            source = self._create_cpu_synced_iterator(iter(self.dataset))
+            packer = MultimodalPacker(source, self.tokenizer, self.model_args, self.max_seq_len)
+            batch_buf = []
+            for packed in packer:
+                sample_index = packed.pop("_resume_sample")
+                # Each packed sequence is a micro-batch; the trainer accumulates
+                # the returned list before one optimizer step.
+                batch = self.collate_fn([packed]) if self.collate_fn else packed
+                batch_buf.append(batch)
+                if len(batch_buf) == self.batch_size:
+                    self._put((batch_buf, sample_index))
+                    batch_buf = []
+            # Keep the number of forwards identical across DP ranks. An
+            # incomplete accumulation group is dropped, as in the omni loader.
+            if batch_buf and not self.stop_event.is_set():
+                logger.info(f"Dropping {len(batch_buf)}/{self.batch_size} trailing Ulysses micro-batches")
+            # A final exchange covers failures while collating the last pack,
+            # after the record iterator has already agreed on EOF.
+            self._exchange_metadata([0, 0, RecordState.STOP if self.stop_event.is_set() else RecordState.EOF, -1])
+        except Exception as exc:
+            if not isinstance(exc, SynchronizedDataError):
+                try:
+            
+                    self._exchange_metadata([0, 0, RecordState.ERROR, -1])
+                except SynchronizedDataError:
+                    pass
+            self._put(exc)
+        finally:
+            self._put(None)
+
+    def __iter__(self):
+        self.launch()
         return self._consumer()
- 
+
     def _consumer(self):
         while True:
             try:
                 item = self.queue.get(timeout=600)
-            except queue.Empty:
-                alive = self.producer_thread is not None and self.producer_thread.is_alive()
-                raise TimeoutError(
-                    f"[Rank {self.rank}] DataLoader queue timeout. "
-                    f"Producer {'alive' if alive else 'DEAD'}."
-                )
- 
+            except queue.Empty as exc:
+                raise TimeoutError(f"[Rank {self.rank}] Ulysses dataloader queue timeout") from exc
             if isinstance(item, Exception):
                 raise item
- 
             if item is None:
-                break
-
-            # Count consumed raw samples for resume
-            if isinstance(item, dict):
-                if "seq_lens" in item:
-                    self.samples_consumed += item["seq_lens"].numel()
-                elif "input_ids" in item:
-                    self.samples_consumed += item["input_ids"].size(0)
-            elif isinstance(item, list):
-                for s in item:
-                    if isinstance(s, dict) and "sample_lens" in s:
-                        self.samples_consumed += len(s["sample_lens"])
-                    else:
-                        self.samples_consumed += 1
- 
-            yield item
-            item = None
-            self.queue.task_done()
- 
+                self._resume_index = len(self.data_list)
+                self.samples_consumed = len(self.data_list)
+                return
+            batches, sample_index = item
+            self._pending_sample = sample_index
+            yield batches
 
 
 def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer):
@@ -1007,8 +876,8 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         tokenizer       : pre-built tokenizer (already configured)
  
     Returns:
-        PrefetchingPackedLoader – finite iterator yielding collated batches
-                                  for num_train_epochs epochs
+        PrefetchingPackedLoader: one epoch of lists of collated micro-batches.
+        Call mark_batch_consumed() after each successful optimizer step.
     """
    
     # ── Dataset ───────────────────────────────────────────────────────────────
@@ -1024,7 +893,8 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
         raw_dataset,
         batch_size=None,           # disable auto-batching; items are already dicts
         num_workers=getattr(training_args, "dataloader_num_workers", 2),
-        prefetch_factor=getattr(training_args, "dataloader_prefetch_factor", 2),
+        prefetch_factor=(getattr(training_args, "dataloader_prefetch_factor", 2)
+                         if getattr(training_args, "dataloader_num_workers", 2) > 0 else None),
         persistent_workers=False,
     )
  
@@ -1089,58 +959,209 @@ def check_sp_consistency(tensor: torch.Tensor, sp_group, name: str, step: int = 
 
     return is_consistent
 
-def test_ulysess():
-    from veomni.trainer.llava_trainer import VeOmniVLMArguments
+class _UlyssesTestAudit:
+    """Test-only checks before sample filtering and before SP slicing."""
+
+    def __init__(self, exchange, collator):
+        self.exchange = exchange
+        self.collator = collator
+        self.error = None
+        self.samples = 0
+        self.empty_samples = 0
+        self.modalities = {"image": 0, "video": 0, "audio": 0}
+
+    @staticmethod
+    def fingerprint(value):
+        """Include dtype, shape and every byte; equal sums are insufficient."""
+        digest = hashlib.sha256()
+
+        def update(item):
+            digest.update(type(item).__name__.encode())
+            if isinstance(item, torch.Tensor):
+                tensor = item.detach().cpu().contiguous()
+                digest.update(str((tensor.dtype, tuple(tensor.shape))).encode())
+                digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+            elif isinstance(item, dict):
+                for key in sorted(item):
+                    update(key)
+                    update(item[key])
+            elif isinstance(item, (list, tuple)):
+                digest.update(str(len(item)).encode())
+                for child in item:
+                    update(child)
+            else:
+                digest.update(repr(item).encode())
+
+        update(value)
+        return digest.hexdigest()
+
+    def exchange_metadata(self, metadata):
+        try:
+            peers = self.exchange(metadata)
+        except Exception as exc:
+            self.error = repr(exc)
+            raise
+        # A deliberate bounded stop can interrupt peers at different records.
+        if any(peer[2] == RecordState.STOP for peer in peers):
+            return peers
+        if any(peer != peers[0] for peer in peers):
+            self.error = f"Pre-filter Ulysses mismatch (sample/chunk/terminal/EOF/content): {peers}"
+            raise SynchronizedDataError(self.error)
+        if metadata[2] == RecordState.TERMINAL:
+            self.empty_samples += int(metadata[1] == 0)
+        elif metadata[2] == RecordState.DATA and metadata[3] >= 0:
+            self.samples += 1
+        return peers
+
+    def collate(self, features):
+        raw = features[0]
+        fingerprints = {key: self.fingerprint(value) for key, value in raw.items()}
+        for modality, key in (("image", "pixel_values"), ("video", "pixel_values_video"), ("audio", "audio_features")):
+            value = raw.get(key)
+            self.modalities[modality] += int(value is not None)
+        try:
+            batch = self.collator(features)
+        except Exception as exc:
+            self.error = repr(exc)
+            raise
+        batch["_ulysses_test_fingerprints"] = fingerprints
+        return batch
+
+
+def test_ulysess(args=None):
+    """Run with torchrun and a trainer YAML; never initialize model weights.
+
+    ULYSSES_TEST_MAX_SAMPLES (128) bounds the offset subset, MAX_STEPS (10)
+    bounds iteration, and SP_SIZE (2) selects the Ulysses group size. All three
+    names have the ULYSSES_TEST_ prefix. A zero MAX_STEPS runs to subset EOF.
+    """
+    import copy
+    import tempfile
+
     from transformers import AutoTokenizer
-    from veomni.arguments import parse_args
-    args = parse_args(VeOmniVLMArguments)
-    model_args, data_args, training_args = args.model, args.data, args.train
 
-    # Must set CUDA device and init dist BEFORE init_parallel_state
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+    if args is None:
+        from veomni.arguments import parse_args
+        from veomni.trainer.llava_trainer import VeOmniVLMArguments
 
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_path,
-                                              model_max_length=training_args.model_max_length)
-    init_parallel_state(ulysses_size=2)
+        args = parse_args(VeOmniVLMArguments)
+    model_args, data_args, training_args = args.model, copy.copy(args.data), args.train
+    max_samples = int(os.environ.get("ULYSSES_TEST_MAX_SAMPLES", "128"))
+    max_steps = int(os.environ.get("ULYSSES_TEST_MAX_STEPS", "10"))
+    sp_size = int(os.environ.get("ULYSSES_TEST_SP_SIZE", "2"))
+    if max_samples < 1 or max_steps < 0 or sp_size < 2:
+        raise ValueError("Require MAX_SAMPLES > 0, MAX_STEPS >= 0 and SP_SIZE >= 2")
 
-    rank = dist.get_rank()
-    dp_rank = get_parallel_state().dp_rank
-    print(f"RANK: {rank}, dp rank: {dp_rank}")
-    device = torch.device("cuda", local_rank)
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group(backend="nccl" if use_cuda else "gloo", timeout=datetime.timedelta(minutes=5))
+    train_loader = None
+    audit_group = None
+    try:
+        world_size = dist.get_world_size()
+        if world_size % sp_size:
+            raise ValueError(f"world_size={world_size} must be divisible by SP_SIZE={sp_size}")
+        init_parallel_state(
+            dp_size=world_size // sp_size,
+            ulysses_size=sp_size,
+            device_type="cuda" if use_cuda else "cpu",
+        )
+        ps = get_parallel_state()
+        if ps.ulysses_size != sp_size or ps.dp_size != world_size // sp_size or ps.cp_size != 1:
+            raise ValueError("Existing parallel state does not match the requested test topology")
+        # Consumer checks must not interleave with producer metadata collectives.
+        audit_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(minutes=5))
 
-    train_loader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
+        def gather(value):
+            peers = [None] * world_size
+            dist.all_gather_object(peers, value, group=audit_group)
+            return peers
 
-    for i, data in enumerate(train_loader):
-        sp_group = get_parallel_state().ulysses_group
-        sp_rank = get_parallel_state().sp_rank
-        device_data = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.config_path or model_args.model_path,
+            model_max_length=training_args.model_max_length,
+        )
+        with tempfile.TemporaryDirectory(prefix="ulysses-consistency-") as scratch:
+            offsets = np.load(data_args.offset_file_path, mmap_mode="r")
+            if len(offsets) == 0:
+                raise ValueError("The offset file contains no samples")
+            # Deterministically cover the mapping without materializing/shuffling
+            # tens of millions of indices just to run a bounded smoke test.
+            rows = np.linspace(0, len(offsets) - 1, min(max_samples, len(offsets)), dtype=np.int64)
+            data_args.offset_file_path = os.path.join(scratch, "offsets.npy")
+            np.save(data_args.offset_file_path, offsets[rows])
+            train_loader = make_ulysses_train_dataloader(data_args, training_args, model_args, tokenizer)
+            audit = _UlyssesTestAudit(train_loader._exchange_metadata, train_loader.collate_fn)
+            train_loader._exchange_metadata = audit.exchange_metadata
+            train_loader.collate_fn = audit.collate
+            iterator = iter(train_loader)
+            steps = micro_batches_checked = 0
+            try:
+                while max_steps == 0 or steps < max_steps:
+                    try:
+                        batches = next(iterator)
+                        local = {
+                            "dp": ps.dp_rank,
+                            "state": "batch",
+                            "fingerprints": [batch.pop("_ulysses_test_fingerprints") for batch in batches],
+                        }
+                    except StopIteration:
+                        local = {"dp": ps.dp_rank, "state": "eof"}
+                    except Exception as exc:
+                        local = {"dp": ps.dp_rank, "state": "error", "error": repr(exc)}
+                    peers = gather(local)
+                    errors = [peer for peer in peers if peer["state"] == "error"]
+                    if errors:
+                        raise AssertionError(f"Ulysses consistency test failed: {errors}")
+                    for dp_rank in range(ps.dp_size):
+                        group = [peer for peer in peers if peer["dp"] == dp_rank]
+                        if len(group) != sp_size:
+                            raise AssertionError(f"Expected {sp_size} Ulysses peers, got {len(group)}")
+                        if any(peer != group[0] for peer in group):
+                            raise AssertionError(f"Pre-slice batch mismatch at step {steps}: {group}")
+                    if any(peer["state"] == "eof" for peer in peers):
+                        break
+                    train_loader.mark_batch_consumed()
+                    steps += 1
+                    micro_batches_checked += len(batches)
+                    if dist.get_rank() == 0:
+                        print(f"Ulysses consistent: step={steps}, micro_batches={micro_batches_checked}", flush=True)
+            finally:
+                train_loader.close()
+            reports = gather(
+                {
+                    "rank": dist.get_rank(),
+                    "steps": steps,
+                    "micro_batches": micro_batches_checked,
+                    "matched_chunks": audit.samples,
+                    "empty_samples": audit.empty_samples,
+                    "packed_modalities": audit.modalities,
+                    "error": audit.error,
+                }
+            )
+            if any(report["error"] is not None for report in reports):
+                raise AssertionError(f"Ulysses prefetch failed: {reports}")
+            if any(report["micro_batches"] == 0 for report in reports):
+                raise AssertionError(f"No complete micro-batch was checked: {reports}")
+            if dist.get_rank() == 0:
+                print("ULYSSES_CONSISTENCY_PASS " + json.dumps(reports, sort_keys=True), flush=True)
+            return reports
+    finally:
+        try:
+            if train_loader is not None:
+                train_loader.close()
+        finally:
+            if audit_group is not None:
+                dist.destroy_process_group(audit_group)
+            if owns_group:
+                dist.destroy_process_group()
+                from veomni.distributed.parallel_state import clear_parallel_state
 
-        # Check seq_lens (NOT sp-sliced) for data consistency across SP ranks
-        seq_lens = device_data["seq_lens"]
-        seq_consist = check_sp_consistency(seq_lens, sp_group, "seq_lens", step=i)
-
-        # Check full input_ids by all_gather-ing the SP chunks back together
-        input_ids = device_data["input_ids"].squeeze(0)  # [T_pad // sp_size]
-        sp_size = get_parallel_state().sp_size
-        gathered = [torch.zeros_like(input_ids) for _ in range(sp_size)]
-        dist.all_gather(gathered, input_ids, group=sp_group)
-        full_ids = torch.cat(gathered, dim=0)
-        id_consist = check_sp_consistency(full_ids, sp_group, "full_input_ids", step=i)
-
-        status = "✅" if (seq_consist and id_consist) else "❌"
-        msg = (f"{status} RANK: {rank} DP_Rank {dp_rank} SP_Rank {sp_rank} | "
-               f"Shape: {device_data['input_ids'].shape} | "
-               f"seq_lens: {seq_lens.tolist()} | "
-               f"Consumed: {train_loader.samples_consumed}")
-        print(msg)
-        del device_data, full_ids, gathered
-
-
+                clear_parallel_state()
 
 
 if __name__ == "__main__":
     test_ulysess()
-    
