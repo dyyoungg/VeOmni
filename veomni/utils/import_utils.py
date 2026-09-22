@@ -41,9 +41,11 @@ def _get_package_version(name: str) -> "Version":
 
 _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
+    "flash_attn_interface": _is_package_available("flash_attn_interface"),
     "liger_kernel": _is_package_available("liger_kernel"),
     "torch_npu": _is_package_available("torch_npu"),
     "torch_mlu": _is_package_available("torch_mlu"),
+    "torch_musa": _is_package_available("torch_musa"),
     "apex": _is_package_available("apex"),
     "diffusers": _is_package_available("diffusers"),
     "av": _is_package_available("av"),

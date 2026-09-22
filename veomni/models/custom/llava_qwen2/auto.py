@@ -22,6 +22,7 @@ from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import _bind_veomni_ops
 from veomni.ops import apply_ops_config
 from veomni.models.transformers.qwen2.generated import patched_modeling_qwen2_gpu as _patched_qwen2_module
+from veomni.models.custom.vision_encoder import modeling_qwen25_vision_encoder as _customer_vision_module
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
     from transformers.initialization import no_init_weights
@@ -35,6 +36,11 @@ def _set_attn_implementation_in_config(config: PretrainedConfig, attn_implementa
     # The custom omni wrapper forwards `config._attn_implementation` into submodules.
     setattr(config, "_attn_implementation", attn_implementation)
 
+def _encoder_attn_implementation(attn_implementation: str) -> str:
+    """The muDNN experiment changes the language backbone, not existing encoder FA3 paths."""
+    if attn_implementation == "veomni_mudnn_attention":
+        return "veomni_flash_attention_3_with_sp"
+    return attn_implementation
 
 def _install_veomni_qwen2_ops(ops_implementation: OpsImplementationConfig) -> None:
     """Modern replacement for the deleted ``apply_veomni_qwen2_gpu_patch``.
@@ -53,7 +59,7 @@ def _install_veomni_qwen2_ops(ops_implementation: OpsImplementationConfig) -> No
     """
     apply_ops_config(ops_implementation)
     _bind_veomni_ops(_patched_qwen2_module, ops_implementation)
-
+    _bind_veomni_ops(_customer_vision_module, ops_implementation)
 
 def _set_foundation_dtype_in_config(config: PretrainedConfig, torch_dtype: str) -> None:
     if torch_dtype == "bfloat16":
@@ -208,6 +214,9 @@ def build_llavaqwen2_omni_from_pretrained(
         _install_veomni_qwen2_ops(ops_implementation)
 
     _set_attn_implementation_in_config(omni_config.foundation_config, attn_implementation)
+    from veomni.utils.device import get_device_type
+    if get_device_type() == "musa":
+        attn_implementation = _encoder_attn_implementation(attn_implementation)
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation)

@@ -25,7 +25,13 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..utils import logging
-from ..utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from ..utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
+    IS_MUSA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_gpu_compute_capability,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -35,7 +41,7 @@ logger = logging.get_logger(__name__)
 class HardwareRequirement:
     """Describes hardware constraints for a kernel."""
 
-    device_type: str | list[str]  # "gpu" | "npu" | "mlu"
+    device_type: str | list[str]  # "gpu" | "npu" | "mlu" | "musa"
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
     # Inclusive upper bound for kernels that don't yet support newer arches
     # (e.g. FlashQLA today only ships SM90; SM100/SM120 wheels are WIP per
@@ -45,7 +51,7 @@ class HardwareRequirement:
 
     def _is_single_device_satisfied(self, device_type: str) -> bool:
         if device_type == "gpu":
-            if not IS_CUDA_AVAILABLE:
+            if not (IS_CUDA_AVAILABLE or IS_MUSA_AVAILABLE):
                 return False
             cc = get_gpu_compute_capability()
             if self.min_compute_capability is not None and cc < self.min_compute_capability:
@@ -60,6 +66,8 @@ class HardwareRequirement:
             return IS_NPU_AVAILABLE
         if device_type == "mlu":
             return IS_MLU_AVAILABLE
+        if device_type == "musa":
+            return IS_MUSA_AVAILABLE
         if device_type == "any":
             # Hardware-agnostic kernel (pure PyTorch). Used e.g. by chunk_loss
             # (F.linear + eager_cross_entropy in a chunked autograd Function),

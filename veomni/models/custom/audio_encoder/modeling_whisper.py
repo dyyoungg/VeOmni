@@ -27,19 +27,17 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
-from flash_attn import (
+try:
+    from flash_attn import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
-
-try:
-    is_fa3_ready = True
-    from flash_attn_interface import (
-        flash_attn_varlen_func as fa3_varlen_func,
-        flash_attn_func as fa3_func,
-    )
 except:
-    is_fa3_ready = False
+    from flash_attn_interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
+
 
 from transformers.activations import ACT2FN
 from transformers.generation.logits_process import WhisperTimeStampLogitsProcessor
@@ -347,6 +345,10 @@ class WhisperAttention(nn.Module):
         """
         ### use flash_attn_func when seq_lens is None
 
+        if output_attentions:
+            raise NotImplementedError("MATE FA3 does not return attention probabilities.")
+        if self.training and self.dropout != 0.0:
+            raise ValueError("MATE FA3 training requires attention dropout=0.")
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -360,32 +362,14 @@ class WhisperAttention(nn.Module):
                 bsz, tgt_len, self.num_heads, self.head_dim
             )
 
-            if is_fa3_ready:
-                attn_output, attn_probs_ret = fa3_func(
-                    query_states,
-                    key_states,
-                    value_states,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                )
-                if output_attentions:
-                    attn_probs = attn_probs_ret
-                else:
-                    attn_probs = None
-            else:
-                attn_output = flash_attn_func(
-                    query_states,
-                    key_states,
-                    value_states,
-                    dropout_p=self.dropout,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                    return_attn_probs=output_attentions,
-                )
-                if output_attentions:
-                    attn_output, attn_probs = attn_output
-                else:
-                    attn_probs = None
+            attn_output = flash_attn_func(
+                query_states,
+                key_states,
+                value_states,
+                softmax_scale=self.scaling,
+                causal=self.is_decoder,
+            )
+            attn_probs = None
             attn_output = attn_output.view(bsz, tgt_len, self.embed_dim)
         else:
             query_states = query_states.view(-1, self.num_heads, self.head_dim)
@@ -400,40 +384,18 @@ class WhisperAttention(nn.Module):
                     qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
 
                 query_states, key_states, value_states = qkv.unbind(0)
-            if is_fa3_ready:
-                attn_output, attn_probs_ret = fa3_varlen_func(
-                    q=query_states,
-                    k=key_states,
-                    v=value_states,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_kv,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_kv,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                )
-                if output_attentions:
-                    attn_probs = attn_probs_ret
-                else:
-                    attn_probs = None
-            else:
-                attn_output = flash_attn_varlen_func(
-                    q=query_states,
-                    k=key_states,
-                    v=value_states,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_kv,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_kv,
-                    dropout_p=self.dropout,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                    return_attn_probs=output_attentions,
-                )
-                if output_attentions:
-                    attn_output, attn_probs = attn_output
-                else:
-                    attn_probs = None
+            attn_output = flash_attn_varlen_func(
+                q=query_states,
+                k=key_states,
+                v=value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_kv,
+                softmax_scale=self.scaling,
+                causal=self.is_decoder,
+            )
+            attn_probs = None
 
             if self.training and get_parallel_state() is not None and get_parallel_state().sp_enabled:
                 attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
@@ -813,7 +775,15 @@ class WhisperPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["WhisperEncoderLayer", "WhisperDecoderLayer"]
 
     def _init_weights(self, module):
-        super()._init_weights(module)
+        std = self.config.init_std
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (WhisperDecoder, WhisperEncoder)):

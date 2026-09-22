@@ -28,7 +28,10 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 import math
 
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+except:
+    from flash_attn_interface import flash_attn_varlen_func # fa3 or musa
 from transformers import AutoConfig
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeVisionConfig
 

@@ -25,6 +25,7 @@ from veomni.models.auto import _bind_veomni_ops
 from veomni.ops import apply_ops_config
 from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
 from veomni.models.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as _patched_qwen3_moe_module
+from veomni.models.custom.vision_encoder import modeling_qwen35_vision_encoder as _customer_vision_module
 
 if is_transformers_version_greater_or_equal_to("5.0.0"):
     from transformers.initialization import no_init_weights
@@ -52,7 +53,7 @@ def _install_veomni_qwen3moe_ops(ops_implementation: OpsImplementationConfig) ->
     """
     apply_ops_config(ops_implementation)
     _bind_veomni_ops(_patched_qwen3_moe_module, ops_implementation)
-
+    _bind_veomni_ops(_customer_vision_module, ops_implementation)
 
 def _legacy_apply_fused_moe_only(moe_implementation: Optional[str]) -> None:
     """Fallback for callers that pass only the legacy ``moe_implementation``
@@ -100,7 +101,12 @@ def _legacy_apply_fused_moe_only(moe_implementation: Optional[str]) -> None:
 def _set_attn_implementation_in_config(config: PretrainedConfig, attn_implementation: str) -> None:
     # The custom omni wrapper forwards `config._attn_implementation` into submodules.
     setattr(config, "_attn_implementation", attn_implementation)
-      
+
+def _encoder_attn_implementation(attn_implementation: str) -> str:
+    """The muDNN experiment changes the language backbone, not existing encoder FA3 paths."""
+    if attn_implementation == "veomni_mudnn_attention":
+        return "veomni_flash_attention_3_with_sp"
+    return attn_implementation
         
 
 def _set_foundation_dtype_in_config(config: PretrainedConfig, torch_dtype: str) -> None:
@@ -272,6 +278,9 @@ def build_qwen3moe_omni_from_pretrained(
         _legacy_apply_fused_moe_only(moe_implementation)
 
     _set_attn_implementation_in_config(omni_config.foundation_config, attn_implementation)
+    from veomni.utils.device import get_device_type
+    if get_device_type() == "musa":
+        attn_implementation = _encoder_attn_implementation(attn_implementation)
 
     if getattr(omni_config.encoder_config, "image_config", None) is not None:
         _set_attn_implementation_in_config(omni_config.encoder_config.image_config, attn_implementation)

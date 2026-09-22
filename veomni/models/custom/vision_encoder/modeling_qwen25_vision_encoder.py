@@ -7,7 +7,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import torch.distributed as dist
 from transformers import AutoConfig
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+except:
+    from flash_attn_interface import flash_attn_varlen_func
 import math
 
 from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
