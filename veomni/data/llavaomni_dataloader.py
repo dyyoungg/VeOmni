@@ -51,7 +51,6 @@ from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, Lon
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
-
 try:
     from baidubce.bce_client_configuration import BceClientConfiguration
     from baidubce.auth.bce_credentials import BceCredentials

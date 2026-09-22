@@ -31,7 +31,6 @@ from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 import os as _os
 import inspect as _inspect
 
-
 def _install_flce_big_chunk_patch():
     import liger_kernel.ops.fused_linear_cross_entropy as _m
 

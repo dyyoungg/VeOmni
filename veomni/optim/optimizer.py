@@ -541,7 +541,14 @@ def build_optimizer(
             logger.info_rank0("fused Adam is not supported on this device, falling back to foreach Adam.")
             fused = False
         foreach = not fused
-        optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+        from veomni.utils.device import get_device_type
+        if get_device_type() == "cuda":
+            optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+        elif get_device_type() == "musa":
+            from torch_musa.optim import FusedAdamW
+            optim = FusedAdamW(param_groups, lr, betas, eps, weight_decay)
+        else:
+            raise NotImplementedError(f"device type {get_device_type()} is not supported for Adamw optimizer!")
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
