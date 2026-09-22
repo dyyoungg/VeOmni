@@ -17,6 +17,7 @@
 from typing import Callable, Optional
 
 import torch
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from . import flash, flex, magi
@@ -31,7 +32,7 @@ from .magi import (
     magi_attention_forward,
     register_veomni_magi_attention_mask_builder,
 )
-
+from .mudnn import mudnn_attention_forward
 
 _ATTENTION_FORWARD_DISPATCH: dict[str, Callable] = {
     "veomni_flex_attention_with_sp": flex_attention_forward,
@@ -39,6 +40,7 @@ _ATTENTION_FORWARD_DISPATCH: dict[str, Callable] = {
     "veomni_flash_attention_2_with_sp": flash_attention_forward,
     "veomni_flash_attention_3_with_sp": flash_attention_forward,
     "veomni_flash_attention_4_with_sp": flash_attention_forward,
+    "veomni_mudnn_attention": mudnn_attention_forward,
 }
 
 
@@ -90,3 +92,5 @@ def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_4_with_sp", fused_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("veomni_mudnn_attention", fused_attention_forward)
+    ALL_MASK_ATTENTION_FUNCTIONS.register("veomni_mudnn_attention", ALL_MASK_ATTENTION_FUNCTIONS["flash_attention_2"])

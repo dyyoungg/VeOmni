@@ -70,6 +70,18 @@ def is_liger_kernel_available() -> bool:
 def is_torch_npu_available() -> bool:
     return _PACKAGE_FLAGS["torch_npu"]
 
+def is_torch_musa_available() -> bool:
+    """Return whether the Moore Threads MUSA backend is importable and active."""
+    if not _PACKAGE_FLAGS["torch_musa"]:
+        return False
+    try:
+        import torch
+        import torch_musa  # noqa: F401  registers torch.musa
+
+        return hasattr(torch, "musa") and torch.musa.is_available()
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
 
 def is_torch_mlu_available() -> bool:
     if _PACKAGE_FLAGS["torch_mlu"]:
@@ -104,6 +116,22 @@ def is_fused_moe_available() -> bool:
         and not _PACKAGE_FLAGS["torch_npu"]
         and _PACKAGE_FLAGS["triton"]
     )
+
+def is_flash_attn_3_available() -> bool:
+    """Return whether the locally installed FA3 interface can run here.
+
+    Transformers' own predicate currently gates FA3 on ``torch.cuda`` only.
+    The MUSA wheel exposes the same ``flash_attn_interface`` API, so VeOmni
+    needs a backend-aware predicate for config normalization and diagnostics.
+    """
+    if not _PACKAGE_FLAGS["flash_attn_interface"]:
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available() or is_torch_musa_available()
+    except (ImportError, AttributeError, RuntimeError):
+        return False
 
 
 def is_quack_package_available() -> bool:

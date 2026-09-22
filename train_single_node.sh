@@ -1,13 +1,19 @@
 
 
-#!/usr/bin/env bash
-set -uo pipefail
-export WANDB_API_KEY="" # replace with your API
-export PYTHONPATH="/mnt/afs/yangdeyu/VeOmni:${PYTHONPATH:-}"
-export PYTHONUNBUFFERED=1
-export VEOMNI_USE_LIGER_KERNEL=1
-export VIT_PROFILE=0
-export PYTORCH_MUSA_ALLOC_CONF="expandable_segments:True"
+export WANDB_API_KEY="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" # replace with your API
+export PYTHONPATH="/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev:$PYTHONPATH"
+# source /opt/dtk/env.sh
+# source /opt/dtk/cuda/env.sh
+# source /opt/MacCodecSDK/env.sh
+# source /home/tione/notebook/yangdeyu/rccl_env.sh
+# export LD_LIBRARY_PATH=/opt/dtk/cuda/cuda/lib64:/opt/MacCodecSDK/lib:${LD_LIBRARY_PATH:-}
+# export HSA_FORCE_FINE_GRAIN_PCIE=1
+# export GPU_MAX_HW_QUEUES=1
+export AOSS_FILE="/mnt/afs/yangdeyu/aoss_ydy_game.conf"
+export VEOMNI_USE_LIGER_KERNEL="1"
+export VEOMNI_FLCE_BIG_CHUNK=1
+export VEOMNI_FAST_RMS_NORM=1
+export VEOMNI_COMPILE_FRIENDLY_CKPT=1
 
 # K8s网络配置
 export GLOO_SOCKET_IFNAME=eth0

@@ -682,10 +682,10 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
-    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
+    init_device: Literal["cuda", "meta", "npu", "mlu", "musa"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU. 5. `musa`: Init parameters on Moore Threads MUSA."
         },
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
@@ -1156,9 +1156,10 @@ class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
     Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
-    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
-    are automatically mapped to NPU-compatible or eager implementations;
-    explicit non-default overrides are validated and unsupported values raise.
+    still equal to the dataclass defaults are mapped to the existing NPU
+    implementations. MUSA does not silently substitute an eager/fallback
+    implementation: requested kernels are resolved as requested and an
+    unsupported backend raises at bind time.
     Per-op fields are ``str`` so third-party backends can register without
     changing this dataclass.
 
@@ -1180,8 +1181,9 @@ class OpsImplementationConfig:
       is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
-    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"musa"`` (MUSA-native
+    fused kernel), ``"npu"`` (Ascend), ``"triton"`` (CUDA ``triton``).
+    Load-balancing loss has a CUDA Triton
     backend; on NPU, values equal to the dataclass default are normalized to
     ``"eager"`` before registry binding.
     """
@@ -1193,6 +1195,7 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "mudnn",
             "flex_attention",
             "magi_attention",
             "native-sparse",
@@ -1205,7 +1208,7 @@ class OpsImplementationConfig:
         default="fused_triton",
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'fused_mlu' (MLU) | 'fused_mlu_triton' (MLU) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'fused_musa' (MUSA) | 'fused_npu' (NPU) | 'fused_mlu' (MLU) | 'fused_mlu_triton' (MLU) | 'eager'. "
             "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
             "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
@@ -1224,7 +1227,7 @@ class OpsImplementationConfig:
     rms_norm_implementation: str = field(
         default="liger_kernel",
         metadata={
-            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' | "
+            "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'musa' | 'npu' | "
             "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
         },
     )
@@ -1238,13 +1241,13 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "'musa' | 'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
             "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
         default="eager",
-        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+        metadata={"help": "Rotary positional embedding in vision part. 'musa' | 'npu' | 'eager' (default)."},
     )
     load_balancing_loss_implementation: str = field(
         default="triton",
@@ -1278,7 +1281,8 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or MUSA). "
+            "'musa' uses the built-in S5000-tuned FLA bridge (MUSA only). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
@@ -1320,6 +1324,7 @@ class OpsImplementationConfig:
     )
 
     def __post_init__(self):
+        self._resolve_musa_attention()
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -1327,6 +1332,7 @@ class OpsImplementationConfig:
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
                 "flex_attention": "veomni_flex_attention_with_sp",
                 "magi_attention": "veomni_magi_attention_with_sp",
+                "mudnn": "veomni_mudnn_attention",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
@@ -1359,6 +1365,19 @@ class OpsImplementationConfig:
         self._apply_npu_default_fallback()
         self._apply_mlu_default_fallback()
         self._validate_implementations()
+
+    def _resolve_musa_attention(self):
+        """Prefer installed MUSA FA3 for the upstream FA2 attention default."""
+        from ..utils.import_utils import is_flash_attn_3_available, is_torch_musa_available
+
+        if not is_torch_musa_available() or self.attn_implementation != "flash_attention_2":
+            return
+        if is_flash_attn_3_available():
+            logger.info_rank0(
+                "attn_implementation: using locally available flash_attention_3 on MUSA "
+                "instead of the upstream flash_attention_2 default."
+            )
+            self.attn_implementation = "flash_attention_3"
 
     def _apply_npu_default_fallback(self):
         """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
@@ -1426,6 +1445,7 @@ class OpsImplementationConfig:
             is_apex_mlu_available,
             is_package_available,
             is_torch_mlu_available,
+            is_torch_musa_available,
             is_torch_npu_available,
         )
 
@@ -1440,6 +1460,10 @@ class OpsImplementationConfig:
 
         on_npu = is_torch_npu_available()
         on_mlu = is_torch_mlu_available()
+        on_musa = is_torch_musa_available()
+
+        if self.attn_implementation in {"mudnn", "veomni_mudnn_attention"} and not on_musa:
+            raise ValueError("muDNN attention requires an active torch-musa/MUSA device.")
 
         for field_name, npu_ok in _NPU_ALLOWED.items():
             value = getattr(self, field_name)
@@ -1454,6 +1478,21 @@ class OpsImplementationConfig:
                 )
             if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
                 raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+
+            # The Qwen3.5 GPU module is shared by CUDA and MUSA, but its
+            # MUSA-only text-RoPE OpSlot is injected only on an active MUSA
+            # device.  Reject the value here on other hardware instead of
+            # letting it silently fall through to the eager function.
+
+            if (
+                field_name in {"rotary_pos_emb_implementation", "rotary_pos_emb_vision_implementation"}
+                and value == "musa"
+                and not on_musa
+            ):
+                raise ValueError(
+                    f"{field_name}='musa' requires an active torch-musa/MUSA device. "
+                    "Set it to 'eager', 'liger_kernel', or a model-supported backend on other hardware."
+                )
 
         for field_name, mlu_ok in _MLU_ALLOWED.items():
             value = getattr(self, field_name)
