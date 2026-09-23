@@ -173,6 +173,7 @@ class TestMuDNNDevice(unittest.TestCase):
             attention_mask_len=[17, 31],
             tail_padding_length=0,
             output_hidden_states=False,
+            output_router_logits=True,
         )
         self.assertIsNone(weights)
         torch.testing.assert_close(result.squeeze(0), expected, atol=0.01, rtol=0.01)

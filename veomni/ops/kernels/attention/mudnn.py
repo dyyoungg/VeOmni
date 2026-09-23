@@ -265,6 +265,10 @@ def mudnn_attention_forward(
         "linear_attn_cu_seq_lens_q",
         "tail_padding_length",
         "output_hidden_states",
+        # Qwen3-MoE forwards this model-level bookkeeping flag through the
+        # Transformers attention interface.  Router logits are produced by
+        # the MoE block, so muDNN has no attention work to do for this value.
+        "output_router_logits",
     ):
         kwargs.pop(name, None)
     _check_options(dropout, scaling, None, softcap, None, False, False, kwargs)

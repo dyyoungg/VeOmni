@@ -68,9 +68,12 @@ from decord import cpu as decord_cpu
 
 from veomni.data.multimodal.image_utils import qwen25vl_image_preprocess
 
-from aoss_client.client import Client as CepthClient
+try:
+    from aoss_client.client import Client as CepthClient
+except ImportError:
+    CepthClient = None
 
-_cepthclient = CepthClient("/mnt/afs/yangdeyu/aoss_ydy_game.conf")
+_cepthclient = None
 
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -89,37 +92,37 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".o
 DATASETS: Dict[str, dict] = {
     # Audio ASR datasets
     "librispeech_test_clean": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/librispeech_test_clean_new.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_test_clean_new.aoss.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_test_other": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/librispeech_test_other_new.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_test_other_new.aoss.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_dev_clean": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/librispeech_dev_clean_new.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_dev_clean_new.aoss.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_dev_other": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/librispeech_dev_other_new.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_dev_other_new.aoss.json",
         "task": "generate",
         "metric": "wer",
     },
     "wenet": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/wenet_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/wenet_test.aoss.json",
         "task": "generate",
         "metric": "cer",
     },
     "aishell": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/aishell_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/aishell_test.aoss.json",
         "task": "generate",
         "metric": "cer",
     },
     "commonvoice15_zh": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/commonvoice15_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/commonvoice15_test.aoss.json",
         "task": "generate",
         "metric": "cer",
     },
@@ -144,38 +147,38 @@ DATASETS: Dict[str, dict] = {
         "metric": "cer",
     },
     "online_badaudio": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/online_badaudio.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/online_badaudio.aoss.json",
         "task": "generate",
         "metric": "cer",
     },
     # Image benchmarks
     "mmstar": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/VLM_Benchmark/MMStar/mmstar_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmstar_test.aoss.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "mmmu-dev": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/VLM_Benchmark/MMMU/mmmu-dev.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmmu-dev.aoss.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "RealWorldQA": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/VLM_Benchmark/RealWorldQA/RealWorldQA_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/RealWorldQA_test.aoss.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "CRPE": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/VLM_Benchmark/CRPE/crpe_test.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/crpe_test.aoss.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "MMhalBench": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/DPO_data/MMhal_Bench/mmhal-bench_without_image.jsonl",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmhal-bench_without_image.aoss.jsonl",
         "task": "generate",
         "metric": "accuracy",
     },
     "RefoMB": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/DPO_data/RefoMB/train.jsonl",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/train.aoss.jsonl",
         "task": "generate",
         "metric": "accuracy",
     },
@@ -183,6 +186,11 @@ DATASETS: Dict[str, dict] = {
         "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/ocr_eval.json",
         "task": "mcq",
         "metric": "accuracy",
+    },
+    "ocr_generate": {
+        "path": "/mnt/afs/cyan/pipelines/output/ocr_intense_val_generate.jsonl",
+        "task": "generate",
+        "metric": "edit_distance",
     },
     "SyncDoc": {
         "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/img_video_instruct/OCR/SynZhOCR/syncdoc.json",
@@ -195,7 +203,7 @@ DATASETS: Dict[str, dict] = {
         "metric": "accuracy",
     },
     "chartqa": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/VLM_Benchmark/ChartQA/chartqa_test_final.json",
+        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/chartqa_test_final.aoss.json",
         "task": "mcq",
         "metric": "accuracy",
     },
@@ -221,6 +229,19 @@ DATASETS: Dict[str, dict] = {
         "metric": "accuracy",
     },
 }
+
+
+def get_aoss_client():
+    """Create the AOSS client only when an s3 object needs to be accessed."""
+    global _cepthclient
+    if _cepthclient is None:
+        if CepthClient is None:
+            raise RuntimeError(
+                "AOSS support requires the aoss_client package. "
+                "Install it in the evaluation environment or use local media paths."
+            )
+        _cepthclient = CepthClient(os.environ.get("AOSS_FILE", "/mnt/afs/yangdeyu/aoss_ydy_game.conf"))
+    return _cepthclient
 
 
 # ── Metrics ──────────────────────────────────────────────────────────────────
@@ -347,8 +368,8 @@ def load_audio(
     sr: int = 16000,
 ) -> Tuple[Union[str, bytes], Optional[float], Optional[float]]:
     """Load audio, optionally apply gain. Returns (audio_input, original_db, adjusted_db)."""
-    if audio_path.startswith("s3://") and _cepthclient is not None:
-        audio_bytes = _cepthclient.Get(audio_path)
+    if audio_path.startswith("s3://"):
+        audio_bytes = get_aoss_client().Get(audio_path)
         audio, _ = librosa.load(io.BytesIO(audio_bytes), sr=sr, mono=True)
     elif os.path.exists(audio_path):
         audio, _ = librosa.load(audio_path, sr=sr, mono=True)
@@ -389,8 +410,8 @@ def load_video_frames(
     if os.path.exists(video_path):
         video_file = video_path
         target_input = video_path
-    elif video_path.startswith("s3://") and _cepthclient is not None:
-        video_bytes = _cepthclient.Get(video_path)
+    elif video_path.startswith("s3://"):
+        video_bytes = get_aoss_client().Get(video_path)
         target_input = f"/dev/shm/{uuid.uuid4().hex}.mp4"
         with open(target_input, "wb") as f:
             f.write(video_bytes)
@@ -504,8 +525,8 @@ def load_image_frames(
         if os.path.exists(path):
             with open(path, "rb") as f:
                 value = f.read()
-        elif "s3://" in path and _cepthclient is not None:
-            value = _cepthclient.Get(path)
+        elif path.startswith("s3://"):
+            value = get_aoss_client().Get(path)
 
         if value is not None:
             buff = io.BytesIO(np.frombuffer(value, np.uint8))
@@ -967,10 +988,72 @@ def load_dataset(path: str) -> list[dict]:
         return json.load(f)
 
 
+MEDIA_KEYS = ("audio", "audio_path", "video_path", "image_path", "image", "path")
+
+
+def _iter_media_values(sample: dict):
+    for key in MEDIA_KEYS:
+        value = sample.get(key)
+        if isinstance(value, str):
+            yield key, value
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    yield key, item
+
+
+def inspect_dataset_file(dataset_name: str, path: str) -> dict:
+    """Inspect a registry dataset without downloading any media."""
+    report = {
+        "dataset": dataset_name,
+        "json_path": path,
+        "json_exists": os.path.isfile(path),
+        "samples": 0,
+        "media": {"aoss": 0, "local_exists": 0, "local_missing": 0, "other": 0},
+        "missing_examples": [],
+    }
+    if not report["json_exists"]:
+        return report
+
+    data = load_dataset(path)
+    report["samples"] = len(data)
+    for sample in data:
+        for _, media_path in _iter_media_values(sample):
+            if media_path.startswith("s3://"):
+                kind = "aoss"
+            elif os.path.isfile(media_path):
+                kind = "local_exists"
+            else:
+                kind = "local_missing"
+                if len(report["missing_examples"]) < 5:
+                    report["missing_examples"].append(media_path)
+            report["media"][kind] += 1
+    return report
+
+
+def print_dataset_reports(dataset_names: Optional[list[str]] = None) -> None:
+    names = dataset_names or list(DATASETS)
+    for name in names:
+        if name not in DATASETS:
+            print(f"[dataset:{name}] unknown dataset")
+            continue
+        report = inspect_dataset_file(name, DATASETS[name]["path"])
+        print(
+            f"[dataset:{name}] json_exists={report['json_exists']} "
+            f"samples={report['samples']} media={report['media']}"
+        )
+        for path in report["missing_examples"]:
+            print(f"  missing: {path}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main(args):
+    if args.check_datasets:
+        print_dataset_reports(args.aoss_datasets or None)
+        return
+
     # Resolve dataset path
     if args.dataset_path and os.path.exists(args.dataset_path):
         data_path = args.dataset_path
@@ -1070,6 +1153,17 @@ if __name__ == "__main__":
         "--eval_dataset", type=str, default="", help=f"Predefined dataset: {', '.join(DATASETS.keys())}"
     )
     parser.add_argument("--dataset_path", type=str, default="", help="Custom JSON/JSONL path (overrides eval_dataset)")
+    parser.add_argument(
+        "--check_datasets",
+        action="store_true",
+        help="Check registered dataset JSON files and report local/AOSS media paths, then exit.",
+    )
+    parser.add_argument(
+        "--aoss_datasets",
+        nargs="+",
+        default=[],
+        help="Datasets used by --check_datasets (default: all).",
+    )
 
     # Task
     parser.add_argument(
