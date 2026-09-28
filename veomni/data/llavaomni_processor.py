@@ -431,7 +431,7 @@ class OmniSampleProcessor:
         resolution = (rw, rh)
         proj = self.model_args.image_projector_type
 
-        if "avgpool" in proj or "dual_conv" in proj:
+        if proj in ["dynamic_avgpool", "dual_conv", "frame_varlen_attention"]:
             scale = selected_downsample_ratio
             M = resolution[0] / self.image_patch_size / merge_size
             N = resolution[1] / self.image_patch_size / merge_size
@@ -1540,7 +1540,20 @@ class OmniSampleProcessor:
         # 否则 AUDIO_TOKEN_INDEX(-300) 会泄漏到最终 input_ids 导致 embedding OOB。
         has_audio_placeholder = (cur_input_ids == AUDIO_TOKEN_INDEX).any().item()
         if has_audio_placeholder and not actual_audio_lens:
-            print(f"[WARNING] sample {sample_idx}: audio placeholder found but audio features empty, skipping")
+            audio_paths = sample_data.get("audio", [])
+            if isinstance(audio_paths, str):
+                audio_paths = [audio_paths]
+            loaded_audio_lengths = [
+                int(audio.numel()) for audio in multimodal_resources.get("audio", [])
+                if isinstance(audio, torch.Tensor)
+            ]
+            print(
+                f"[WARNING] sample {sample_idx}: audio placeholder found but audio features "
+                f"empty, skipping; audio_paths={audio_paths!r}, "
+                f"loaded_audio_lengths={loaded_audio_lengths}, "
+                f"category={sample_data.get('category', 'unknown')!r}",
+                flush=True,
+            )
             return None
 
         cur_input_ids, cur_labels, token_counts = self._expand_multimodal_tokens(

@@ -1261,7 +1261,7 @@ class Qwen25VLEvaluationDataset(Dataset, OmniDataloader):
         language = sample_data.get("language", "en")
         text = sample_data.get("text", None)
 
-        if category in ["aishell", "librispeech", "cantonese", "commonvoice_ja"]:
+        if category in ["aishell", "librispeech", "cantonese", "commonvoice_ja", "online_badaudio"]:
             query_map = {
                 "zh": "请转录这段语音的内容。",
                 "en": "Please transcribe the audio content.",

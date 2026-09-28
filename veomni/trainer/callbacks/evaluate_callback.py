@@ -35,7 +35,7 @@ if TYPE_CHECKING:
  
 logger = get_logger(__name__)
 
-ASR_CATEGORIES = frozenset({"aishell", "librispeech", "cantonese", "commonvoice_ja"})
+ASR_CATEGORIES = frozenset({"aishell", "librispeech", "cantonese", "commonvoice_ja", "online_badaudio"})
  
 
 class EvaluateCallback(Callback):
