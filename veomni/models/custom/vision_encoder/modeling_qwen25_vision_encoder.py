@@ -387,12 +387,20 @@ class BeeBeeVLVisionModel(BaseEncoderModelMixin, Qwen25ViTPretrainedModel):
                 dummy_data = self._get_lm_dummy_data()
                 if self.freeze_vit:
                     with torch.no_grad():
-                        _ = super().forward(dummy_data["features"], dummy_data["grid_thw"])
+                        dummy_out = super().forward(dummy_data["features"], dummy_data["grid_thw"])
                 else:
                     dummy_out = super().forward(dummy_data["features"], dummy_data["grid_thw"])
-                    # Connect to computation graph with zero contribution so backward
-                    # triggers the same FSDP block all-gathers as real chunks.
-                    all_features[-1] = all_features[-1] + dummy_out.sum() * 0
+                # Keep the dummy result on the projector input path. This is required for
+                # checkpoint recomputation: otherwise early-stop may skip the dummy forward
+                # on ranks with fewer real chunks, desynchronizing FSDP collectives.
+                dummy_dependency = dummy_out.sum() * 0
+                if all_features:
+                    all_features[-1] = all_features[-1] + dummy_dependency
+                else:
+                    # A rank may have no local frames while another rank has real chunks.
+                    # Preserve an empty feature sequence, but keep the dummy computation
+                    # on the returned tensor's dependency path for checkpoint recompute.
+                    all_features.append(dummy_out[:0] + dummy_dependency)
 
         return torch.cat(all_features, dim=0)
 
