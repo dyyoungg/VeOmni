@@ -584,6 +584,7 @@ class OmniSampleProcessor:
         
         raw_img_list: List[Image.Image] = []
         video_io = io.BytesIO(video_file) if isinstance(video_file, bytes) else video_file
+        owns_video_io = isinstance(video_file, bytes)
         
         video_iter = None 
         vr = None
@@ -680,6 +681,9 @@ class OmniSampleProcessor:
                     vr = VideoReader(video_io, ctx=cpu(0), num_threads=1)
                     frames_np = vr.get_batch(frame_seq).asnumpy()
                     raw_img_list = [Image.fromarray(img).convert("RGB") for img in frames_np]
+                    # PIL copies own the frame data needed downstream. Do not
+                    # retain the full decoded batch while preprocessing them.
+                    del frames_np
                 except Exception as e:
                     logger.warning(f"[WARN] Decord 抽取失败，降级使用 imageio 重新抽取: {e}")
                     method = "imageio"  
@@ -706,7 +710,6 @@ class OmniSampleProcessor:
             return None
             
         finally:
-          
             if vr is not None:
                 del vr
                 
@@ -716,6 +719,8 @@ class OmniSampleProcessor:
                     del video_iter
                 except Exception:
                     pass
+            if owns_video_io:
+                video_io.close()
             self._cleanup_shm(video_file)
             
 
@@ -1701,10 +1706,12 @@ class LongVideoProcessor(OmniSampleProcessor):
         video_file = self.get_video_path(sample_data)
         subtitle_path = sample_data.get("subtitle_path", "")
         if not video_file or not subtitle_path:
+            self._cleanup_shm(video_file)
             return
 
         subtitle_list = self._get_subtitle_data(subtitle_path)
         if not subtitle_list:
+            self._cleanup_shm(video_file)
             return
 
         system_prompt = sample_data.get("system_prompt", "You are a helpful assistant.")
@@ -1737,6 +1744,7 @@ class LongVideoProcessor(OmniSampleProcessor):
             logger.warning(f"[WARN] Decord 初始化失败: {e}。开始降级使用 imageio 解析基础信息。{sample_data}")
             reader_state["backend"] = "imageio"
             vr = None
+            video_iter = None
             try:
                 # 如果 Decord 炸了，降级尝试用 av 和 imageio 获取视频元信息
                 with av.open(video_file) as container:
@@ -1765,6 +1773,11 @@ class LongVideoProcessor(OmniSampleProcessor):
             except Exception as e2:
                 # 连 imageio 都解析不出来，说明视频彻底损坏，放弃
                 logger.error(f"[ERROR] ImageIO 兜底解析失败，视频 {video_file} 彻底损坏: {e2} {sample_data}")
+                if video_iter is not None and hasattr(video_iter, "close"):
+                    try:
+                        video_iter.close()
+                    except Exception:
+                        pass
                 self._cleanup_shm(video_file)
                 return
 
@@ -2001,6 +2014,7 @@ class LongVideoProcessor(OmniSampleProcessor):
                     try:
                         frames_np = vr.get_batch(f_indices).asnumpy()
                         pil_frames = [Image.fromarray(img).convert("RGB").resize(res, Image.Resampling.BICUBIC) for img in frames_np]
+                        del frames_np
                     except Exception as e:
                         logger.warning(f"[WARN] Decord 失败，全局切换到 imageio: {e}")
                         reader_state["backend"] = "imageio"
@@ -2054,6 +2068,18 @@ class LongVideoProcessor(OmniSampleProcessor):
                 # 校验：如果抽取出来的数量和要求的数量对不上，说明 EOF 或损坏
                 if len(pil_frames) < len(f_indices):
                     logger.error(f"[Discard Segment] Expected {len(f_indices)} frames but got only {len(pil_frames)}. Marking whole video as failed.")
+                    for frame in pil_frames:
+                        try:
+                            frame.close()
+                        except Exception:
+                            pass
+                    for clip in video_clips:
+                        for frame in clip:
+                            try:
+                                frame.close()
+                            except Exception:
+                                pass
+                    video_clips.clear()
                     return None
                 
                 video_clips.append(pil_frames)
@@ -2062,12 +2088,21 @@ class LongVideoProcessor(OmniSampleProcessor):
         video_grid_thw = None
         # Qwen2.5-VL 特征处理
         if video_clips:
-            inputs = self.process_image_videos(video=video_clips, merge_size=self.video_merge_size)
-            pixel_values_videos = inputs["pixel_values_videos"]
-            video_grid_thw = inputs["video_grid_thw"]
-            
-            del video_clips
-            del inputs
+            try:
+                inputs = self.process_image_videos(video=video_clips, merge_size=self.video_merge_size)
+                pixel_values_videos = inputs["pixel_values_videos"]
+                video_grid_thw = inputs["video_grid_thw"]
+                del inputs
+            finally:
+                # Processing is synchronous and returns tensors. Close the
+                # temporary PIL images immediately for long-video chunks.
+                for clip in video_clips:
+                    for frame in clip:
+                        try:
+                            frame.close()
+                        except Exception:
+                            pass
+                video_clips.clear()
 
 
         # Token 拼接与展开
@@ -2159,6 +2194,7 @@ class ProactiveVideoProcessor(LongVideoProcessor):
 
         convs = sample_data.get('conversations', [])
         if not convs:
+            self._cleanup_shm(video_file)
             return
 
         system_prompt = sample_data.get("system", "You are a helpful assistant.")
@@ -2182,6 +2218,7 @@ class ProactiveVideoProcessor(LongVideoProcessor):
         except Exception:
             reader_state["backend"] = "imageio"
             vr = None
+            video_iter = None
             try:
                 with av.open(video_file) as container:
                     stream = container.streams.video[0]
@@ -2197,6 +2234,11 @@ class ProactiveVideoProcessor(LongVideoProcessor):
                         duration = container.duration / 1_000_000.0 if container.duration else 0.0
                         total_frames = int(duration * fps)
             except Exception:
+                if video_iter is not None and hasattr(video_iter, "close"):
+                    try:
+                        video_iter.close()
+                    except Exception:
+                        pass
                 self._cleanup_shm(video_file)
                 return
 
