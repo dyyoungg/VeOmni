@@ -275,8 +275,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
                 )
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        # self._save_model_assets()
-        super().on_train_begin(state)
+        # The base callback restores the DCP checkpoint. This callback only
+        # exports Hugging Face weights and must not restore the checkpoint again.
+        self._save_model_assets()
 
     def _save_model_assets(self):
         args: "VeOmniArguments" = self.trainer.args

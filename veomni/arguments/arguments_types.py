@@ -949,6 +949,42 @@ class TrainingArguments:
             )
         },
     )
+    spectral_entropy_monitor_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Log singular-value entropy of sampled trainable 2D/3D weights every N steps. "
+                "0 = disabled; FSDP2 row-sharded 2D parameters use owner all-to-all only at monitor steps."
+            )
+        },
+    )
+    spectral_entropy_monitor_layers: List[int] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Zero-based transformer layer indices to monitor, for example [0, 15, 31]. "
+                "All trainable 2D/3D parameters in these layers are selected. "
+                "An empty list disables parameter sampling."
+            )
+        },
+    )
+    spectral_entropy_monitor_max_slices: int = field(
+        default=4,
+        metadata={"help": "Maximum number of matrices sampled from each 3D parameter."},
+    )
+    spectral_entropy_monitor_log_per_param: bool = field(
+        default=True,
+        metadata={"help": "Also log one spectral entropy metric per sampled parameter."},
+    )
+    spectral_entropy_monitor_gather_3d: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Gather full 3D MoE weights before SVD. Disabled by default because a full expert tensor "
+                "can require several GB; the default reports a local-shard approximation."
+            )
+        },
+    )
 
     # Legacy public configuration. None means no override of model-local input.
     # __post_init__ resolves these to concrete defaults for standalone callers.

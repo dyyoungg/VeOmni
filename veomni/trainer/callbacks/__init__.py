@@ -22,6 +22,7 @@ from .base import Callback, TrainerState
 from .channel_loss_callback import ChannelLossCallback, ChannelLossComputer
 from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
+from .spectral_entropy_callback import SpectralEntropyMonitorCallback
 from .trace_callback import (
     RESERVED_TRAINING_METRIC_NAMES,
     EnvironMeterCallback,
@@ -44,6 +45,7 @@ __all__ = [
     "HuggingfaceCkptCallback",
     "HFLoraCkptCallback",
     "EvaluateCallback",
+    "SpectralEntropyMonitorCallback",
     "WandbTraceCallback",
     "ProfileTraceCallback",
     "EnvironMeterCallback",

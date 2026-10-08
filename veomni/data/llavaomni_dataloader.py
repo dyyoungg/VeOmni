@@ -821,7 +821,7 @@ class OmniDataloader(BaseDataLoader):
                         f"rss={mem_mb:.0f}MB "
                         f"gc=({gen0},{gen1},{gen2})"
                     )
-                # gc.collect()
+                gc.collect()
         try:
             for f in file_cache.values():
                 f.close()

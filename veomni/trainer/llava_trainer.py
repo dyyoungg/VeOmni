@@ -57,6 +57,7 @@ from veomni.trainer.callbacks import (
     EvaluateCallback,
     HuggingfaceCkptCallback,
     MoERouterMonitorCallback,
+    SpectralEntropyMonitorCallback,
     ProfileTraceCallback,
     VideoTqdmCallback,
     TrainerState,
@@ -726,11 +727,13 @@ class VLMTrainer:
         self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        self.spectral_entropy_monitor_callback = SpectralEntropyMonitorCallback(self)
         self.state = TrainerState()
         self._init_channel_loss()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
+        self.spectral_entropy_monitor_callback.on_train_begin(self.state)
         self.tqdm_callback.on_train_begin(self.state)
         self.wandb_callback.on_train_begin(self.state)
         self.tensorboard_callback.on_train_begin(self.state)
@@ -742,6 +745,7 @@ class VLMTrainer:
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
+        self.spectral_entropy_monitor_callback.on_train_end(self.state)
         self.tqdm_callback.on_train_end(self.state)
         self.wandb_callback.on_train_end(self.state)
         self.tensorboard_callback.on_train_end(self.state)
@@ -785,6 +789,7 @@ class VLMTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.spectral_entropy_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.timing_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)

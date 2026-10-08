@@ -79,6 +79,7 @@ from .callbacks import (
     HFLoraCkptCallback,
     HuggingfaceCkptCallback,
     MoERouterMonitorCallback,
+    SpectralEntropyMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
     TrainerState,
@@ -519,6 +520,7 @@ class BaseTrainer(Stateful, ABC):
             checkpoint_callbacks = [self.checkpointer_callback, self.hf_ckpt_callback]
         self.evaluate_callback = EvaluateCallback(trainer)
         self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
+        self.spectral_entropy_monitor_callback = SpectralEntropyMonitorCallback(trainer)
         self.channel_loss_callback = ChannelLossCallback(trainer)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
@@ -531,6 +533,7 @@ class BaseTrainer(Stateful, ABC):
         # logs them), so its per-source metrics survive into the logged payload.
         self._callbacks = [
             self.environ_meter_callback,
+            self.spectral_entropy_monitor_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
