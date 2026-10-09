@@ -33,6 +33,7 @@ from veomni.data.llavaomni_processor import OmniSampleProcessor, LongVideoProces
 from veomni.distributed.sequence_parallel import get_data_parallel_rank, get_data_parallel_world_size, get_ulysses_sequence_parallel_cpu_group
 from veomni.distributed.parallel_state import get_parallel_state, _init_parallel_state
 from veomni.utils.logging import get_logger
+from veomni.utils.device import get_device_type
 from veomni.utils.helper import read_data
 from veomni.data.ulysses_protocol import RecordState, SynchronizedDataError, synchronize_records
 
@@ -676,6 +677,22 @@ class PrefetchingPackedLoader:
     def raw_samples_consumed(self):
         return self.samples_consumed
 
+    def global_samples_consumed(self) -> int:
+        """Sum committed raw records over DP ranks, once per SP replica."""
+        if not dist.is_available() or not dist.is_initialized():
+            return int(self.samples_consumed)
+
+        ps = get_parallel_state()
+        group = ps.dp_group if ps is not None else None
+        backend = str(dist.get_backend(group)).lower()
+        if backend in {"nccl", "hccl", "mccl", "cncl"}:
+            device = torch.device(get_device_type(), int(os.environ.get("LOCAL_RANK", 0)))
+        else:
+            device = torch.device("cpu")
+        count = torch.tensor([self.samples_consumed], dtype=torch.long, device=device)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM, group=group)
+        return int(count.item())
+
     def _propagate(self, obj, method, value):
         if hasattr(obj, method):
             getattr(obj, method)(value)
@@ -692,7 +709,7 @@ class PrefetchingPackedLoader:
         self._pending_sample = None
         self.samples_consumed = 0
 
-    def mark_batch_consumed(self):
+    def mark_batch_consumed(self, batch=None):
         """Commit progress only after the trainer successfully updates parameters."""
         if self._pending_sample is None:
             raise RuntimeError("No Ulysses batch is pending consumption")
@@ -877,7 +894,7 @@ def make_ulysses_train_dataloader(data_args, training_args, model_args, tokenize
  
     Returns:
         PrefetchingPackedLoader: one epoch of lists of collated micro-batches.
-        Call mark_batch_consumed() after each successful optimizer step.
+        Call mark_batch_consumed(batches) after each successful optimizer step.
     """
    
     # ── Dataset ───────────────────────────────────────────────────────────────
@@ -1124,7 +1141,7 @@ def test_ulysess(args=None):
                             raise AssertionError(f"Pre-slice batch mismatch at step {steps}: {group}")
                     if any(peer["state"] == "eof" for peer in peers):
                         break
-                    train_loader.mark_batch_consumed()
+                    train_loader.mark_batch_consumed(batches)
                     steps += 1
                     micro_batches_checked += len(batches)
                     if dist.get_rank() == 0:

@@ -452,5 +452,3 @@ class BaseDataLoader:
             if tensor is not None:
                 result.append(tensor)
         return result
-
-  

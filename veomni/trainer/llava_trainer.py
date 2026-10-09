@@ -900,49 +900,16 @@ class VLMTrainer:
                 self.model.set_reshard_after_backward(True)
 
 
-    def _get_consumed_samples(self) -> int:
-        """Read the local consumed-sample count from the dataloader.
-
-        Handles multiprocessing.Value (OmniDataloader) and plain int
-        (PrefetchingPackedLoader) transparently.
-        """
-        raw = self.train_dataloader.samples_consumed
-        return raw.value if hasattr(raw, "value") else int(raw)
-
     def _sync_video_trained_num(self, epoch) -> None:
-        """Sync consumed data count across ranks and update training progress."""
+        """Read DP-wide consumed data progress from the dataloader."""
         args = self.args
 
         if getattr(args.train, "use_fake_data", False):
-            video_trained_num = self.state.global_step
-        elif hasattr(self.train_dataloader, "samples_consumed"):
-            # Unified path for OmniDataloader (remote or local) and
-            # Ulysses PrefetchingPackedLoader. All-reduce across DP ranks.
-            consumed_tensor = torch.tensor(
-                [self._get_consumed_samples()], dtype=torch.long, device=self.device
-            )
-            if dist.is_initialized():
-                ps = get_parallel_state()
-                dp_group = ps.dp_group if ps is not None else None
-                dist.all_reduce(consumed_tensor, op=dist.ReduceOp.SUM, group=dp_group)
-            video_trained_num = int(consumed_tensor.item())
-        elif args.train.remote_dataloader and hasattr(self.train_dataloader, "remote_data_index"):
-            # Legacy remote path without samples_consumed: broadcast from rank 0
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            current_global_index = self.train_dataloader.remote_data_index.value if rank == 0 else 0
-            data_tensor = torch.tensor([current_global_index], dtype=torch.long, device=self.device)
-            if dist.is_initialized():
-                dist.broadcast(data_tensor, src=0)
-            video_trained_num = int(data_tensor.item())
+            self.state.video_trained_num = self.state.global_step + 1
         else:
-            remain_data = len(self.train_dataloader.data_list)
-            logger.warning(
-                "dataloader has no samples_consumed or remote_data_index, "
-                "defaulting to len(data_list)"
-            )
-            video_trained_num = self.init_data_size - remain_data
+            video_trained_num = self.train_dataloader.global_samples_consumed()
+            self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
 
-        self.state.video_trained_num = video_trained_num + epoch * self.init_data_size
         self.state.epoch = self.state.video_trained_num / max(self.train_steps, 1)
  
     
@@ -1029,8 +996,7 @@ class VLMTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        if isinstance(self.train_dataloader, PrefetchingPackedLoader):
-            self.train_dataloader.mark_batch_consumed()
+        self.train_dataloader.mark_batch_consumed(micro_batches)
         self._sync_video_trained_num(epoch)
 
         warmup_steps = int(
@@ -1090,8 +1056,8 @@ class VLMTrainer:
                 # Keep checkpoint-restored counter on mid-epoch resume
                 if not (epoch == self.state.start_epoch and self.start_step > 0):
                     self.train_dataloader.remote_data_index.value = 0
-                    if hasattr(self.train_dataloader, "samples_consumed"):
-                        self.train_dataloader.samples_consumed.value = 0
+                    if hasattr(self.train_dataloader, "_remote_resume_index"):
+                        self.train_dataloader._remote_resume_index = 0
             self.train_dataloader.set_epoch(epoch)
             self.train_dataloader.launch()
             data_iterator = iter(self.train_dataloader)

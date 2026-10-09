@@ -37,6 +37,14 @@ import torch.nn as nn
 import transformers
 from transformers import set_seed as set_seed_func
 
+try:
+    from urllib3.exceptions import InsecureRequestWarning
+except ImportError:  # pragma: no cover - urllib3 is provided by requests
+    InsecureRequestWarning = None
+
+if InsecureRequestWarning is not None:
+    warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+
 from ..distributed.parallel_state import get_parallel_state
 from . import logging
 from .count_flops import VeomniFlopsCounter

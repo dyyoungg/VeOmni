@@ -393,6 +393,15 @@ class EnvironMeterCallback(Callback):
         self._tracemalloc_started = False
         self._tracemalloc_snapshot = None
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Save the loss smoothing state used by the training curve."""
+        return {"loss_window": list(self._loss_window)}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Restore loss smoothing state, tolerating older checkpoints."""
+        self._loss_window.clear()
+        self._loss_window.extend(state_dict.get("loss_window", []))
+
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)

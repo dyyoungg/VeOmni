@@ -200,7 +200,7 @@ def consume(loader):
     result = []
     for batches in loader:
         result.append([batch["input_ids"].tolist() for batch in batches])
-        loader.mark_batch_consumed()
+        loader.mark_batch_consumed(batches)
     return result
 
 
@@ -251,6 +251,27 @@ def test_single_epoch_and_fresh_epoch_state():
         assert loader.epoch == 1
     finally:
         loader.close()
+
+
+def test_global_samples_consumed_uses_dp_group(monkeypatch):
+    loader = make_loader()
+    loader.samples_consumed = 3
+    dp_group = object()
+    monkeypatch.setitem(
+        Loader.global_samples_consumed.__globals__,
+        "get_parallel_state",
+        lambda: SimpleNamespace(dp_group=dp_group),
+    )
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+
+    def all_reduce(count, op, group):
+        assert group is dp_group
+        assert op == dist.ReduceOp.SUM
+        count += 4
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    assert loader.global_samples_consumed() == 7
 
 
 def test_restore_rejects_changed_batch_configuration():

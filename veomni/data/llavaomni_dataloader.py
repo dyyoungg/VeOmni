@@ -48,6 +48,7 @@ from veomni.utils.constants import (
 )
 from veomni.data.multimodal.image_utils import  tokenizer_audio_token
 from veomni.data.llavaomni_processor import OmniSampleProcessor, OmniSample, LongVideoProcessor, ProactiveVideoProcessor
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.constants import get_image_video_audio_placeholder
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
@@ -71,6 +72,14 @@ except Exception:
 
 AOSS_FILE = os.environ.get("AOSS_FILE", "/mnt/afs/yangdeyu/aoss_ydy_game.conf")
 logger = helper.create_logger(__name__)
+
+
+class _OmniBatch(list):
+    """Model inputs with the number of source records to confirm after training."""
+
+    def __init__(self, batches, raw_samples: int):
+        super().__init__(batches)
+        self.raw_samples = raw_samples
 
 
 def set_env_cpu_limit(cpu_num: int = 1) -> None:
@@ -279,6 +288,9 @@ class OmniDataloader(BaseDataLoader):
         self.processor: Optional[OmniSampleProcessor] = None
         self.image_token_id, self.video_token_id, self.audio_token_id  = get_image_video_audio_placeholder(tokenizer)
         self._resumed_trained_index = 0
+        self._remote_resume_index = 0
+        self._local_epoch = None
+        self._full_data_list = None
 
         # Channel loss: load mapping from config
         self.channel_mapping: Dict[str, str] = {}
@@ -337,30 +349,44 @@ class OmniDataloader(BaseDataLoader):
             self.proactive_processor._threadpool = self.processor._threadpool
     
     def state_dict(self) -> Dict:
-
-        if self.training_args.remote_dataloader and hasattr(self, "samples_consumed"):
-            effective_remote_index = self.samples_consumed.value
-        else:
-            effective_remote_index = self.remote_data_index.value
-
-        if hasattr(self, "samples_consumed"):
-            trained_index = self.samples_consumed.value
-        else:
-            total = len(self.data_list)
-            remaining = self.data_queue.qsize() if hasattr(self, "data_queue") else 0
-            trained_index = self._resumed_trained_index + (total - remaining)
+        if self.training_args.remote_dataloader:
+            if not hasattr(self, "samples_consumed"):
+                raise RuntimeError("Launch the remote dataloader before saving its state")
+            return {
+                "data_path": self.data_args.train_path,
+                "remote_data_index": self.global_samples_consumed(),
+            }
 
         return {
-            "data_path":     self.data_args.train_path,
-            "trained_index": max(trained_index, 0),
-            "remote_data_index": effective_remote_index,
+            "data_path": self.data_args.train_path,
+            "trained_index": (
+                self.samples_consumed.value if hasattr(self, "samples_consumed") else self._resumed_trained_index
+            ),
         }
+
+    def global_samples_consumed(self) -> int:
+        """Return the DP-wide record count, including the remote resume cursor."""
+        local = int(self.samples_consumed.value)
+        if not dist.is_available() or not dist.is_initialized():
+            return (self._remote_resume_index if self.training_args.remote_dataloader else 0) + local
+
+        ps = get_parallel_state()
+        group = ps.dp_group if ps is not None else None
+        backend = str(dist.get_backend(group)).lower()
+        if backend in {"nccl", "hccl", "mccl", "cncl"}:
+            device = torch.device(get_device_type(), self.local_rank)
+        else:
+            device = torch.device("cpu")
+        count = torch.tensor([local], dtype=torch.long, device=device)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM, group=group)
+        return (self._remote_resume_index if self.training_args.remote_dataloader else 0) + int(count.item())
 
     def load_state_dict(self, state: Dict) -> None:
         saved_path   = state.get("data_path", "")
         resume_index = state.get("trained_index", 0)
         remote_index = state.get("remote_data_index", 0)
         self.remote_data_index.value = remote_index
+        self._remote_resume_index = remote_index if self.training_args.remote_dataloader else 0
 
         if not self.training_args.remote_dataloader:
             if saved_path and saved_path != self.data_args.train_path:
@@ -375,19 +401,32 @@ class OmniDataloader(BaseDataLoader):
                 return
 
             total = len(self.data_list)
-            if resume_index >= total:
+            if resume_index > total:
                 logger.warning(
-                    f"[Dataloader] trained_index={resume_index} >= total={total}, "
-                    f"data exhausted, starting from scratch."
+                    f"[Dataloader] trained_index={resume_index} > total={total}, "
+                    f"starting from scratch."
                 )
                 return
 
+            self._full_data_list = self.data_list
             self.data_list = self.data_list[resume_index:]
             self._resumed_trained_index = resume_index
             logger.info(
                 f"[Dataloader] Resumed: skipped {resume_index}/{total}, "
                 f"{len(self.data_list)} samples remaining."
             )
+
+    def set_epoch(self, epoch: int) -> None:
+        if not self.training_args.remote_dataloader:
+            if self._local_epoch is not None and epoch != self._local_epoch:
+                if self._full_data_list is not None:
+                    self.data_list = self._full_data_list
+                    self._full_data_list = None
+                self._resumed_trained_index = 0
+                if hasattr(self, "samples_consumed"):
+                    self.samples_consumed.value = 0
+            self._local_epoch = epoch
+        super().set_epoch(epoch)
 
     def build_inputs_token(
         self,
@@ -435,8 +474,7 @@ class OmniDataloader(BaseDataLoader):
         self._clear_pack_buffer()
         self.worker_metrics_queue = torch.multiprocessing.Queue()
         self.samples_consumed = torch.multiprocessing.Value(
-            "i", self.remote_data_index.value if self.training_args.remote_dataloader
-            else self._resumed_trained_index
+            "q", 0 if self.training_args.remote_dataloader else self._resumed_trained_index
         )
         if getattr(self.data_args, "save_token_counted_data", False):
             self.save_info_queue = torch.multiprocessing.Queue()
@@ -856,7 +894,8 @@ class OmniDataloader(BaseDataLoader):
         self, cur_input_ids: torch.Tensor, cur_labels: torch.Tensor,
         cur_caption_len: int, resources: Dict, token_counts: Dict,
         channel_id: str = "other",
-    ) -> None:
+        num_raw_samples: int = 1,
+    ) -> bool:
 
         max_len = self.tokenizer.model_max_length
         # 首先检查长度截断
@@ -865,13 +904,13 @@ class OmniDataloader(BaseDataLoader):
             cur_labels = cur_labels[:max_len]
             if not self._validate_truncation(cur_input_ids, token_counts):
                 print(f"WARNING: Skipping sample. Truncation to {max_len} cut off multimodal tokens.")
-                return
+                return False
             cur_caption_len = max_len
 
         if not self.training_args.pack_seq:
             self._enqueue_packed_result(cur_input_ids, cur_labels, [cur_caption_len], resources,
-                                        channel_ids=[channel_id], num_raw_samples=1)
-            return
+                                        channel_ids=[channel_id], num_raw_samples=num_raw_samples)
+            return True
         image_num = 0
         if len(self.new_images_thw):
             image_num = torch.cat(self.new_images_thw)[:,0].sum().item()
@@ -883,7 +922,8 @@ class OmniDataloader(BaseDataLoader):
 
 
         self._append_to_pack_buffer(cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
-                                    channel_id=channel_id)
+                                    channel_id=channel_id, num_raw_samples=num_raw_samples)
+        return True
 
 
     def _flush_pack_buffer(self) -> None:
@@ -999,13 +1039,13 @@ class OmniDataloader(BaseDataLoader):
         return position_ids.squeeze(1)
 
     def _append_to_pack_buffer(self, cur_input_ids, cur_labels, cur_caption_len, resources, token_counts,
-                               channel_id: str = "other"):
+                               channel_id: str = "other", num_raw_samples: int = 1):
         self.new_caption_len += cur_caption_len
         self.new_input_ids.append(cur_input_ids)
         self.new_labels.append(cur_labels)
         self.attention_mask_len.append(cur_caption_len)
         self.channel_id_list.append(channel_id)
-        self._pack_raw_count += 1
+        self._pack_raw_count += num_raw_samples
 
         if resources.get("image_pixels") is not None and resources.get("image_thw") is not None:
             self.new_images_list.append(resources["image_pixels"])
@@ -1045,7 +1085,11 @@ class OmniDataloader(BaseDataLoader):
     # Finetune worker: dispatch + batch packing
     # ------------------------------------------------------------------    
     def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False,
-                             file_path: Optional[str] = None) -> None:        
+                             file_path: Optional[str] = None) -> None:
+        is_subtitle = is_long_video or bool(sample_data.get("subtitle_path"))
+        if is_subtitle:
+            with self.samples_consumed.get_lock():
+                self.samples_consumed.value += 1
         # Route processing through the proactive processor if enabled
         # if getattr(self.training_args, "proactive", False):
         #     processor = self.proactive_processor
@@ -1064,7 +1108,7 @@ class OmniDataloader(BaseDataLoader):
                 # 走向主动式数据（主动式音频部署、主动式长视频字幕）处理流程
                 processor = self.proactive_processor
         else:
-            processor = self.long_video_processor if is_long_video else self.processor
+            processor = self.long_video_processor if is_subtitle else self.processor
         
         samples = processor.process(sample_data, sample_idx)
         if samples is None:
@@ -1072,16 +1116,24 @@ class OmniDataloader(BaseDataLoader):
             
         # 兼容单样本(短数据)和迭代器(长视频数据)两种返回格式
         if isinstance(samples, Iterator):
+            counted = is_subtitle
             try:
                 for sample in samples:
                     if sample is None:
                         continue
-                    self._process_single_sample(sample_data, sample, processor, file_path=file_path)
+                    accepted = self._process_single_sample(
+                        sample_data, sample, processor, file_path=file_path,
+                        num_raw_samples=0 if counted else 1,
+                    )
+                    counted = counted or accepted
             finally:
                 if hasattr(samples, 'close'):
                     samples.close()
         else:
-            self._process_single_sample(sample_data, samples, processor, file_path=file_path)
+            self._process_single_sample(
+                sample_data, samples, processor, file_path=file_path,
+                num_raw_samples=0 if is_subtitle else 1,
+            )
 
     def _resolve_channel_id(self, sample_data: Dict, file_path: Optional[str] = None) -> str:
         """Map sample's dataset_type to a channel name via self.channel_mapping.
@@ -1099,7 +1151,7 @@ class OmniDataloader(BaseDataLoader):
         return "unknown"
 
     def _process_single_sample(self, sample_data: Dict, sample: OmniSample, processor: Any,
-                               file_path: Optional[str] = None) -> None:
+                               file_path: Optional[str] = None, num_raw_samples: int = 1) -> bool:
         if getattr(self.data_args, "save_token_counted_data", False):
             system_token = processor._build_system_token(sample_data, 0)
             self._save_token_counts(
@@ -1107,7 +1159,7 @@ class OmniDataloader(BaseDataLoader):
             )
 
         channel_id = self._resolve_channel_id(sample_data, file_path=file_path)
-        self._pack_and_enqueue(
+        return self._pack_and_enqueue(
             cur_input_ids=sample.input_ids,
             cur_labels=sample.labels,
             cur_caption_len=sample.caption_len,
@@ -1124,6 +1176,7 @@ class OmniDataloader(BaseDataLoader):
             },
             token_counts=sample.token_counts,
             channel_id=channel_id,
+            num_raw_samples=num_raw_samples,
         )
        
         
@@ -1167,9 +1220,9 @@ class OmniDataloader(BaseDataLoader):
                 break
 
             # Keep each packed record as an independent model micro-batch.
-            micro_batches = [
+            micro_batches = _OmniBatch([
                 Qwen25VLcollatorFunc([data], self.tokenizer) for data in batch_data
-            ]
+            ], batch_raw_samples)
             del batch_data
 
             bf16_keys = ["images", "pixel_values", "pixel_values_videos", "audio_features"]
@@ -1185,7 +1238,6 @@ class OmniDataloader(BaseDataLoader):
             while True: # add loop for gracefully exit
                 try:
                     self.batch_data_queue.put(micro_batches, timeout=1)
-                    self.samples_consumed.value += batch_raw_samples
                     break
                 except queue.Full:
                     pass
@@ -1194,6 +1246,13 @@ class OmniDataloader(BaseDataLoader):
 
             if self.end_signal:
                 break
+
+    def mark_batch_consumed(self, batch: Any) -> None:
+        """Commit the batch fetched by the trainer after a successful update."""
+        if not isinstance(batch, _OmniBatch):
+            raise RuntimeError("Expected an OmniDataloader batch")
+        with self.samples_consumed.get_lock():
+            self.samples_consumed.value += batch.raw_samples
                 
     
 
