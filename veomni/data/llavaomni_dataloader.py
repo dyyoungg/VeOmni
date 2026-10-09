@@ -799,6 +799,7 @@ class OmniDataloader(BaseDataLoader):
                     sample_index += 1
                 except Exception as e:
                     logger.error(f"Read Error at index {data_index}: {e}")
+                    self._add_samples_consumed()
                     if file_path is not None and file_path in file_cache:
                         try:
                             file_cache[file_path].close()
@@ -936,6 +937,7 @@ class OmniDataloader(BaseDataLoader):
         }
         if not self._validate_truncation(packed_ids, packed_counts):
             print("WARNING: Packed batch failed validation. Dropping.")
+            self._add_samples_consumed(self._pack_raw_count)
             return
 
         def _safe_cat(lst):
@@ -1084,12 +1086,15 @@ class OmniDataloader(BaseDataLoader):
     # ------------------------------------------------------------------
     # Finetune worker: dispatch + batch packing
     # ------------------------------------------------------------------    
+    def _add_samples_consumed(self, count: int = 1) -> None:
+        with self.samples_consumed.get_lock():
+            self.samples_consumed.value += count
+
     def worker_loop_finetune(self, sample_data: Dict, sample_idx: int, is_long_video: bool = False,
                              file_path: Optional[str] = None) -> None:
         is_subtitle = is_long_video or bool(sample_data.get("subtitle_path"))
         if is_subtitle:
-            with self.samples_consumed.get_lock():
-                self.samples_consumed.value += 1
+            self._add_samples_consumed()
         # Route processing through the proactive processor if enabled
         # if getattr(self.training_args, "proactive", False):
         #     processor = self.proactive_processor
@@ -1112,6 +1117,8 @@ class OmniDataloader(BaseDataLoader):
         
         samples = processor.process(sample_data, sample_idx)
         if samples is None:
+            if not is_subtitle:
+                self._add_samples_consumed()
             return
             
         # 兼容单样本(短数据)和迭代器(长视频数据)两种返回格式
@@ -1129,11 +1136,15 @@ class OmniDataloader(BaseDataLoader):
             finally:
                 if hasattr(samples, 'close'):
                     samples.close()
+            if not counted:
+                self._add_samples_consumed()
         else:
-            self._process_single_sample(
+            accepted = self._process_single_sample(
                 sample_data, samples, processor, file_path=file_path,
                 num_raw_samples=0 if is_subtitle else 1,
             )
+            if not is_subtitle and not accepted:
+                self._add_samples_consumed()
 
     def _resolve_channel_id(self, sample_data: Dict, file_path: Optional[str] = None) -> str:
         """Map sample's dataset_type to a channel name via self.channel_mapping.

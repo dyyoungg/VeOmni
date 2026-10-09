@@ -22,6 +22,11 @@ and `torch_rng_state`. Each rank writes and restores its own file. Full-model
 DCP resumes restore model and optimizer; LoRA DCP saves trainable parameters
 only and still needs the pretrained base weights.
 
+For the Omni remote loader, the saved cursor includes records skipped after a
+read or processing failure. Successful ordinary records count after the optimizer
+step; subtitle records count when processing begins. The cursor remains a count,
+so out-of-order workers and prefetched records can still affect exact replay.
+
 `train.checkpoint.load_path` points directly to the step directory. `auto`
 discovers a `global_step_*` directory with a root `.metadata` marker.
 `scripts/merge_dcp_to_hf.py --load-dir` takes that same DCP directory.
