@@ -2,12 +2,14 @@
 Unified multimodal evaluation via SGLang server.
 
 Supports audio / image / video inputs, MCQ and free-form generation tasks,
-with pluggable metrics (accuracy, CER, WER, edit distance).
+with pluggable metrics (accuracy, CER, WER, edit distance, VQA accuracy,
+DocVQA ANLS, and ScreenSpot click accuracy).
 
 Task and metric are auto-resolved per sample when not specified:
   - audio (zh) -> generate + cer
   - audio (en) -> generate + wer
   - image/video -> mcq + accuracy
+  - TextVQA / DocVQA / ScreenSpot categories -> generate + benchmark metric
   - category ending with '_generate' -> generate + edit_distance
 Use --task / --metric to override globally.
 
@@ -25,6 +27,11 @@ Usage:
     python eval_sglang.py --eval_dataset mmstar \
         --temperature 0.1 --top_k 20 --top_p 0.8
 
+    # Visual compensation benchmarks (docqa also accepts the docvqa alias)
+    python scripts/eval_sglang.py --eval_dataset textvqa --temperature 0
+    python scripts/eval_sglang.py --eval_dataset docqa --temperature 0
+    python scripts/eval_sglang.py --eval_dataset screenspot --temperature 0
+
     # Custom dataset, multiple servers
     python eval_sglang.py --dataset_path /path/to/data.json \
         --task generate --metric wer --urls 10.0.0.1 10.0.0.2
@@ -38,14 +45,17 @@ import asyncio
 import base64
 import io
 import json
+import math
 import os
 import random
 import re
+import string
 import sys
 import time
 import uuid
 import warnings
-from typing import Callable, Dict, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -84,147 +94,155 @@ DEFAULT_AUDIO_START_TOKEN = "<|audio_start|>"
 DEFAULT_AUDIO_END_TOKEN = "<|audio_end|>"
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v", ".gif"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".svg"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".svg", ".mpo"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus", ".pcm"}
 
 # ── Dataset Registry ─────────────────────────────────────────────────────────
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Index paths are relative to the repository root, independent of the caller's cwd.
 DATASETS: Dict[str, dict] = {
     # Audio ASR datasets
     "librispeech_test_clean": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_test_clean_new.aoss.json",
+        "path": "datasets/audio/librispeech_test_clean.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_test_other": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_test_other_new.aoss.json",
+        "path": "datasets/audio/librispeech_test_other.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_dev_clean": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_dev_clean_new.aoss.json",
+        "path": "datasets/audio/librispeech_dev_clean.json",
         "task": "generate",
         "metric": "wer",
     },
     "librispeech_dev_other": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/librispeech_dev_other_new.aoss.json",
+        "path": "datasets/audio/librispeech_dev_other.json",
         "task": "generate",
         "metric": "wer",
     },
     "wenet": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/wenet_test.aoss.json",
+        "path": "datasets/audio/wenet.json",
         "task": "generate",
         "metric": "cer",
     },
     "aishell": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/aishell_test.aoss.json",
+        "path": "datasets/audio/aishell.json",
         "task": "generate",
         "metric": "cer",
     },
     "commonvoice15_zh": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/commonvoice15_test.aoss.json",
+        "path": "datasets/audio/commonvoice15_zh.json",
         "task": "generate",
         "metric": "cer",
     },
     "commonvoice17_zh": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/commonvoice17/commonvoice17_zh_test.json",
+        "path": "datasets/audio/commonvoice17_zh.json",
         "task": "generate",
         "metric": "cer",
     },
     "commonvoice17_en": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/academic_mix/commonvoice17/json/commonvoice_test.json",
+        "path": "datasets/audio/commonvoice17_en.json",
         "task": "generate",
         "metric": "wer",
     },
     "test_meeting": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/test_meeting.json",
+        "path": "datasets/audio/test_meeting.json",
         "task": "generate",
         "metric": "cer",
     },
     "test_net": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/audio/evaluation_dataset/test_net.json",
+        "path": "datasets/audio/test_net.json",
         "task": "generate",
         "metric": "cer",
     },
     "online_badaudio": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/online_badaudio.aoss.json",
+        "path": "datasets/audio/online_badaudio.json",
         "task": "generate",
         "metric": "cer",
     },
     # Image benchmarks
     "mmstar": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmstar_test.aoss.json",
+        "path": "datasets/image/mmstar.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "mmmu-dev": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmmu-dev.aoss.json",
+        "path": "datasets/image/mmmu-dev.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "RealWorldQA": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/RealWorldQA_test.aoss.json",
+        "path": "datasets/image/realworldqa.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "CRPE": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/crpe_test.aoss.json",
+        "path": "datasets/image/crpe.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "MMhalBench": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/mmhal-bench_without_image.aoss.jsonl",
+        "path": "datasets/image/mmhalbench.jsonl",
         "task": "generate",
         "metric": "accuracy",
     },
     "RefoMB": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/train.aoss.jsonl",
+        "path": "datasets/image/refomb.jsonl",
         "task": "generate",
         "metric": "accuracy",
     },
     "ocr": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/ocr_eval.json",
+        "path": "datasets/image/ocr.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "ocr_generate": {
-        "path": "/mnt/afs/cyan/pipelines/output/ocr_intense_val_generate.jsonl",
+        "path": "datasets/image/ocr_generate.jsonl",
         "task": "generate",
         "metric": "edit_distance",
     },
-    "SyncDoc": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/img_video_instruct/OCR/SynZhOCR/syncdoc.json",
-        "task": "mcq",
-        "metric": "accuracy",
+    "textvqa": {
+        "path": "datasets/image/textvqa.json",
+        "task": "generate",
+        "metric": "vqa_accuracy",
     },
-    "SyncDoc_complex": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/data/img_video_instruct/OCR/SynZhOCR/syncdoc_new.json",
-        "task": "mcq",
-        "metric": "accuracy",
+    "docqa": {
+        "path": "datasets/image/docqa.json",
+        "task": "generate",
+        "metric": "anls",
+    },
+    "screenspot": {
+        "path": "datasets/image/screenspot.json",
+        "task": "generate",
+        "metric": "screenspot_accuracy",
     },
     "chartqa": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/VeOmni-Dev/exp_data/aoss_datasets/chartqa_test_final.aoss.json",
+        "path": "datasets/image/chartqa.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     # Video benchmarks
     "mvbench": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/mvbench_test.json",
+        "path": "datasets/video/mvbench.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "lvbench": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/lvbench_test.json",
+        "path": "datasets/video/lvbench.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "videomme": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/videomme_test.json",
+        "path": "datasets/video/videomme.json",
         "task": "mcq",
         "metric": "accuracy",
     },
     "videommmu": {
-        "path": "/mnt/afs/yangdeyu/GameMLLM/LLaVA_hub/exp_data/videommmu_test.json",
+        "path": "datasets/video/videommmu.json",
         "task": "mcq",
         "metric": "accuracy",
     },
@@ -314,12 +332,138 @@ def calculate_accuracy(references: list[str], hypotheses: list[str]) -> list[flo
     return [1.0 if r.strip() == h.strip() else 0.0 for r, h in zip(references, hypotheses)]
 
 
+# VQA's official punctuation, number/article and contraction normalization.
+VQA_CONTRACTIONS = {
+    "aint": "ain't", "arent": "aren't", "cant": "can't", "couldve": "could've",
+    "couldnt": "couldn't", "couldn'tve": "couldn't've", "couldnt've": "couldn't've",
+    "didnt": "didn't", "doesnt": "doesn't", "dont": "don't", "hadnt": "hadn't",
+    "hadnt've": "hadn't've", "hadn'tve": "hadn't've", "hasnt": "hasn't",
+    "havent": "haven't", "hed": "he'd", "hed've": "he'd've", "he'dve": "he'd've",
+    "hes": "he's", "howd": "how'd", "howll": "how'll", "hows": "how's",
+    "Id've": "I'd've", "I'dve": "I'd've", "Im": "I'm", "Ive": "I've",
+    "isnt": "isn't", "itd": "it'd", "itd've": "it'd've", "it'dve": "it'd've",
+    "itll": "it'll", "let's": "let's", "maam": "ma'am", "mightnt": "mightn't",
+    "mightnt've": "mightn't've", "mightn'tve": "mightn't've", "mightve": "might've",
+    "mustnt": "mustn't", "mustve": "must've", "neednt": "needn't", "notve": "not've",
+    "oclock": "o'clock", "oughtnt": "oughtn't", "ow's'at": "'ow's'at",
+    "'ows'at": "'ow's'at", "'ow'sat": "'ow's'at", "shant": "shan't",
+    "shed've": "she'd've", "she'dve": "she'd've", "she's": "she's",
+    "shouldve": "should've", "shouldnt": "shouldn't", "shouldnt've": "shouldn't've",
+    "shouldn'tve": "shouldn't've", "somebody'd": "somebodyd", "somebodyd've": "somebody'd've",
+    "somebody'dve": "somebody'd've", "somebodyll": "somebody'll", "somebodys": "somebody's",
+    "someoned": "someone'd", "someoned've": "someone'd've", "someone'dve": "someone'd've",
+    "someonell": "someone'll", "someones": "someone's", "somethingd": "something'd",
+    "somethingd've": "something'd've", "something'dve": "something'd've",
+    "somethingll": "something'll", "thats": "that's", "thered": "there'd",
+    "thered've": "there'd've", "there'dve": "there'd've", "therere": "there're",
+    "theres": "there's", "theyd": "they'd", "theyd've": "they'd've",
+    "they'dve": "they'd've", "theyll": "they'll", "theyre": "they're", "theyve": "they've",
+    "twas": "'twas", "wasnt": "wasn't", "wed've": "we'd've", "we'dve": "we'd've",
+    "weve": "we've", "werent": "weren't", "whatll": "what'll", "whatre": "what're",
+    "whats": "what's", "whatve": "what've", "whens": "when's", "whered": "where'd",
+    "wheres": "where's", "whereve": "where've", "whod": "who'd", "whod've": "who'd've",
+    "who'dve": "who'd've", "wholl": "who'll", "whos": "who's", "whove": "who've",
+    "whyll": "why'll", "whyre": "why're", "whys": "why's", "wont": "won't",
+    "wouldve": "would've", "wouldnt": "wouldn't", "wouldnt've": "wouldn't've",
+    "wouldn'tve": "wouldn't've", "yall": "y'all", "yall'll": "y'all'll",
+    "y'allll": "y'all'll", "yall'd've": "y'all'd've", "y'alld've": "y'all'd've",
+    "y'all'dve": "y'all'd've", "youd": "you'd", "youd've": "you'd've",
+    "you'dve": "you'd've", "youll": "you'll", "youre": "you're", "youve": "you've",
+}
+VQA_CONTRACTIONS = {key.lower(): value.lower() for key, value in VQA_CONTRACTIONS.items()}
+VQA_NUMBERS = dict(zip(
+    ("none", "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"),
+    ("0", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+))
+
+
+def normalize_vqa_answer(answer: str) -> str:
+    text = answer.replace("\n", " ").replace("\t", " ").strip()
+    output = text
+    punctuation = (";", "/", "[", "]", '"', "{", "}", "(", ")", "=", "+", "\\", "_", "-", ">", "<", "@", "`", ",", "?", "!")
+    for mark in punctuation:
+        if mark + " " in text or " " + mark in text or re.search(r"\d,\d", text):
+            output = output.replace(mark, "")
+        else:
+            output = output.replace(mark, " ")
+    # Use the upstream VQA period rule, which preserves decimal points.
+    output = re.sub(r"(?!<=\d)(\.)(?!\d)", "", output)
+    words = [VQA_NUMBERS.get(word, word) for word in output.lower().split()]
+    return " ".join(VQA_CONTRACTIONS.get(word, word) for word in words if word not in {"a", "an", "the"})
+
+
+def calculate_vqa_accuracy(references: list[list[str]], hypotheses: list[str]) -> list[float]:
+    """Average the official leave-one-annotator-out consensus scores."""
+    scores = []
+    for answers, prediction in zip(references, hypotheses):
+        normalized = [normalize_vqa_answer(answer) for answer in answers]
+        prediction = normalize_vqa_answer(prediction)
+        if not normalized:
+            raise ValueError("TextVQA requires reference answers")
+        matches = sum(answer == prediction for answer in normalized)
+        scores.append(sum(min((matches - (answer == prediction)) / 3, 1.0) for answer in normalized) / len(normalized))
+    return scores
+
+
+def calculate_anls(references: list[list[str]], hypotheses: list[str]) -> list[float]:
+    def normalize_answer(answer: str) -> str:
+        answer = answer.lower().translate(str.maketrans("", "", string.punctuation))
+        answer = re.sub(r"\b(a|an|the)\b", " ", answer)
+        return " ".join(answer.split())
+
+    scores = []
+    for answers, prediction in zip(references, hypotheses):
+        if not answers:
+            raise ValueError("DocVQA requires reference answers")
+        prediction = normalize_answer(prediction)
+        distances = calculate_edit_distance(
+            [normalize_answer(answer) for answer in answers], [prediction] * len(answers)
+        )
+        scores.append(max(1.0 - distance if distance < 0.5 else 0.0 for distance in distances))
+    return scores
+
+
+def parse_click_point(prediction: str) -> Optional[Tuple[float, float]]:
+    """Read one explicit normalized pair; malformed/out-of-range outputs fail."""
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    pair = rf"\s*({number})\s*,\s*({number})\s*"
+    matches = re.findall(rf"\({pair}\)|\[{pair}\]", prediction)
+    if len(matches) != 1:
+        return None
+    x, y = map(float, (value for value in matches[0] if value))
+    return (x, y) if math.isfinite(x) and math.isfinite(y) and 0 <= x <= 1 and 0 <= y <= 1 else None
+
+
+def calculate_screenspot_accuracy(references: list[list[float]], hypotheses: list[str]) -> list[float]:
+    scores = []
+    for bbox, prediction in zip(references, hypotheses):
+        if len(bbox) != 4 or not all(math.isfinite(value) for value in bbox):
+            raise ValueError("ScreenSpot requires a normalized xyxy box")
+        x1, y1, x2, y2 = bbox
+        if not (0 <= x1 <= x2 <= 1 and 0 <= y1 <= y2 <= 1):
+            raise ValueError("ScreenSpot box must be normalized xyxy")
+        point = parse_click_point(prediction)
+        scores.append(float(point is not None and x1 <= point[0] <= x2 and y1 <= point[1] <= y2))
+    return scores
+
+
 METRIC_FUNCTIONS: Dict[str, Callable] = {
     "cer": calculate_cer,
     "wer": calculate_wer,
     "edit_distance": calculate_edit_distance,
     "accuracy": calculate_accuracy,
+    "vqa_accuracy": calculate_vqa_accuracy,
+    "anls": calculate_anls,
+    "screenspot_accuracy": calculate_screenspot_accuracy,
 }
+
+VISUAL_GENERATION_METRICS = {
+    "textvqa": "vqa_accuracy",
+    "docvqa": "anls",
+    "docqa": "anls",
+    "screenspot": "screenspot_accuracy",
+}
+DATASETS["docvqa"] = DATASETS["docqa"].copy()
 
 
 # ── Media Type Detection ─────────────────────────────────────────────────────
@@ -675,8 +819,8 @@ def _parse_conversation_question(question_list: list) -> list[Tuple[str, str]]:
 
 
 def prepare_question(
-    sample: dict, task: str, media_type: str, language: str = "en",
-) -> Tuple[Union[str, list], str]:
+    sample: dict, task: str, media_type: str, language: str = "en", metric: str = "",
+) -> Tuple[Union[str, list], Any]:
     """Build the question text and extract the ground-truth answer.
 
     Returns (question_text_or_turns, gt_answer).
@@ -707,7 +851,14 @@ def prepare_question(
             question = "\n".join(str(q) for q in question)
 
     answer = sample.get("answer", sample.get("gt_answer", ""))
-    if isinstance(answer, list):
+    visual_generation = task == "generate" and metric in VISUAL_GENERATION_METRICS.values()
+    if visual_generation and metric in {"vqa_accuracy", "anls"}:
+        answer = sample.get("answers", answer)
+        if isinstance(answer, str):
+            answer = [answer]
+    elif visual_generation and metric == "screenspot_accuracy":
+        answer = sample.get("bbox_xyxy_normalized", answer)
+    elif isinstance(answer, list):
         answer = answer[0] if len(answer) == 1 else "\n".join(str(a) for a in answer)
 
     if task == "mcq":
@@ -735,9 +886,32 @@ def prepare_question(
                         answer_option = option_char
             return question, answer_option or str(answer)
     else:
+        instruction = ""
+        if visual_generation and metric in {"vqa_accuracy", "anls"}:
+            instruction = (
+                "只输出简短答案，不要解释。"
+                if language == "zh"
+                else "Answer with a short answer only. Do not provide an explanation."
+            )
+        elif visual_generation and metric == "screenspot_accuracy":
+            instruction = (
+                "指出截图中该操作对应的点击位置，只输出归一化坐标 (x, y)，"
+                "x 和 y 在 0 到 1 之间，原点是图像左上角。"
+                if language == "zh"
+                else "Locate the click target for this instruction in the screenshot. "
+                "Return only one normalized coordinate pair (x, y), with x and y between 0 and 1 "
+                "and the origin at the top-left corner."
+            )
+        if instruction:
+            if is_conversation:
+                last_role, last_text = turns[-1]
+                turns[-1] = (last_role, last_text + "\n" + instruction)
+            else:
+                question += "\n" + instruction
+        gt_answer = answer if visual_generation else str(answer)
         if is_conversation:
-            return turns, str(answer)
-        return question, str(answer)
+            return turns, gt_answer
+        return question, gt_answer
 
 
 def extract_mcq_answer(text: str) -> str:
@@ -754,13 +928,16 @@ def resolve_sample_task_metric(
     """Per-sample task and metric resolution.
 
     Rules (applied when no global override is given):
+    - TextVQA / DocVQA / ScreenSpot -> generate task, benchmark-specific metric
     - category ending with '_generate' -> generate task, edit_distance metric
     - audio -> generate task, cer (zh) or wer (en)
     - image/video -> mcq task, accuracy metric
     """
     category = sample.get("category", sample.get("task", ""))
+    category_key = str(category).lower().removesuffix("_generate")
+    visual_metric = VISUAL_GENERATION_METRICS.get(category_key)
 
-    if not global_task and isinstance(category, str) and category.endswith("_generate"):
+    if not global_task and (visual_metric or (isinstance(category, str) and category.endswith("_generate"))):
         task = "generate"
     elif global_task:
         task = global_task
@@ -769,7 +946,9 @@ def resolve_sample_task_metric(
     else:
         task = "mcq"
 
-    if not global_metric and isinstance(category, str) and category.endswith("_generate"):
+    if not global_metric and visual_metric:
+        metric = visual_metric
+    elif not global_metric and isinstance(category, str) and category.endswith("_generate"):
         metric = "edit_distance"
     elif global_metric:
         metric = global_metric
@@ -802,7 +981,7 @@ async def evaluate_sample(
     system_prompt = sample.get("system", sample.get("system_prompt", "You are a helpful assistant."))
 
     task, metric = resolve_sample_task_metric(sample, media_type, global_task, global_metric)
-    question_text, gt_answer = prepare_question(sample, task, media_type, language)
+    question_text, gt_answer = prepare_question(sample, task, media_type, language, metric)
 
     images = None
     audios = None
@@ -849,6 +1028,8 @@ async def evaluate_sample(
 
     if task == "mcq":
         pred = extract_mcq_answer(raw_answer)
+    elif metric in VISUAL_GENERATION_METRICS.values():
+        pred = raw_answer
     else:
         pred = raw_answer.replace("The answer is ", "").replace(".", "").strip()
 
@@ -980,6 +1161,10 @@ def print_report(metrics: dict, dataset_name: str):
 # ── Data Loading ─────────────────────────────────────────────────────────────
 
 
+def get_registered_dataset_path(dataset_name: str) -> str:
+    return str(REPO_ROOT / DATASETS[dataset_name]["path"])
+
+
 def load_dataset(path: str) -> list[dict]:
     if path.endswith(".jsonl"):
         with open(path, "r", encoding="utf-8") as f:
@@ -1037,7 +1222,7 @@ def print_dataset_reports(dataset_names: Optional[list[str]] = None) -> None:
         if name not in DATASETS:
             print(f"[dataset:{name}] unknown dataset")
             continue
-        report = inspect_dataset_file(name, DATASETS[name]["path"])
+        report = inspect_dataset_file(name, get_registered_dataset_path(name))
         print(
             f"[dataset:{name}] json_exists={report['json_exists']} "
             f"samples={report['samples']} media={report['media']}"
@@ -1059,7 +1244,7 @@ def main(args):
         data_path = args.dataset_path
         dataset_name = args.eval_dataset or os.path.splitext(os.path.basename(data_path))[0]
     elif args.eval_dataset and args.eval_dataset in DATASETS:
-        data_path = DATASETS[args.eval_dataset]["path"]
+        data_path = get_registered_dataset_path(args.eval_dataset)
         dataset_name = args.eval_dataset
     else:
         raise FileNotFoundError(
@@ -1177,7 +1362,7 @@ if __name__ == "__main__":
         "--metric",
         type=str,
         default="",
-        choices=["accuracy", "cer", "wer", "edit_distance", ""],
+        choices=[*METRIC_FUNCTIONS, ""],
         help="Metric (default: inferred from dataset)",
     )
 
