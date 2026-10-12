@@ -134,6 +134,8 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/context_parallel
       - name: Run models tests
         run: |
+          uv run --frozen pytest -s -x tests/models/test_frame_varlen_attention_projector.py
+          uv run --frozen pytest -s -x tests/models/test_frame_projector_loading.py
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_model_runtime.py
           uv run --frozen pytest -s -x tests/utils/test_legacy_arguments.py

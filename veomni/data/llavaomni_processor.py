@@ -431,7 +431,7 @@ class OmniSampleProcessor:
         resolution = (rw, rh)
         proj = self.model_args.image_projector_type
 
-        if proj in ["dynamic_avgpool", "dual_conv", "frame_varlen_attention"]:
+        if proj in ["dynamic_avgpool", "dual_conv", "pooled_query_attention", "pooling_residual_attention"]:
             scale = selected_downsample_ratio
             M = resolution[0] / self.image_patch_size / merge_size
             N = resolution[1] / self.image_patch_size / merge_size

@@ -1,7 +1,6 @@
-"""Frame-level varlen cross-attention for visual token compression.
+"""Pooled-query cross-attention for visual token compression.
 
-This experimental projector stays separate from ``projector.py`` so it can be
-validated without changing an active training run. It keeps the token layout of
+These experimental projectors keep the token layout of
 ``DynamicAvgPoolProjector``: every frame emits a dynamic number of tokens, and
 all frames from a packed batch are concatenated along the token dimension.
 
@@ -26,6 +25,7 @@ import torch.nn.functional as F
 
 from veomni.distributed.parallel_state import get_parallel_state
 
+
 try:
     from flash_attn import flash_attn_varlen_func
 except ImportError:
@@ -43,6 +43,7 @@ class FrameAttentionAux:
     """Intermediate state for diagnostics and future teacher supervision.
 
     base_tokens/residual_tokens: [C, D] before the final projector MLP.
+    dense_residual_tokens: optional [N, D] pooling differences used as values.
     cu_seqlens_q: [F + 1], frame boundaries for the C pooled queries.
     cu_seqlens_kv: [F + 1], matching boundaries for the N dense patches.
     query_lengths/key_value_lengths: Python lengths used to build the prefixes.
@@ -54,6 +55,7 @@ class FrameAttentionAux:
     cu_seqlens_kv: torch.IntTensor
     query_lengths: list[int]
     key_value_lengths: list[int]
+    dense_residual_tokens: Optional[torch.Tensor] = None
 
 
 class _ZeroInitOutputProjection(nn.Module):
@@ -72,7 +74,7 @@ class _ZeroInitOutputProjection(nn.Module):
         return F.linear(hidden_states, self.weight)
 
 
-class FrameVarlenAttentionProjector(nn.Module):
+class PooledQueryAttentionProjector(nn.Module):
     """Add frame-level dense information to adaptive-pooling tokens.
 
     FlashAttention receives one query sequence and one key/value sequence per
@@ -190,9 +192,7 @@ class FrameVarlenAttentionProjector(nn.Module):
         frame_pos = (torch.arange(time, dtype=torch.float32) + 0.5) / time
         row_pos = (torch.arange(height, dtype=torch.float32) + 0.5) / height
         col_pos = (torch.arange(width, dtype=torch.float32) + 0.5) / width
-        positions = torch.stack(
-            torch.meshgrid(frame_pos, row_pos, col_pos, indexing="ij"), dim=-1
-        ).reshape(-1, 3)
+        positions = torch.stack(torch.meshgrid(frame_pos, row_pos, col_pos, indexing="ij"), dim=-1).reshape(-1, 3)
         return positions.mul(2).sub(1)
 
     @staticmethod
@@ -201,6 +201,21 @@ class FrameVarlenAttentionProjector(nn.Module):
         for length in lengths:
             offsets.append(offsets[-1] + length)
         return torch.tensor(offsets, device=device, dtype=torch.int32)
+
+    def _pool_grid(
+        self, grid_features: torch.Tensor, output_height: int, output_width: int
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return pooled queries and dense value features in T/Y/X/D order."""
+        pooled = F.adaptive_avg_pool2d(grid_features.permute(0, 3, 1, 2), (output_height, output_width)).permute(
+            0, 2, 3, 1
+        )
+        return pooled, None
+
+    def _project_values(self, value_features: torch.Tensor, normalized_features: torch.Tensor) -> torch.Tensor:
+        return self.value_proj(normalized_features)
+
+    def _dense_residual_aux(self, value_features: torch.Tensor) -> Optional[torch.Tensor]:
+        return None
 
     def _build_frame_metadata(
         self,
@@ -217,10 +232,12 @@ class FrameVarlenAttentionProjector(nn.Module):
         list[int],
         torch.IntTensor,
         torch.IntTensor,
+        torch.Tensor,
     ]:
         """Pool base tokens and build packed frame-level attention metadata."""
         grids = images_thw.detach().cpu().tolist()
         base_tokens = []
+        value_tokens = []
         query_positions = []
         key_positions = []
         query_rates = []
@@ -240,9 +257,7 @@ class FrameVarlenAttentionProjector(nn.Module):
                 raise ValueError(f"merge_size must be a positive integer, got {merge_size_value}.")
             merge_size = int(merge_size_value)
             if raw_height % merge_size != 0 or raw_width % merge_size != 0:
-                raise ValueError(
-                    f"Grid {(time, raw_height, raw_width)} is not divisible by merge_size={merge_size}."
-                )
+                raise ValueError(f"Grid {(time, raw_height, raw_width)} is not divisible by merge_size={merge_size}.")
             if not math.isfinite(scale) or scale <= 0:
                 raise ValueError(f"downsample ratios must be finite and positive, got {scale}.")
 
@@ -261,10 +276,10 @@ class FrameVarlenAttentionProjector(nn.Module):
             grid_features = images_feature[feature_offset:next_feature_offset].view(
                 time, height, width, self.hidden_size
             )
-            pooled = F.adaptive_avg_pool2d(
-                grid_features.permute(0, 3, 1, 2), (output_height, output_width)
-            )
-            pooled = pooled.permute(0, 2, 3, 1).reshape(-1, self.hidden_size)
+            pooled, values = self._pool_grid(grid_features, output_height, output_width)
+            pooled = pooled.reshape(-1, self.hidden_size)
+            if values is not None:
+                value_tokens.append(values.reshape(-1, self.hidden_size))
 
             queries_per_frame = output_height * output_width
             base_tokens.append(pooled)
@@ -287,11 +302,13 @@ class FrameVarlenAttentionProjector(nn.Module):
             packed_query_positions = torch.cat(query_positions).to(device=device, non_blocking=True)
             packed_key_positions = torch.cat(key_positions).to(device=device, non_blocking=True)
             packed_query_rates = torch.cat(query_rates).to(device=device, non_blocking=True)
+            packed_values = torch.cat(value_tokens) if value_tokens else images_feature
         else:
             packed_base = images_feature.new_empty((0, self.hidden_size))
             packed_query_positions = torch.empty((0, 3), device=device, dtype=torch.float32)
             packed_key_positions = torch.empty((0, 3), device=device, dtype=torch.float32)
             packed_query_rates = torch.empty((0, 1), device=device, dtype=torch.float32)
+            packed_values = images_feature
 
         return (
             packed_base,
@@ -302,6 +319,7 @@ class FrameVarlenAttentionProjector(nn.Module):
             key_value_lengths,
             self._prefix_sums(query_lengths, device),
             self._prefix_sums(key_value_lengths, device),
+            packed_values,
         )
 
     def _varlen_attention(
@@ -340,9 +358,7 @@ class FrameVarlenAttentionProjector(nn.Module):
     ) -> tuple[torch.Tensor, list[int], FrameAttentionAux]:
         """Return [C, D] enhanced tokens, frame lengths, and attention metadata."""
         if images_feature.ndim != 2:
-            raise ValueError(
-                f"images_feature must have shape [tokens, hidden], got {tuple(images_feature.shape)}."
-            )
+            raise ValueError(f"images_feature must have shape [tokens, hidden], got {tuple(images_feature.shape)}.")
         if images_feature.shape[-1] != self.hidden_size:
             raise ValueError(f"Expected hidden size {self.hidden_size}, got {images_feature.shape[-1]}.")
         if images_thw.ndim != 2 or images_thw.shape[-1] != 3:
@@ -351,7 +367,7 @@ class FrameVarlenAttentionProjector(nn.Module):
         parallel_state = get_parallel_state()
         if self.training and parallel_state is not None and parallel_state.sp_enabled:
             raise NotImplementedError(
-                "FrameVarlenAttentionProjector does not yet support sequence parallelism. "
+                f"{type(self).__name__} does not yet support sequence parallelism. "
                 "QK dot products require complete attention heads."
             )
 
@@ -369,23 +385,22 @@ class FrameVarlenAttentionProjector(nn.Module):
             key_value_lengths,
             cu_seqlens_q,
             cu_seqlens_kv,
+            value_features,
         ) = self._build_frame_metadata(images_feature, images_thw, merge_sizes, ratios)
 
         query_hidden = self.query_proj(self.query_norm(base_tokens))
-        query_hidden = query_hidden + self.query_position_proj(
-            query_positions.to(images_feature.dtype)
-        )
+        query_hidden = query_hidden + self.query_position_proj(query_positions.to(images_feature.dtype))
         query_hidden = query_hidden + self.rate_proj(query_rates.to(images_feature.dtype))
         key_value_hidden = self.key_value_norm(images_feature)
         key_hidden = self.key_proj(key_value_hidden)
         key_hidden = key_hidden + self.key_position_proj(key_positions.to(images_feature.dtype))
-        value_hidden = self.value_proj(key_value_hidden)
+        value_hidden = self._project_values(value_features, key_value_hidden)
 
         query = query_hidden.view(-1, self.num_attention_heads, self.head_dim)
         key = key_hidden.view(-1, self.num_attention_heads, self.head_dim)
         value = value_hidden.view(-1, self.num_attention_heads, self.head_dim)
         if flash_attn_varlen_func is None:
-            raise RuntimeError("FrameVarlenAttentionProjector requires flash-attn.")
+            raise RuntimeError(f"{type(self).__name__} requires flash-attn.")
         if not query.is_cuda or query.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("FlashAttention requires CUDA fp16 or bf16 query/key/value tensors.")
         attention_output = self._varlen_attention(
@@ -407,6 +422,7 @@ class FrameVarlenAttentionProjector(nn.Module):
             cu_seqlens_kv=cu_seqlens_kv,
             query_lengths=query_lengths,
             key_value_lengths=key_value_lengths,
+            dense_residual_tokens=self._dense_residual_aux(value_features),
         )
         return enhanced_tokens, query_lengths, aux
 
@@ -432,18 +448,57 @@ class FrameVarlenAttentionProjector(nn.Module):
         return hidden_states, seq_len
 
 
-def build_frame_attention_projector(
-    encoder_hidden: int,
-    out_hidden: int,
-    downsample_ratio: float,
-    num_attention_heads: int = 8,
-    attention_dropout: float = 0.0,
-) -> FrameVarlenAttentionProjector:
-    """Build the standalone experimental frame-level attention projector."""
-    return FrameVarlenAttentionProjector(
-        encoder_hidden=encoder_hidden,
-        out_hidden=out_hidden,
-        downsample_ratio=downsample_ratio,
-        num_attention_heads=num_attention_heads,
-        attention_dropout=attention_dropout,
-    )
+def broadcast_pooling_windows(pooled: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Map [T, Ho, Wo, D] coarse features to [T, H, W, D] by window coverage.
+
+    Integer compression uses exact region replication. Otherwise each dense
+    location receives the average of the coarse cells whose adaptive-average
+    pooling windows contain it. Separable axis maps avoid an [H*W, Ho*Wo] map.
+    """
+    if pooled.ndim != 4 or min(height, width, pooled.shape[1], pooled.shape[2]) <= 0:
+        raise ValueError("Expected [T, Ho, Wo, D] pooled features and positive spatial sizes.")
+    output_height, output_width = pooled.shape[1:3]
+    if height % output_height == 0 and width % output_width == 0:
+        return pooled.repeat_interleave(height // output_height, dim=1).repeat_interleave(width // output_width, dim=2)
+
+    def axis_coverage(size: int, output_size: int) -> torch.Tensor:
+        cells = torch.arange(output_size)
+        starts = torch.div(cells * size, output_size, rounding_mode="floor")
+        ends = torch.div((cells + 1) * size + output_size - 1, output_size, rounding_mode="floor")
+        locations = torch.arange(size)[:, None]
+        coverage = ((locations >= starts) & (locations < ends)).float()
+        return (coverage / coverage.sum(dim=1, keepdim=True)).to(device=pooled.device)
+
+    row_map = axis_coverage(height, output_height)
+    column_map = axis_coverage(width, output_width)
+    # Accumulate overlapping broadcasts in fp32 for fp16/bf16 inputs.
+    work_dtype = torch.float64 if pooled.dtype == torch.float64 else torch.float32
+    rows = torch.einsum("hi,tijd->thjd", row_map.to(work_dtype), pooled.to(work_dtype))
+    restored = torch.einsum("wj,thjd->thwd", column_map.to(work_dtype), rows)
+    return restored.to(pooled.dtype)
+
+
+class PoolingResidualAttentionProjector(PooledQueryAttentionProjector):
+    """Let pooled queries read differences from their coarse spatial baseline.
+
+    Keys use normalized full features, as in PooledQueryAttentionProjector.
+    Values use a bias-free projection of raw pooling residuals without a
+    per-token LayerNorm, preserving relative residual amplitudes. No features
+    are detached: both pooling and broadcasting participate in autograd.
+
+    The inherited output projection starts at zero, preserving the avgpool
+    baseline. CUDA fp16/bf16 FlashAttention is required; SP is unsupported.
+    """
+
+    def _pool_grid(
+        self, grid_features: torch.Tensor, output_height: int, output_width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pooled, _ = super()._pool_grid(grid_features, output_height, output_width)
+        restored = broadcast_pooling_windows(pooled, grid_features.shape[1], grid_features.shape[2])
+        return pooled, grid_features - restored
+
+    def _project_values(self, value_features: torch.Tensor, normalized_features: torch.Tensor) -> torch.Tensor:
+        return self.value_proj(value_features)
+
+    def _dense_residual_aux(self, value_features: torch.Tensor) -> torch.Tensor:
+        return value_features

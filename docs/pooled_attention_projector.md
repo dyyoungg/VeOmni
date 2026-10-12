@@ -1,15 +1,20 @@
 # Experimental frame attention projector
 
-`veomni.models.custom.llava_qwen3moe.projector_frame_attention` provides a
-projector selectable through `build_image_projector("frame_varlen_attention", ...)`.
+`veomni.models.custom.llava_qwen3moe.projector_pooled_query_attention` provides
+projectors selectable through `build_image_projector("pooled_query_attention", ...)`
+and `build_image_projector("pooling_residual_attention", ...)`.
 The existing `dynamic_avgpool` factory option is unchanged.
+The full-feature baseline is named `PooledQueryAttentionProjector`. Update old
+checkpoint configs from `frame_varlen_attention` to `pooled_query_attention`;
+the old module, class name and factory option have been removed. Parameter keys
+are unchanged, so complete full-feature checkpoints retain their behavior.
 
 For the custom Qwen3.5 vision encoder, set these fields inside
 `encoder_config.image_config` in the checkpoint config:
 
 ```json
 {
-  "image_projector_type": "frame_varlen_attention",
+  "image_projector_type": "pooled_query_attention",
   "image_projector_num_attention_heads": 32,
   "image_projector_attention_dropout": 0.0
 }
@@ -20,11 +25,11 @@ of width 1152 into width 4608, giving head dimension 144. The standalone class
 default remains 8 heads; pass 32 explicitly when using it with width 4608.
 
 ```python
-from veomni.models.custom.llava_qwen3moe.projector_frame_attention import (
-    FrameVarlenAttentionProjector,
+from veomni.models.custom.llava_qwen3moe.projector_pooled_query_attention import (
+    PooledQueryAttentionProjector,
 )
 
-projector = FrameVarlenAttentionProjector(
+projector = PooledQueryAttentionProjector(
     encoder_hidden=1024,
     out_hidden=2048,
     downsample_ratio=4,
@@ -51,6 +56,51 @@ projection starts at zero. Enhanced tokens pass through the original-style
 two-layer projector MLP; there is no additional residual FFN. Output token count,
 order, and per-temporal-step `seq_len` match average pooling.
 
+## Pooling residual experiment
+
+Set `image_projector_type` to `pooling_residual_attention` to build
+`PoolingResidualAttentionProjector` from the same `projector_pooled_query_attention.py` module.
+The encoder already forwards this option to the shared image-projector factory;
+no changes to the ViT, LLM positions, placeholder lengths or collators are needed.
+
+The source X is the final ViT feature after the encoder's norm-and-concatenate
+spatial merger, before the projector MLP. This experiment uses:
+
+```text
+B = AdaptiveAvgPool2d(X)
+R = X - U(B)
+Q = query_proj(LN(B)) + query_position + compression_rate
+K = key_proj(LN(X)) + key_position
+V = value_proj(R)
+Z = B + zero_init_output(Attention(Q, K, V))
+tokens = mlp(Z)
+```
+
+U broadcasts each coarse feature over its actual adaptive-pooling window.
+On integer compression grids this repeats the region mean. On non-divisible
+grids a dense position may belong to several windows: it receives the average
+of their coarse features. Broadcasting preserves time and channel dimensions;
+it is a reference coarse representation, not an inverse of pooling. For scale
+1, R is exactly zero. Do not expect the zero-mean-cell property on overlapping
+windows. The class also accepts the baseline's positive ratios below 1, but
+those enlarge the output grid and are not compression experiments.
+
+Residual values have a bias-free linear projection and no per-token LayerNorm,
+so their relative amplitudes are retained. Pooling and broadcasting remain in
+the autograd graph. Query/key normalization, frame boundaries, positions, output
+MLP and zero-initialized output projection match the full-feature baseline.
+At initialization Q/K/V receive zero gradients; the output projection learns
+first. With `return_attention_aux=True`, `aux.dense_residual_tokens` exposes
+the [N, D] input pooling differences, whereas `aux.residual_tokens` is the
+[C, D] attention correction. The full-feature baseline leaves the former unset.
+
+Compare both modes at the same realized token budget. Reuse the same pretrained
+MLP and initialize attention parameters consistently for a controlled experiment.
+Although their parameter schemas match, a trained full-feature attention branch
+is not a trained residual branch: changing the config alone changes Value
+semantics. Start the new branch from a baseline MLP with newly initialized
+attention, or load a checkpoint trained specifically for residual values.
+
 Requires FlashAttention 2, CUDA fp16/bf16 Q/K/V and head dimension at most 256.
 There is no CPU/SDPA fallback. Training with Ulysses sequence parallelism raises
 `NotImplementedError`. Empty visual inputs retain parameter autograd edges, but
@@ -73,7 +123,8 @@ To create an independent checkpoint with all image projector weights removed:
 python scripts/prepare_frame_attention_checkpoint.py SOURCE DESTINATION
 ```
 
-This copies unaffected shards byte-for-byte, rewrites only shards containing
+This script selects the `pooled_query_attention` full-feature baseline.
+It copies unaffected shards byte-for-byte, rewrites only shards containing
 `image_encoder.mm_projector.*`, and updates the index and the three config fields
 above. Audio projector, vision backbone, LLM weights and other config values are
 preserved. Per-shard readback hashes are recorded in

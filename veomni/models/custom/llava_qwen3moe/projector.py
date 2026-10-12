@@ -293,10 +293,16 @@ def build_image_projector(
     # print("image encoder", encoder_hidden, out_hidden, downsample_ratio)
     if projector_type == "dynamic_avgpool":
         return DynamicAvgPoolProjector(encoder_hidden, out_hidden, downsample_ratio)
-    elif projector_type == "frame_varlen_attention":
-        from .projector_frame_attention import FrameVarlenAttentionProjector
+    elif projector_type in ("pooled_query_attention", "pooling_residual_attention"):
+        from .projector_pooled_query_attention import (
+            PooledQueryAttentionProjector,
+            PoolingResidualAttentionProjector,
+        )
 
-        return FrameVarlenAttentionProjector(
+        projector_class = PooledQueryAttentionProjector
+        if projector_type == "pooling_residual_attention":
+            projector_class = PoolingResidualAttentionProjector
+        return projector_class(
             encoder_hidden,
             out_hidden,
             downsample_ratio,
@@ -317,5 +323,3 @@ def build_audio_projector(projector_type, encoder_hidden, out_hidden, downsample
         return AudioMLPChannelProjector(encoder_hidden, out_hidden, downsample_ratio)
     else:
         raise NotImplementedError
-
-

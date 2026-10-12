@@ -182,3 +182,6 @@ exp_data/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+results/
+profile_json/
+.claude
